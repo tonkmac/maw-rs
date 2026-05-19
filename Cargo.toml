@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/maw-matcher", "crates/maw-calver", "crates/maw-policy"]
+members = ["crates/maw-matcher", "crates/maw-calver", "crates/maw-policy", "crates/maw-worktree"]
 resolver = "2"
 
 [workspace.package]
