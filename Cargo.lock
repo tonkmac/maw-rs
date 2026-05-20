@@ -125,6 +125,7 @@ dependencies = [
  "maw-policy",
  "maw-routing",
  "maw-split",
+ "maw-tmux",
  "maw-transport",
  "maw-worktree",
  "maw-xdg",

@@ -38,6 +38,10 @@ use maw_routing::{
     ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
 };
 use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
+use maw_tmux::{
+    mark_peer_targets_live, resolve_tmux_live_state, DiscoverLivePane, PeerTargetWithLive,
+    TmuxLiveStateResult, TmuxPane,
+};
 use maw_transport::{
     classify_error, Transport, TransportFailureReason, TransportResult, TransportRouter,
     TransportTarget,
@@ -84,6 +88,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "calver" => run_calver_plan(&argv[1..]),
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
         "route" => run_route_plan(&argv[1..]),
+        "discover" => run_discover_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
         "split-policy" => run_split_policy_plan(&argv[1..]),
@@ -3103,6 +3108,378 @@ fn render_peer_sources_plan_text(result: &PeerSourceResult) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+fn run_discover_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut json = false;
+    let mut tree = false;
+    let mut awake = false;
+    let mut peer_source_raw: Option<String> = None;
+    let mut config = PeerConfig::default();
+    let mut discovery_rows = Vec::new();
+    let mut panes = Vec::new();
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--json" => json = true,
+            "--tree" => tree = true,
+            "--awake" => awake = true,
+            "--peers" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --peers value");
+                };
+                peer_source_raw = Some(value.to_owned());
+                index += 1;
+            }
+            arg if arg.starts_with("--peers=") => {
+                peer_source_raw = Some(arg["--peers=".len()..].to_owned());
+            }
+            "--peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --peer value");
+                };
+                config.peers.push(value.to_owned());
+                index += 1;
+            }
+            "--named-peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --named-peer value");
+                };
+                match parse_key_value(value, "discover: --named-peer must use <name=url>") {
+                    Ok((name, url)) => config.named_peers.push(NamedPeerConfig { name, url }),
+                    Err(message) => return discover_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--discovered" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --discovered value");
+                };
+                match parse_discovery_row(value) {
+                    Ok(row) => discovery_rows.push(row),
+                    Err(message) => {
+                        return discover_usage_error(&message.replace("peer-sources", "discover"))
+                    }
+                }
+                index += 1;
+            }
+            "--pane" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --pane value");
+                };
+                match parse_discover_pane(value) {
+                    Ok(pane) => panes.push(pane),
+                    Err(message) => return discover_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => return discover_usage_error(&format!("discover: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    let Some(mode) =
+        maw_peer::parse_peer_source_mode(peer_source_raw.as_deref(), PeerSourceMode::Both)
+    else {
+        return render_discover_invalid_peer_source(plan_json);
+    };
+    let discoveries = (!discovery_rows.is_empty()).then_some(DiscoveryResult::Ok {
+        peers: discovery_rows,
+    });
+    let result = resolve_peer_sources(&config, mode, discoveries.as_ref());
+    let include_live = json || tree || awake;
+    let live_probe_calls = usize::from(include_live);
+    let live_state = if include_live {
+        resolve_tmux_live_state(&result.peers, &panes)
+    } else {
+        TmuxLiveStateResult {
+            source: "tmux".to_owned(),
+            live: Vec::new(),
+            warnings: Vec::new(),
+        }
+    };
+    let peers_with_live = if include_live {
+        mark_peer_targets_live(&result.peers, &live_state.live)
+    } else {
+        result
+            .peers
+            .iter()
+            .map(peer_with_no_live)
+            .collect::<Vec<_>>()
+    };
+    let visible_peers = if awake && !tree {
+        peers_with_live
+            .iter()
+            .filter(|peer| peer.awake)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        peers_with_live
+    };
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json || json {
+            render_discover_plan_json(
+                &result,
+                &visible_peers,
+                &live_state,
+                awake,
+                live_probe_calls,
+            )
+        } else if awake {
+            render_discover_live_text(&live_state)
+        } else {
+            render_peer_sources_plan_text(&result)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_discover_invalid_peer_source(plan_json: bool) -> CliOutput {
+    let body = "{\"command\":\"discover\",\"ok\":false,\"error\":\"invalid_peer_source\",\"output\":\"usage: maw discover [--peers config|scout|both] [--json] [--tree] [--awake]\",\"fetchCalls\":0,\"liveProbeCalls\":0}\n";
+    CliOutput {
+        code: if plan_json { 0 } else { 2 },
+        stdout: if plan_json {
+            body.to_owned()
+        } else {
+            String::new()
+        },
+        stderr: if plan_json {
+            String::new()
+        } else {
+            format!("invalid_peer_source\n{}\n", discover_usage())
+        },
+    }
+}
+
+fn discover_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", discover_usage()),
+    }
+}
+
+fn discover_usage() -> &'static str {
+    "usage: maw-rs discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]"
+}
+
+fn parse_discover_pane(value: &str) -> Result<TmuxPane, String> {
+    let parts = value.splitn(7, '|').collect::<Vec<_>>();
+    if parts.len() != 7 {
+        return Err(
+            "discover: --pane must use <id|command|target|title|pid|cwd|last_activity>".to_owned(),
+        );
+    }
+    Ok(TmuxPane {
+        id: parts[0].to_owned(),
+        command: parts[1].to_owned(),
+        target: parts[2].to_owned(),
+        title: parts[3].to_owned(),
+        pid: parse_optional_u32(parts[4], "discover: pane pid must be an integer")?,
+        cwd: optional_field(parts[5]),
+        last_activity: parse_optional_u64(
+            parts[6],
+            "discover: pane last_activity must be an integer",
+        )?,
+    })
+}
+
+fn parse_optional_u32(value: &str, message: &str) -> Result<Option<u32>, String> {
+    if value.is_empty() || value == "-" {
+        return Ok(None);
+    }
+    value
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| message.to_owned())
+}
+
+fn parse_optional_u64(value: &str, message: &str) -> Result<Option<u64>, String> {
+    if value.is_empty() || value == "-" {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| message.to_owned())
+}
+
+fn peer_with_no_live(peer: &maw_peer::PeerTarget) -> PeerTargetWithLive {
+    PeerTargetWithLive {
+        name: peer.name.clone(),
+        url: peer.url.clone(),
+        source: peer.source,
+        node: peer.node.clone(),
+        oracle: peer.oracle.clone(),
+        awake: false,
+        live_targets: Vec::new(),
+        live_sessions: Vec::new(),
+    }
+}
+
+fn render_discover_plan_json(
+    result: &PeerSourceResult,
+    peers: &[PeerTargetWithLive],
+    live_state: &TmuxLiveStateResult,
+    awake: bool,
+    live_probe_calls: usize,
+) -> String {
+    let warnings = result
+        .warnings
+        .iter()
+        .chain(live_state.warnings.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    format!(
+        "{{\"command\":\"discover\",\"ok\":true,\"mode\":{},\"total\":{},\"awake\":{},\"awakeOnly\":{},\"peers\":{},\"fleet\":{{\"source\":\"fleet-config\",\"total\":0,\"records\":[]}},\"oracles\":{{\"source\":\"oracle-manifest\",\"total\":0,\"records\":[]}},\"plugins\":{{\"source\":\"plugin-registry\",\"total\":0,\"records\":[]}},\"ghq\":{{\"source\":\"ghq\",\"total\":0,\"repos\":[]}},\"liveTotal\":{},\"live\":{},\"warnings\":{},\"fetchCalls\":{},\"liveProbeCalls\":{}}}\n",
+        json_string(result.mode.as_str()),
+        peers.len(),
+        awake,
+        awake,
+        render_live_peer_targets_json(peers),
+        live_state.live.len(),
+        render_live_state_json(live_state),
+        json_string_array(&warnings),
+        result.fetch_calls,
+        live_probe_calls
+    )
+}
+
+fn render_live_peer_targets_json(peers: &[PeerTargetWithLive]) -> String {
+    format!(
+        "[{}]",
+        peers
+            .iter()
+            .map(|peer| {
+                let mut fields = vec![
+                    format!("\"url\":{}", json_string(&peer.url)),
+                    format!("\"source\":{}", json_string(peer.source.as_str())),
+                ];
+                push_json_opt(&mut fields, "name", peer.name.as_deref());
+                push_json_opt(&mut fields, "node", peer.node.as_deref());
+                push_json_opt(&mut fields, "oracle", peer.oracle.as_deref());
+                fields.push(format!("\"awake\":{}", peer.awake));
+                fields.push(format!(
+                    "\"liveTargets\":{}",
+                    json_string_array(&peer.live_targets)
+                ));
+                fields.push(format!(
+                    "\"liveSessions\":{}",
+                    json_string_array(&peer.live_sessions)
+                ));
+                format!("{{{}}}", fields.join(","))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_live_state_json(live_state: &TmuxLiveStateResult) -> String {
+    format!(
+        "{{\"source\":{},\"total\":{},\"panes\":{},\"sessions\":{}}}",
+        json_string(&live_state.source),
+        live_state.live.len(),
+        render_live_panes_json(&live_state.live),
+        render_live_sessions_json(&live_state.live)
+    )
+}
+
+fn render_live_panes_json(panes: &[DiscoverLivePane]) -> String {
+    format!(
+        "[{}]",
+        panes
+            .iter()
+            .map(|pane| {
+                let mut fields = vec![
+                    format!("\"source\":{}", json_string(&pane.source)),
+                    format!("\"id\":{}", json_string(&pane.id)),
+                    format!("\"target\":{}", json_string(&pane.target)),
+                    format!("\"session\":{}", json_string(&pane.session)),
+                    format!("\"window\":{}", json_string(&pane.window)),
+                    format!("\"pane\":{}", json_string(&pane.pane)),
+                    format!("\"awake\":{}", pane.awake),
+                    format!("\"matches\":{}", json_string_array(&pane.matches)),
+                ];
+                push_json_opt(&mut fields, "command", pane.command.as_deref());
+                push_json_opt(&mut fields, "title", pane.title.as_deref());
+                if let Some(pid) = pane.pid {
+                    fields.push(format!("\"pid\":{pid}"));
+                }
+                push_json_opt(&mut fields, "cwd", pane.cwd.as_deref());
+                if let Some(last_activity) = pane.last_activity {
+                    fields.push(format!("\"lastActivity\":{last_activity}"));
+                }
+                format!("{{{}}}", fields.join(","))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_live_sessions_json(panes: &[DiscoverLivePane]) -> String {
+    let mut sessions: BTreeMap<&str, BTreeMap<&str, Vec<&DiscoverLivePane>>> = BTreeMap::new();
+    for pane in panes {
+        sessions
+            .entry(&pane.session)
+            .or_default()
+            .entry(&pane.window)
+            .or_default()
+            .push(pane);
+    }
+    format!(
+        "[{}]",
+        sessions
+            .into_iter()
+            .map(|(name, windows)| {
+                let pane_count = windows.values().map(Vec::len).sum::<usize>();
+                let windows_json = windows
+                    .into_iter()
+                    .map(|(window_name, window_panes)| {
+                        let cloned = window_panes.into_iter().cloned().collect::<Vec<_>>();
+                        format!(
+                            "{{\"name\":{},\"paneCount\":{},\"panes\":{}}}",
+                            json_string(window_name),
+                            cloned.len(),
+                            render_live_panes_json(&cloned)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{{\"source\":\"tmux\",\"name\":{},\"awake\":true,\"paneCount\":{},\"windows\":[{}]}}",
+                    json_string(name),
+                    pane_count,
+                    windows_json
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_discover_live_text(live_state: &TmuxLiveStateResult) -> String {
+    if live_state.live.is_empty() {
+        return "no live tmux sessions/windows found\n".to_owned();
+    }
+    live_state
+        .live
+        .iter()
+        .map(|pane| {
+            format!(
+                "tmux {} {}",
+                pane.target,
+                pane.command.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_route_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
     let mut query = None;
@@ -3799,7 +4176,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
