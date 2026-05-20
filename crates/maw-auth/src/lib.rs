@@ -8,6 +8,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const WINDOW_SEC: i64 = 300;
 pub const DEFAULT_ORACLE: &str = "mawjs";
+pub const PAIR_CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headers(BTreeMap<String, String>);
@@ -51,6 +52,68 @@ pub struct AutoPairIdentity {
     pub oracle: String,
     pub url: String,
     pub pubkey: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairEntry {
+    pub code: String,
+    pub expires_at: u64,
+    pub consumed: bool,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupResult {
+    Live(PairEntry),
+    NotFound,
+    Expired,
+    Consumed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PairCodeStore {
+    entries: BTreeMap<String, PairEntry>,
+}
+
+impl PairCodeStore {
+    #[must_use]
+    pub fn register_at(&mut self, code: &str, ttl_ms: u64, now_ms: u64) -> PairEntry {
+        let entry = PairEntry {
+            code: normalize_pair_code(code),
+            expires_at: now_ms.saturating_add(ttl_ms),
+            consumed: false,
+            created_at: now_ms,
+        };
+        self.entries.insert(entry.code.clone(), entry.clone());
+        entry
+    }
+
+    #[must_use]
+    pub fn lookup_at(&self, code: &str, now_ms: u64) -> LookupResult {
+        let Some(entry) = self.entries.get(&normalize_pair_code(code)).cloned() else {
+            return LookupResult::NotFound;
+        };
+        if entry.consumed {
+            return LookupResult::Consumed;
+        }
+        if now_ms > entry.expires_at {
+            return LookupResult::Expired;
+        }
+        LookupResult::Live(entry)
+    }
+
+    #[must_use]
+    pub fn consume_at(&mut self, code: &str, now_ms: u64) -> LookupResult {
+        let key = normalize_pair_code(code);
+        match self.lookup_at(&key, now_ms) {
+            LookupResult::Live(mut entry) => {
+                entry.consumed = true;
+                self.entries.insert(key, entry.clone());
+                LookupResult::Live(entry)
+            }
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +301,50 @@ pub fn resolve_from_address(config: &FromAddressConfig) -> Option<String> {
     let node = config.node.as_deref()?;
     let oracle = config.oracle.as_deref().unwrap_or(DEFAULT_ORACLE);
     Some(format!("{oracle}:{node}"))
+}
+
+#[must_use]
+pub fn normalize_pair_code(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| *ch != '-' && !ch.is_whitespace())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+#[must_use]
+pub fn is_valid_pair_code_shape(code: &str) -> bool {
+    let code = normalize_pair_code(code);
+    code.len() == 6 && code.chars().all(|ch| PAIR_CODE_ALPHABET.contains(ch))
+}
+
+#[must_use]
+pub fn pretty_pair_code(code: &str) -> String {
+    let code = normalize_pair_code(code);
+    if code.len() == 6 {
+        format!("{}-{}", &code[..3], &code[3..])
+    } else {
+        code
+    }
+}
+
+#[must_use]
+pub fn redact_pair_code(code: &str) -> String {
+    let code = normalize_pair_code(code);
+    if code.len() >= 3 {
+        format!("{}-***", &code[..3])
+    } else {
+        "***".to_owned()
+    }
+}
+
+#[must_use]
+pub fn generate_pair_code_from_bytes(bytes: &[u8]) -> String {
+    let alphabet = PAIR_CODE_ALPHABET.as_bytes();
+    bytes
+        .iter()
+        .take(6)
+        .map(|byte| char::from(alphabet[usize::from(byte % 32)]))
+        .collect()
 }
 
 #[must_use]
