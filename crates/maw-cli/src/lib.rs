@@ -4,6 +4,7 @@
 //! be tested against maw-js parser contracts before host IO is wired.
 
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
+use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
 use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
     ResolveOptions, ResolveResult,
@@ -28,12 +29,171 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
         "normalize" => run_normalize_plan(&argv[1..]),
+        "calver" => run_calver_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_calver_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut stable = false;
+    let mut channel = None;
+    let mut now = None;
+    let mut package_version = String::new();
+    let mut tags = Vec::new();
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--stable" => stable = true,
+            "--alpha" => channel = Some(Channel::Alpha),
+            "--beta" => channel = Some(Channel::Beta),
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return calver_usage_error("calver: missing --now value");
+                };
+                match parse_date_parts(value) {
+                    Ok(parsed) => now = Some(parsed),
+                    Err(message) => return calver_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--package-version" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return calver_usage_error("calver: missing --package-version value");
+                };
+                package_version.clone_from(value);
+                index += 1;
+            }
+            "--tag" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return calver_usage_error("calver: missing --tag value");
+                };
+                tags.push(value.to_owned());
+                index += 1;
+            }
+            arg => return calver_usage_error(&format!("calver: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    let Some(now) = now else {
+        return calver_usage_error("calver: expected --now <YYYY-M-DTHH:MM>");
+    };
+
+    let compute_args = ComputeArgs {
+        stable,
+        channel,
+        now,
+    };
+    match compute_version(compute_args, &tags, &package_version) {
+        Ok(version) => CliOutput {
+            code: 0,
+            stdout: if plan_json {
+                render_calver_plan_json(compute_args, &tags, &package_version, &version)
+            } else {
+                format!("{version}\n")
+            },
+            stderr: String::new(),
+        },
+        Err(error) => CliOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("calver: {error}\n"),
+        },
+    }
+}
+
+fn calver_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n"
+        ),
+    }
+}
+
+fn parse_date_parts(value: &str) -> Result<DateParts, String> {
+    let Some((date, time)) = value.split_once('T') else {
+        return Err("calver: --now must use YYYY-M-DTHH:MM".to_owned());
+    };
+    let mut date_parts = date.split('-');
+    let year = parse_i32_part(date_parts.next(), "year")?;
+    let month = parse_u32_part(date_parts.next(), "month")?;
+    let day = parse_u32_part(date_parts.next(), "day")?;
+    if date_parts.next().is_some() {
+        return Err("calver: --now date must use YYYY-M-D".to_owned());
+    }
+
+    let mut time_parts = time.split(':');
+    let hour = parse_u32_part(time_parts.next(), "hour")?;
+    let minute = parse_u32_part(time_parts.next(), "minute")?;
+    if time_parts.next().is_some() {
+        return Err("calver: --now time must use HH:MM".to_owned());
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return Err("calver: --now contains out-of-range date/time parts".to_owned());
+    }
+    Ok(DateParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+    })
+}
+
+fn parse_i32_part(value: Option<&str>, name: &str) -> Result<i32, String> {
+    let Some(value) = value else {
+        return Err(format!("calver: missing {name} in --now"));
+    };
+    value
+        .parse::<i32>()
+        .map_err(|_| format!("calver: invalid {name} in --now"))
+}
+
+fn parse_u32_part(value: Option<&str>, name: &str) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Err(format!("calver: missing {name} in --now"));
+    };
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("calver: invalid {name} in --now"))
+}
+
+fn render_calver_plan_json(
+    args: ComputeArgs,
+    tags: &[String],
+    package_version: &str,
+    version: &str,
+) -> String {
+    let mut arg_fields = vec![
+        format!("\"stable\":{}", args.stable),
+        format!("\"now\":{}", render_date_parts_json(args.now)),
+    ];
+    if let Some(channel) = args.channel {
+        arg_fields.push(format!("\"channel\":{}", json_string(channel.as_str())));
+    }
+    format!(
+        "{{\"command\":\"calver\",\"args\":{{{}}},\"tags\":{},\"packageVersion\":{},\"version\":{}}}\n",
+        arg_fields.join(","),
+        json_string_array(tags),
+        json_string(package_version),
+        json_string(version)
+    )
+}
+
+fn render_date_parts_json(now: DateParts) -> String {
+    format!(
+        "{{\"year\":{},\"month\":{},\"day\":{},\"hour\":{},\"minute\":{}}}",
+        now.year, now.month, now.day, now.hour, now.minute
+    )
 }
 
 fn run_normalize_plan(argv: &[String]) -> CliOutput {
@@ -185,7 +345,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n"
         .to_owned()
 }
 

@@ -111,6 +111,7 @@ name = "maw-cli"
 version = "0.1.0"
 dependencies = [
  "maw-bring",
+ "maw-calver",
  "maw-matcher",
  "serde",
  "serde_json",
