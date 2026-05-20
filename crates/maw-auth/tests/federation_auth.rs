@@ -629,3 +629,56 @@ fn consent_request_id_generation_matches_maw_js_24_hex_contract() {
         "abababababababababababab"
     );
 }
+
+// Ported from maw-js `test/pair-api-default.test.ts` generate/probe cases
+// and `src/api/pair.ts` route decision behavior.
+#[test]
+fn pair_api_generate_and_probe_plans_match_maw_js_status_contract() {
+    use maw_auth::{pair_api_generate_plan, pair_api_probe_plan, PairApiConfig, PairCodeStore};
+
+    let config = PairApiConfig {
+        node: "node-a".to_owned(),
+        oracle: "oracle-a".to_owned(),
+        port: 4567,
+        base_url: "http://localhost:4567".to_owned(),
+        federation_token: "token-a".to_owned(),
+        pubkey: "p".repeat(64),
+    };
+    let mut store = PairCodeStore::default();
+
+    let generated = pair_api_generate_plan(&mut store, &config, "ABC234", None, None, 1_000_000);
+    assert_eq!(generated.status, 201);
+    assert!(generated.ok);
+    assert_eq!(generated.code, "ABC-234");
+    assert_eq!(generated.ttl_ms, 120_000);
+    assert_eq!(generated.expires_at, 1_120_000);
+    assert_eq!(generated.node, "node-a");
+    assert_eq!(generated.port, 4567);
+
+    let generated = pair_api_generate_plan(&mut store, &config, "ABC234", Some(5), None, 1_000_000);
+    assert_eq!(generated.ttl_ms, 5_000);
+    assert_eq!(generated.expires_at, 1_005_000);
+
+    let generated =
+        pair_api_generate_plan(&mut store, &config, "ABC234", None, Some(42), 1_000_000);
+    assert_eq!(generated.ttl_ms, 42);
+    assert_eq!(generated.expires_at, 1_000_042);
+
+    let invalid = pair_api_probe_plan(&store, &config, "bad", 1_000_000);
+    assert_eq!(invalid.status, 400);
+    assert_eq!(invalid.error.as_deref(), Some("invalid_shape"));
+
+    let missing = pair_api_probe_plan(&store, &config, "ZZZ999", 1_000_000);
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.error.as_deref(), Some("not_found"));
+
+    let _ = store.register_at("DEF456", 1, 0);
+    let expired = pair_api_probe_plan(&store, &config, "DEF456", 1_000_000);
+    assert_eq!(expired.status, 410);
+    assert_eq!(expired.error.as_deref(), Some("expired"));
+
+    let live = pair_api_probe_plan(&store, &config, "ABC234", 1_000_000);
+    assert_eq!(live.status, 200);
+    assert!(live.ok);
+    assert_eq!(live.node.as_deref(), Some("node-a"));
+}

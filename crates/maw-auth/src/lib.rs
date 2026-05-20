@@ -231,6 +231,35 @@ pub struct PairEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApiConfig {
+    pub node: String,
+    pub oracle: String,
+    pub port: u16,
+    pub base_url: String,
+    pub federation_token: String,
+    pub pubkey: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApiGenerateResult {
+    pub status: u16,
+    pub ok: bool,
+    pub code: String,
+    pub expires_at: u64,
+    pub ttl_ms: u64,
+    pub node: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApiProbeResult {
+    pub status: u16,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupResult {
     Live(PairEntry),
     NotFound,
@@ -528,6 +557,51 @@ pub fn verify_consent_pin(pin: &str, expected_hash: &str) -> bool {
 #[must_use]
 pub fn consent_request_id_from_bytes(bytes: &[u8]) -> String {
     hex_lower(&bytes.iter().copied().take(12).collect::<Vec<_>>())
+}
+
+pub fn pair_api_generate_plan(
+    store: &mut PairCodeStore,
+    config: &PairApiConfig,
+    code: &str,
+    expires_sec: Option<u64>,
+    ttl_ms: Option<u64>,
+    now_ms: u64,
+) -> PairApiGenerateResult {
+    let ttl_ms =
+        ttl_ms.unwrap_or_else(|| expires_sec.map_or(120_000, |sec| sec.saturating_mul(1_000)));
+    let entry = store.register_at(code, ttl_ms, now_ms);
+    PairApiGenerateResult {
+        status: 201,
+        ok: true,
+        code: pretty_pair_code(&entry.code),
+        expires_at: entry.expires_at,
+        ttl_ms,
+        node: config.node.clone(),
+        port: config.port,
+    }
+}
+
+#[must_use]
+pub fn pair_api_probe_plan(
+    store: &PairCodeStore,
+    config: &PairApiConfig,
+    code: &str,
+    now_ms: u64,
+) -> PairApiProbeResult {
+    if !is_valid_pair_code_shape(code) {
+        return pair_api_probe_error(400, "invalid_shape");
+    }
+    match store.lookup_at(code, now_ms) {
+        LookupResult::Live(_) => PairApiProbeResult {
+            status: 200,
+            ok: true,
+            error: None,
+            node: Some(config.node.clone()),
+        },
+        LookupResult::NotFound => pair_api_probe_error(404, "not_found"),
+        LookupResult::Expired => pair_api_probe_error(410, "expired"),
+        LookupResult::Consumed => pair_api_probe_error(410, "consumed"),
+    }
 }
 
 #[must_use]
@@ -913,6 +987,15 @@ fn consent_error(error: impl Into<String>) -> ConsentApprovalResult {
         ok: false,
         error: Some(error.into()),
         entry: None,
+    }
+}
+
+fn pair_api_probe_error(status: u16, error: &str) -> PairApiProbeResult {
+    PairApiProbeResult {
+        status,
+        ok: false,
+        error: Some(error.to_owned()),
+        node: None,
     }
 }
 
