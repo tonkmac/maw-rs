@@ -4,12 +4,13 @@
 //! be tested against maw-js parser contracts before host IO is wired.
 
 use maw_auth::{
-    consent_request_id_from_bytes, generate_pair_code_from_bytes, hash_consent_pin,
-    is_valid_pair_code_shape, normalize_pair_code, pretty_pair_code, redact_pair_code,
-    request_consent_plan, sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3,
-    verify_auto_pair_proof, verify_consent_pin, verify_request, AutoPairIdentity, ConsentAction,
+    approve_consent_plan, consent_request_id_from_bytes, generate_pair_code_from_bytes,
+    hash_consent_pin, is_valid_pair_code_shape, normalize_pair_code, pretty_pair_code,
+    redact_pair_code, reject_consent_plan, request_consent_plan, sign_auto_pair_proof,
+    sign_headers_v3_at, sign_request_v3, verify_auto_pair_proof, verify_consent_pin,
+    verify_request, ApprovedBy, AutoPairIdentity, ConsentAction, ConsentApprovalResult,
     ConsentRequestArgs, ConsentRequestResult, ConsentStore, FromVerifyDecision, Headers,
-    PeerPendingRequest, PeerPostResult, PendingRequest, VerifyRequestArgs,
+    PeerPendingRequest, PeerPostResult, PendingRequest, TrustEntry, VerifyRequestArgs,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -116,6 +117,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "auto-pair-proof" => run_auto_pair_proof_plan(&argv[1..]),
         "consent-pin" => run_consent_pin_plan(&argv[1..]),
         "consent-request" => run_consent_request_plan(&argv[1..]),
+        "consent-approval" => run_consent_approval_plan(&argv[1..]),
         "pair-code" => run_pair_code_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
@@ -4675,6 +4677,249 @@ fn consent_request_usage_error(message: &str) -> CliOutput {
 
 fn consent_request_usage() -> &'static str {
     "usage: maw-rs consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]"
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_consent_approval_plan(argv: &[String]) -> CliOutput {
+    let Some(mode) = argv.first().map(String::as_str) else {
+        return consent_approval_usage_error("consent-approval: expected approve or reject");
+    };
+    if mode != "approve" && mode != "reject" {
+        return consent_approval_usage_error("consent-approval: expected approve or reject");
+    }
+
+    let mut plan_json = false;
+    let mut request_id = None::<String>;
+    let mut from = None::<String>;
+    let mut to = None::<String>;
+    let mut action = None::<ConsentAction>;
+    let mut summary = None::<String>;
+    let mut pin = None::<String>;
+    let mut seed_pin = "ABCDEF".to_owned();
+    let mut created_at_ms = None::<i64>;
+    let mut now_ms = None::<i64>;
+
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--request-id" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error(
+                        "consent-approval: missing --request-id value",
+                    );
+                };
+                request_id = Some(value.to_owned());
+                index += 1;
+            }
+            "--from" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error("consent-approval: missing --from value");
+                };
+                from = Some(value.to_owned());
+                index += 1;
+            }
+            "--to" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error("consent-approval: missing --to value");
+                };
+                to = Some(value.to_owned());
+                index += 1;
+            }
+            "--action" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error(
+                        "consent-approval: missing --action value",
+                    );
+                };
+                match parse_consent_action(value) {
+                    Ok(parsed) => action = Some(parsed),
+                    Err(_) => {
+                        return consent_approval_usage_error(
+                            "consent-approval: invalid --action value",
+                        )
+                    }
+                }
+                index += 1;
+            }
+            "--summary" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error(
+                        "consent-approval: missing --summary value",
+                    );
+                };
+                summary = Some(value.to_owned());
+                index += 1;
+            }
+            "--pin" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error("consent-approval: missing --pin value");
+                };
+                pin = Some(value.to_owned());
+                index += 1;
+            }
+            "--seed-pin" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error(
+                        "consent-approval: missing --seed-pin value",
+                    );
+                };
+                value.clone_into(&mut seed_pin);
+                index += 1;
+            }
+            "--created-at" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error(
+                        "consent-approval: missing --created-at value",
+                    );
+                };
+                match parse_i64_arg(value, "consent-approval: --created-at") {
+                    Ok(parsed) => created_at_ms = Some(parsed),
+                    Err(message) => return consent_approval_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_approval_usage_error("consent-approval: missing --now value");
+                };
+                match parse_i64_arg(value, "consent-approval: --now") {
+                    Ok(parsed) => now_ms = Some(parsed),
+                    Err(message) => return consent_approval_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return consent_approval_usage_error(&format!(
+                    "consent-approval: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let Some(request_id) = request_id else {
+        return consent_approval_usage_error("consent-approval: missing --request-id value");
+    };
+    let Some(from) = from else {
+        return consent_approval_usage_error("consent-approval: missing --from value");
+    };
+    let Some(to) = to else {
+        return consent_approval_usage_error("consent-approval: missing --to value");
+    };
+    let Some(action) = action else {
+        return consent_approval_usage_error("consent-approval: missing --action value");
+    };
+    let Some(summary) = summary else {
+        return consent_approval_usage_error("consent-approval: missing --summary value");
+    };
+    let Some(pin) = pin else {
+        return consent_approval_usage_error("consent-approval: missing --pin value");
+    };
+    let Some(created_at_ms) = created_at_ms else {
+        return consent_approval_usage_error("consent-approval: missing --created-at value");
+    };
+    let Some(now_ms) = now_ms else {
+        return consent_approval_usage_error("consent-approval: missing --now value");
+    };
+
+    let mut store = ConsentStore::default();
+    request_consent_plan(
+        &mut store,
+        ConsentRequestArgs {
+            from: from.clone(),
+            to: to.clone(),
+            action,
+            summary,
+            peer_url: None,
+            request_id: request_id.clone(),
+            pin: seed_pin,
+            now_ms: created_at_ms,
+            peer_post: PeerPostResult::Skipped,
+        },
+    );
+
+    let result = if mode == "approve" {
+        approve_consent_plan(&mut store, &request_id, &pin, now_ms)
+    } else {
+        reject_consent_plan(&mut store, &request_id)
+    };
+    let pending_status = store
+        .read_pending(&request_id)
+        .map_or("missing", |request| consent_status_name(request.status));
+    let trusted = store.is_trusted(&from, &to, action);
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_consent_approval_plan_json(mode, &result, pending_status, trusted)
+        } else {
+            render_consent_approval_plan_text(mode, &result, pending_status, trusted)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_consent_approval_plan_json(
+    mode: &str,
+    result: &ConsentApprovalResult,
+    pending_status: &str,
+    trusted: bool,
+) -> String {
+    format!(
+        "{{\"command\":\"consent-approval\",\"mode\":{},\"ok\":{},\"error\":{},\"pin\":null,\"entry\":{},\"pendingStatus\":{},\"trusted\":{}}}\n",
+        json_string(mode),
+        result.ok,
+        json_optional_string(result.error.as_deref()),
+        render_trust_entry_json(result.entry.as_ref()),
+        json_string(pending_status),
+        trusted
+    )
+}
+
+fn render_trust_entry_json(entry: Option<&TrustEntry>) -> String {
+    entry.map_or_else(|| "null".to_owned(), |entry| {
+        format!(
+            "{{\"from\":{},\"to\":{},\"action\":{},\"approvedAt\":{},\"approvedBy\":{},\"requestId\":{}}}",
+            json_string(&entry.from),
+            json_string(&entry.to),
+            json_string(entry.action.as_str()),
+            json_string(&entry.approved_at),
+            json_string(approved_by_name(entry.approved_by)),
+            json_optional_string(entry.request_id.as_deref())
+        )
+    })
+}
+
+fn approved_by_name(approved_by: ApprovedBy) -> &'static str {
+    match approved_by {
+        ApprovedBy::Human => "human",
+        ApprovedBy::Auto => "auto",
+    }
+}
+
+fn render_consent_approval_plan_text(
+    mode: &str,
+    result: &ConsentApprovalResult,
+    pending_status: &str,
+    trusted: bool,
+) -> String {
+    format!(
+        "consent-approval mode={mode} ok={} pendingStatus={pending_status} trusted={trusted}\n",
+        result.ok
+    )
+}
+
+fn consent_approval_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", consent_approval_usage()),
+    }
+}
+
+fn consent_approval_usage() -> &'static str {
+    "usage: maw-rs consent-approval <approve|reject> --request-id <id> --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --pin <pin> --created-at <ms> --now <ms> [--seed-pin <pin>] [--plan-json]"
 }
 
 fn run_pair_code_plan(argv: &[String]) -> CliOutput {
