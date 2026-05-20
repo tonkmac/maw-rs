@@ -86,6 +86,55 @@ pub struct PluginEngineServe {
     pub event_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginTarget {
+    Js,
+}
+
+impl PluginTarget {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Js => "js",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginTier {
+    Core,
+    Standard,
+    Extra,
+}
+
+impl PluginTier {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Standard => "standard",
+            Self::Extra => "extra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDependencies {
+    pub plugins: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginArtifact {
+    pub path: String,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCapabilities {
+    pub capabilities: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHooks {
     pub gate: Option<Vec<String>>,
@@ -419,6 +468,203 @@ pub fn parse_engine(manifest: &Value) -> Result<Option<PluginEngine>, String> {
     }))
 }
 
+/// Parse the optional `target` section.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for unsupported targets.
+pub fn parse_target(manifest: &Value) -> Result<Option<PluginTarget>, String> {
+    let Some(target) = manifest.get("target") else {
+        return Ok(None);
+    };
+    let Some(target_string) = target.as_str() else {
+        return Err("plugin.json: target must be a string".to_owned());
+    };
+    if target_string == "wasm" {
+        return Err(
+            "plugin.json: target \"wasm\" not yet supported (Phase C). Use target \"js\" for now."
+                .to_owned(),
+        );
+    }
+    if target_string != "js" {
+        return Err(format!(
+            "plugin.json: unknown target {target} (expected \"js\")"
+        ));
+    }
+    Ok(Some(PluginTarget::Js))
+}
+
+/// Parse optional `capabilityNamespaces`.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed namespace arrays.
+pub fn parse_capability_namespaces(manifest: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(namespaces) = manifest.get("capabilityNamespaces") else {
+        return Ok(None);
+    };
+    let namespaces = parse_string_array(
+        namespaces,
+        "plugin.json: capabilityNamespaces must be an array of slug strings",
+        true,
+    )?;
+    if namespaces.iter().any(|namespace| !is_slug(namespace)) {
+        return Err(
+            "plugin.json: capabilityNamespaces must be an array of slug strings".to_owned(),
+        );
+    }
+
+    let mut deduped = Vec::new();
+    for namespace in namespaces {
+        if !deduped.contains(&namespace) {
+            deduped.push(namespace);
+        }
+    }
+    Ok(Some(deduped))
+}
+
+/// Parse optional `capabilities` and collect maw-js warning text for unknown namespaces.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed capability arrays.
+pub fn parse_capabilities(
+    manifest: &Value,
+    extra_namespaces: &[&str],
+) -> Result<Option<PluginCapabilities>, String> {
+    let Some(capabilities) = manifest.get("capabilities") else {
+        return Ok(None);
+    };
+    let capabilities = parse_string_array(
+        capabilities,
+        "plugin.json: capabilities must be an array of strings",
+        false,
+    )?;
+    let mut warnings = Vec::new();
+    for capability in &capabilities {
+        let namespace = capability
+            .split_once(':')
+            .map_or(capability.as_str(), |(namespace, _)| namespace);
+        if !is_known_capability_namespace(namespace)
+            && !extra_namespaces.iter().any(|extra| extra == &namespace)
+        {
+            warnings.push(format!(
+                "plugin.json: unknown capability namespace \"{namespace}\" in \"{capability}\""
+            ));
+        }
+    }
+    Ok(Some(PluginCapabilities {
+        capabilities,
+        warnings,
+    }))
+}
+
+/// Parse optional `dependencies`.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed dependency shapes.
+pub fn parse_dependencies(manifest: &Value) -> Result<Option<PluginDependencies>, String> {
+    let Some(dependencies) = manifest.get("dependencies") else {
+        return Ok(None);
+    };
+
+    let plugins_value = if dependencies.is_array() {
+        Some(dependencies)
+    } else if let Some(object) = dependencies.as_object() {
+        object.get("plugins")
+    } else {
+        return Err(
+            "plugin.json: dependencies must be an object or array of plugin names".to_owned(),
+        );
+    };
+
+    let Some(plugins_value) = plugins_value else {
+        return Ok(Some(PluginDependencies { plugins: None }));
+    };
+    let plugins = parse_string_array(
+        plugins_value,
+        "plugin.json: dependencies.plugins must be an array of plugin names",
+        true,
+    )?;
+    if plugins.iter().any(|plugin| !is_slug(plugin)) {
+        return Err(
+            "plugin.json: dependencies.plugins must be an array of plugin names".to_owned(),
+        );
+    }
+    Ok(Some(PluginDependencies {
+        plugins: Some(plugins),
+    }))
+}
+
+/// Parse optional `artifact`.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed artifact shapes.
+pub fn parse_artifact(manifest: &Value) -> Result<Option<PluginArtifact>, String> {
+    let Some(artifact) = manifest.get("artifact") else {
+        return Ok(None);
+    };
+    let Some(artifact) = artifact.as_object() else {
+        return Err("plugin.json: artifact must be an object".to_owned());
+    };
+
+    let Some(path) = artifact
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+    else {
+        return Err("plugin.json: artifact.path must be a non-empty string".to_owned());
+    };
+
+    let sha256_value = artifact
+        .get("sha256")
+        .ok_or_else(|| "plugin.json: artifact.sha256 must be a string or null".to_owned())?;
+    let sha256 = if sha256_value.is_null() {
+        None
+    } else {
+        Some(
+            sha256_value
+                .as_str()
+                .ok_or_else(|| "plugin.json: artifact.sha256 must be a string or null".to_owned())?
+                .to_owned(),
+        )
+    };
+
+    Ok(Some(PluginArtifact {
+        path: path.to_owned(),
+        sha256,
+    }))
+}
+
+/// Parse optional `tier`.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for unknown tiers.
+pub fn parse_tier(manifest: &Value) -> Result<Option<PluginTier>, String> {
+    let Some(tier) = manifest.get("tier") else {
+        return Ok(None);
+    };
+    let Some(tier_string) = tier.as_str() else {
+        return Err(format!(
+            "plugin.json: tier must be \"core\", \"standard\", or \"extra\" (got {tier})"
+        ));
+    };
+    let tier = match tier_string {
+        "core" => PluginTier::Core,
+        "standard" => PluginTier::Standard,
+        "extra" => PluginTier::Extra,
+        _ => {
+            return Err(format!(
+                "plugin.json: tier must be \"core\", \"standard\", or \"extra\" (got {tier})"
+            ));
+        }
+    };
+    Ok(Some(tier))
+}
+
 /// Parse the optional `hooks` section.
 ///
 /// # Errors
@@ -529,6 +775,20 @@ fn parse_lifecycle_hook(
         ensures,
         policy,
     }))
+}
+
+fn is_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn is_known_capability_namespace(namespace: &str) -> bool {
+    matches!(
+        namespace,
+        "net" | "fs" | "peer" | "sdk" | "proc" | "ffi" | "tmux" | "shell" | "attach"
+    )
 }
 
 fn parse_optional_string_array(

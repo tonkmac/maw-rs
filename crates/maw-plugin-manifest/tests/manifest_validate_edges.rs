@@ -1,6 +1,7 @@
 use maw_plugin_manifest::{
-    parse_api, parse_cli, parse_cron, parse_engine, parse_hooks, parse_module, parse_transport,
-    ApiMethod, CliFlagKind, HookPolicy,
+    parse_api, parse_artifact, parse_capabilities, parse_capability_namespaces, parse_cli,
+    parse_cron, parse_dependencies, parse_engine, parse_hooks, parse_module, parse_target,
+    parse_tier, parse_transport, ApiMethod, CliFlagKind, HookPolicy, PluginTarget, PluginTier,
 };
 use serde_json::json;
 
@@ -259,6 +260,139 @@ fn parse_engine_rejects_malformed_serve_process_metadata() {
     );
 }
 
+#[test]
+fn parse_dependencies_artifact_and_tier_cover_compact_and_invalid_shapes() {
+    assert_eq!(
+        parse_dependencies(&json!({})).expect("missing dependencies is valid"),
+        None
+    );
+    let deps = parse_dependencies(&json!({ "dependencies": ["trace", "dig"] }))
+        .expect("valid compact dependencies")
+        .expect("dependencies present");
+    assert_eq!(
+        deps.plugins,
+        Some(vec!["trace".to_owned(), "dig".to_owned()])
+    );
+    let empty_deps = parse_dependencies(&json!({ "dependencies": {} }))
+        .expect("valid empty dependencies")
+        .expect("dependencies present");
+    assert_eq!(empty_deps.plugins, None);
+    expect_dependencies_error(
+        &json!({ "dependencies": "trace" }),
+        "plugin.json: dependencies must be an object or array of plugin names",
+    );
+    expect_dependencies_error(
+        &json!({ "dependencies": { "plugins": ["Bad Name"] } }),
+        "plugin.json: dependencies.plugins must be an array of plugin names",
+    );
+
+    assert_eq!(
+        parse_artifact(&json!({})).expect("missing artifact is valid"),
+        None
+    );
+    let artifact =
+        parse_artifact(&json!({ "artifact": { "path": "dist/index.js", "sha256": null } }))
+            .expect("valid artifact null sha")
+            .expect("artifact present");
+    assert_eq!(artifact.path, "dist/index.js");
+    assert_eq!(artifact.sha256, None);
+    let artifact =
+        parse_artifact(&json!({ "artifact": { "path": "dist/index.js", "sha256": "abc" } }))
+            .expect("valid artifact sha")
+            .expect("artifact present");
+    assert_eq!(artifact.sha256, Some("abc".to_owned()));
+    expect_artifact_error(
+        &json!({ "artifact": [] }),
+        "plugin.json: artifact must be an object",
+    );
+    expect_artifact_error(
+        &json!({ "artifact": { "path": "" } }),
+        "plugin.json: artifact.path must be a non-empty string",
+    );
+    expect_artifact_error(
+        &json!({ "artifact": { "path": "dist/index.js", "sha256": 1 } }),
+        "plugin.json: artifact.sha256 must be a string or null",
+    );
+
+    assert_eq!(parse_tier(&json!({})).expect("missing tier is valid"), None);
+    assert_eq!(
+        parse_tier(&json!({ "tier": "core" })).expect("valid tier"),
+        Some(PluginTier::Core)
+    );
+    assert_eq!(PluginTier::Extra.as_str(), "extra");
+    expect_tier_error(&json!({ "tier": "primary" }), "plugin.json: tier must be");
+}
+
+#[test]
+fn target_and_capability_validators_cover_valid_invalid_and_warning_branches() {
+    assert_eq!(
+        parse_target(&json!({})).expect("missing target is valid"),
+        None
+    );
+    assert_eq!(
+        parse_target(&json!({ "target": "js" })).expect("valid target"),
+        Some(PluginTarget::Js)
+    );
+    assert_eq!(PluginTarget::Js.as_str(), "js");
+    expect_target_error(
+        &json!({ "target": 1 }),
+        "plugin.json: target must be a string",
+    );
+    expect_target_error(
+        &json!({ "target": "wasm" }),
+        "plugin.json: target \"wasm\" not yet supported",
+    );
+    expect_target_error(
+        &json!({ "target": "python" }),
+        "plugin.json: unknown target",
+    );
+
+    assert_eq!(
+        parse_capability_namespaces(&json!({})).expect("missing namespaces is valid"),
+        None
+    );
+    assert_eq!(
+        parse_capability_namespaces(
+            &json!({ "capabilityNamespaces": ["messages", "messages", "storage"] })
+        )
+        .expect("valid namespaces"),
+        Some(vec!["messages".to_owned(), "storage".to_owned()])
+    );
+    expect_capability_namespaces_error(
+        &json!({ "capabilityNamespaces": ["Bad Name"] }),
+        "plugin.json: capabilityNamespaces must be an array of slug strings",
+    );
+
+    assert_eq!(
+        parse_capabilities(&json!({}), &[]).expect("missing capabilities is valid"),
+        None
+    );
+    let capabilities = parse_capabilities(
+        &json!({ "capabilities": ["sdk:identity", "messages:ledger"] }),
+        &["messages"],
+    )
+    .expect("valid capabilities")
+    .expect("capabilities present");
+    assert_eq!(
+        capabilities.capabilities,
+        vec!["sdk:identity".to_owned(), "messages:ledger".to_owned()]
+    );
+    assert!(capabilities.warnings.is_empty());
+    expect_capabilities_error(
+        &json!({ "capabilities": [1] }),
+        "plugin.json: capabilities must be an array of strings",
+    );
+
+    let capabilities = parse_capabilities(&json!({ "capabilities": ["unknown:thing"] }), &[])
+        .expect("unknown namespaces warn")
+        .expect("capabilities present");
+    assert_eq!(capabilities.capabilities, vec!["unknown:thing".to_owned()]);
+    assert!(capabilities
+        .warnings
+        .join("\n")
+        .contains("unknown capability namespace"));
+}
+
 fn expect_error(input: &serde_json::Value, expected: &str) {
     let error = parse_cli(input).expect_err("expected parse_cli error");
     assert!(
@@ -309,6 +443,55 @@ fn expect_transport_error(input: &serde_json::Value, expected: &str) {
 
 fn expect_engine_error(input: &serde_json::Value, expected: &str) {
     let error = parse_engine(input).expect_err("expected parse_engine error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_target_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_target(input).expect_err("expected parse_target error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_capability_namespaces_error(input: &serde_json::Value, expected: &str) {
+    let error =
+        parse_capability_namespaces(input).expect_err("expected parse_capability_namespaces error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_capabilities_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_capabilities(input, &[]).expect_err("expected parse_capabilities error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_dependencies_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_dependencies(input).expect_err("expected parse_dependencies error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_artifact_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_artifact(input).expect_err("expected parse_artifact error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_tier_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_tier(input).expect_err("expected parse_tier error");
     assert!(
         error.contains(expected),
         "{error:?} did not contain {expected:?}"
