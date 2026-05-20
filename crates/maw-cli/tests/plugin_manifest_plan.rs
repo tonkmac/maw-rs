@@ -309,3 +309,171 @@ fn write_entry_plugin(
     )
     .expect("manifest");
 }
+
+#[test]
+fn plugin_manifest_import_symbol_plan_cli_returns_whitelisted_exports() {
+    let root = make_temp_dir("import-symbol-happy");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&plugins_dir).expect("plugins");
+    write_module_plugin(
+        &plugins_dir,
+        "helper",
+        "./lib.ts",
+        &["answer", "greet"],
+        false,
+    );
+
+    let output = json_output(&run_cli(&[
+        "plugin-manifest".to_owned(),
+        "import-symbol".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.to_string_lossy().into_owned(),
+        "--plugin".to_owned(),
+        "helper".to_owned(),
+        "--symbol".to_owned(),
+        "answer".to_owned(),
+        "--module-symbol".to_owned(),
+        "answer=42".to_owned(),
+        "--module-symbol".to_owned(),
+        "greet=hi Nat".to_owned(),
+        "--plan-json".to_owned(),
+    ]));
+
+    assert_eq!(output["command"], "plugin-manifest");
+    assert_eq!(output["kind"], "import-symbol");
+    assert_eq!(output["plugin"], "helper");
+    assert_eq!(output["symbol"], "answer");
+    assert_eq!(output["value"], "42");
+    assert!(
+        output["modulePath"]
+            .as_str()
+            .expect("module path")
+            .ends_with("plugins/helper/lib.ts"),
+        "{}",
+        output["modulePath"]
+    );
+
+    remove_dir_all(root).expect("cleanup import symbol");
+}
+
+#[test]
+fn plugin_manifest_import_symbol_plan_cli_rejects_private_missing_and_disabled() {
+    let root = make_temp_dir("import-symbol-errors");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&plugins_dir).expect("plugins");
+    write_module_plugin(&plugins_dir, "helper", "./lib.ts", &["publicThing"], false);
+    write_module_plugin(
+        &plugins_dir,
+        "disabled-helper",
+        "./lib.ts",
+        &["answer"],
+        false,
+    );
+
+    let private = run_cli(&[
+        "plugin-manifest".to_owned(),
+        "import-symbol".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.to_string_lossy().into_owned(),
+        "--plugin".to_owned(),
+        "helper".to_owned(),
+        "--symbol".to_owned(),
+        "privateThing".to_owned(),
+        "--module-symbol".to_owned(),
+        "privateThing=true".to_owned(),
+        "--plan-json".to_owned(),
+    ]);
+    assert_eq!(private.code, 2);
+    assert!(
+        private.stderr.contains("does not export 'privateThing'"),
+        "{}",
+        private.stderr
+    );
+
+    let missing_runtime = run_cli(&[
+        "plugin-manifest".to_owned(),
+        "import-symbol".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.to_string_lossy().into_owned(),
+        "--plugin".to_owned(),
+        "helper".to_owned(),
+        "--symbol".to_owned(),
+        "publicThing".to_owned(),
+        "--module-symbol".to_owned(),
+        "other=true".to_owned(),
+        "--plan-json".to_owned(),
+    ]);
+    assert_eq!(missing_runtime.code, 2);
+    assert!(
+        missing_runtime
+            .stderr
+            .contains("module did not provide export 'publicThing'"),
+        "{}",
+        missing_runtime.stderr
+    );
+
+    let disabled = run_cli(&[
+        "plugin-manifest".to_owned(),
+        "import-symbol".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.to_string_lossy().into_owned(),
+        "--disabled".to_owned(),
+        "disabled-helper".to_owned(),
+        "--plugin".to_owned(),
+        "disabled-helper".to_owned(),
+        "--symbol".to_owned(),
+        "answer".to_owned(),
+        "--module-symbol".to_owned(),
+        "answer=42".to_owned(),
+        "--plan-json".to_owned(),
+    ]);
+    assert_eq!(disabled.code, 2);
+    assert!(
+        disabled
+            .stderr
+            .contains("plugin 'disabled-helper' is disabled"),
+        "{}",
+        disabled.stderr
+    );
+
+    remove_dir_all(root).expect("cleanup import errors");
+}
+
+fn write_module_plugin(
+    root: &Path,
+    name: &str,
+    module_path: &str,
+    exports: &[&str],
+    disabled: bool,
+) {
+    let dir = root.join(name);
+    create_dir_all(&dir).expect("plugin dir");
+    let normalized_module_path = module_path.trim_start_matches("./");
+    let path = dir.join(normalized_module_path);
+    create_dir_all(path.parent().expect("module parent")).expect("module parent");
+    write(&path, b"export const answer = 42;\n").expect("module");
+    let mut full_manifest = serde_json::Map::from_iter([
+        ("name".to_owned(), json!(name)),
+        ("version".to_owned(), json!("1.0.0")),
+        ("sdk".to_owned(), json!("*")),
+        ("target".to_owned(), json!("js")),
+        ("entry".to_owned(), json!("index.ts")),
+        (
+            "module".to_owned(),
+            json!({ "path": module_path, "exports": exports }),
+        ),
+    ]);
+    if disabled {
+        full_manifest.insert("weight".to_owned(), json!(99));
+    }
+    write(
+        dir.join("index.ts"),
+        b"export default async function helper() {}\n",
+    )
+    .expect("entry");
+    write(
+        dir.join("plugin.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(full_manifest)).expect("json"),
+    )
+    .expect("manifest");
+}
