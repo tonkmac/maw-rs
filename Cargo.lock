@@ -113,6 +113,7 @@ dependencies = [
  "maw-bring",
  "maw-calver",
  "maw-matcher",
+ "maw-peer",
  "maw-routing",
  "maw-worktree",
  "serde",

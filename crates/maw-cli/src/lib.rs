@@ -9,6 +9,10 @@ use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
     ResolveOptions, ResolveResult,
 };
+use maw_peer::{
+    resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
+    PeerSourceMode, PeerSourceResult,
+};
 use maw_routing::{
     resolve_target as resolve_route_target, MawConfig as RouteConfig, NamedPeer as RouteNamedPeer,
     ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
@@ -40,12 +44,200 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "calver" => run_calver_plan(&argv[1..]),
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
         "route" => run_route_plan(&argv[1..]),
+        "peer-sources" => run_peer_sources_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut mode = PeerSourceMode::Both;
+    let mut config = PeerConfig::default();
+    let mut discoveries: Option<DiscoveryResult> = None;
+    let mut discovery_rows = Vec::new();
+    let mut discovery_error_hint = None;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--mode" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_sources_usage_error("peer-sources: missing --mode value");
+                };
+                let Some(parsed) = maw_peer::parse_peer_source_mode(Some(value), mode) else {
+                    return peer_sources_usage_error("peer-sources: unknown --mode");
+                };
+                mode = parsed;
+                index += 1;
+            }
+            "--peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_sources_usage_error("peer-sources: missing --peer value");
+                };
+                config.peers.push(value.to_owned());
+                index += 1;
+            }
+            "--named-peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_sources_usage_error("peer-sources: missing --named-peer value");
+                };
+                match parse_key_value(value, "peer-sources: --named-peer must use <name=url>") {
+                    Ok((name, url)) => config.named_peers.push(NamedPeerConfig { name, url }),
+                    Err(message) => return peer_sources_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--discovery-ok" => discoveries = Some(DiscoveryResult::Ok { peers: Vec::new() }),
+            "--discovery-error" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_sources_usage_error(
+                        "peer-sources: missing --discovery-error value",
+                    );
+                };
+                discoveries = Some(DiscoveryResult::Err {
+                    error: value.to_owned(),
+                    hint: discovery_error_hint.clone(),
+                });
+                index += 1;
+            }
+            "--discovery-hint" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_sources_usage_error(
+                        "peer-sources: missing --discovery-hint value",
+                    );
+                };
+                discovery_error_hint = Some(value.to_owned());
+                if let Some(DiscoveryResult::Err { hint, .. }) = &mut discoveries {
+                    hint.clone_from(&discovery_error_hint);
+                }
+                index += 1;
+            }
+            "--discovered" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_sources_usage_error("peer-sources: missing --discovered value");
+                };
+                match parse_discovery_row(value) {
+                    Ok(row) => discovery_rows.push(row),
+                    Err(message) => return peer_sources_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return peer_sources_usage_error(&format!("peer-sources: unknown argument {arg}"))
+            }
+        }
+        index += 1;
+    }
+
+    if !discovery_rows.is_empty() {
+        discoveries = Some(DiscoveryResult::Ok {
+            peers: discovery_rows,
+        });
+    }
+
+    let result = resolve_peer_sources(&config, mode, discoveries.as_ref());
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_peer_sources_plan_json(&result)
+        } else {
+            render_peer_sources_plan_text(&result)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn peer_sources_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n"
+        ),
+    }
+}
+
+fn parse_discovery_row(value: &str) -> Result<DiscoveryRow, String> {
+    let parts: Vec<&str> = value.splitn(4, '|').collect();
+    if parts.len() != 4 {
+        return Err(
+            "peer-sources: --discovered must use <node|host|oracle|locator[,locator]>".to_owned(),
+        );
+    }
+    Ok(DiscoveryRow {
+        node: optional_field(parts[0]),
+        host: optional_field(parts[1]),
+        oracle: optional_field(parts[2]),
+        locators: parts[3]
+            .split(',')
+            .filter(|locator| !locator.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    })
+}
+
+fn optional_field(value: &str) -> Option<String> {
+    if value.is_empty() || value == "-" {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn render_peer_sources_plan_json(result: &PeerSourceResult) -> String {
+    format!(
+        "{{\"command\":\"peer-sources\",\"mode\":{},\"peers\":{},\"warnings\":{},\"fetchCalls\":{}}}\n",
+        json_string(result.mode.as_str()),
+        render_peer_targets_json(result),
+        json_string_array(&result.warnings),
+        result.fetch_calls
+    )
+}
+
+fn render_peer_targets_json(result: &PeerSourceResult) -> String {
+    format!(
+        "[{}]",
+        result
+            .peers
+            .iter()
+            .map(|peer| {
+                let mut fields = vec![
+                    format!("\"url\":{}", json_string(&peer.url)),
+                    format!("\"source\":{}", json_string(peer.source.as_str())),
+                ];
+                push_json_opt(&mut fields, "name", peer.name.as_deref());
+                push_json_opt(&mut fields, "node", peer.node.as_deref());
+                push_json_opt(&mut fields, "oracle", peer.oracle.as_deref());
+                format!("{{{}}}", fields.join(","))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_peer_sources_plan_text(result: &PeerSourceResult) -> String {
+    let mut lines = vec![format!(
+        "peer-sources mode={} fetchCalls={}",
+        result.mode.as_str(),
+        result.fetch_calls
+    )];
+    for peer in &result.peers {
+        lines.push(format!(
+            "{} {} {}",
+            peer.source.as_str(),
+            peer.name.as_deref().unwrap_or("-"),
+            peer.url
+        ));
+    }
+    for warning in &result.warnings {
+        lines.push(format!("warning: {warning}"));
+    }
+    lines.join("\n") + "\n"
 }
 
 #[allow(clippy::too_many_lines)]
@@ -734,7 +926,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n"
         .to_owned()
 }
 
