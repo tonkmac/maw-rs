@@ -900,6 +900,30 @@ where
             .map(|_| ())
     }
 
+    /// Run maw-js `cmdTmuxSplit` against a resolved target with command-style error wrapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns pct validation or wrapped runner errors.
+    pub fn split_target_action(
+        &mut self,
+        target: &TmuxKillTarget,
+        options: &TmuxSplitActionOptions,
+    ) -> Result<(), TmuxError> {
+        self.runner
+            .run(
+                "split-window",
+                &tmux_split_action_args(&target.resolved, options)?,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                TmuxError::new(format!(
+                    "split-window failed for '{}' (from {}): {}",
+                    target.resolved, target.source, error.message
+                ))
+            })
+    }
+
     /// Select a pane, optionally setting its title.
     ///
     /// # Errors
@@ -1007,6 +1031,32 @@ where
         validate_layout_preset(preset)?;
         let window = tmux_window_target(resolved);
         self.select_layout(&window, preset)
+    }
+
+    /// Run maw-js `cmdTmuxLayout` against a resolved target with command-style error wrapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns preset validation or wrapped runner errors.
+    pub fn select_layout_action(
+        &mut self,
+        target: &TmuxKillTarget,
+        preset: &str,
+    ) -> Result<(), TmuxError> {
+        validate_layout_preset(preset)?;
+        let window = tmux_window_target(&target.resolved);
+        self.runner
+            .run(
+                "select-layout",
+                &["-t".to_owned(), window.clone(), preset.to_owned()],
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                TmuxError::new(format!(
+                    "select-layout failed for '{}' (from {}): {}",
+                    window, target.source, error.message
+                ))
+            })
     }
 
     /// Send tmux keys to a target.
@@ -2537,6 +2587,49 @@ mod tests {
         );
         assert_eq!(tmux_window_target("some-session:0.1"), "some-session:0");
         assert_eq!(tmux_window_target("some-session"), "some-session");
+    }
+
+    #[test]
+    fn tmux_split_and_layout_actions_wrap_host_failures_like_maw_js() {
+        let target = TmuxKillTarget {
+            resolved: "%1".to_owned(),
+            source: "pane-id".to_owned(),
+        };
+        let runner = FakeRunner::with_responses(vec![Err(TmuxError::new("split bad"))]);
+        let mut client = TmuxClient::new(runner);
+        let error = client
+            .split_target_action(&target, &TmuxSplitActionOptions::default())
+            .expect_err("split error wrapped");
+        assert_eq!(
+            error.message,
+            "split-window failed for '%1' (from pane-id): split bad"
+        );
+
+        let target = TmuxKillTarget {
+            resolved: "demo:1.2".to_owned(),
+            source: "session:w.p".to_owned(),
+        };
+        let runner = FakeRunner::with_responses(vec![Err(TmuxError::new("layout denied"))]);
+        let mut client = TmuxClient::new(runner);
+        let error = client
+            .select_layout_action(&target, "tiled")
+            .expect_err("layout error wrapped");
+        assert_eq!(
+            error.message,
+            "select-layout failed for 'demo:1' (from session:w.p): layout denied"
+        );
+        assert_eq!(
+            client.runner.calls,
+            vec![(
+                "select-layout".to_owned(),
+                vec!["-t".to_owned(), "demo:1".to_owned(), "tiled".to_owned()]
+            )]
+        );
+
+        let error = client
+            .select_layout_action(&target, "spiral")
+            .expect_err("invalid layout");
+        assert!(error.message.contains("invalid layout 'spiral'"));
     }
 
     #[test]
