@@ -2,7 +2,7 @@
 //! `src/commands/shared/plugin-create-scaffold.ts`.
 //!
 //! This crate ports the deterministic validation/manifest helpers plus the
-//! template tree-copy contract from `test/plugin-create.test.ts`.
+//! template tree-copy and Rust scaffold contracts from `test/plugin-create.test.ts`.
 
 use std::{fs, io, path::Path};
 
@@ -26,6 +26,46 @@ pub enum PluginLanguage {
 /// directories, or copying files.
 pub fn copy_tree(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> io::Result<()> {
     copy_tree_inner(src.as_ref(), dest.as_ref())
+}
+
+/// Scaffold a Rust WASM plugin from a template directory.
+///
+/// Mirrors maw-js `scaffoldRust`: validates the template exists, copies the
+/// template tree, rewrites `Cargo.toml` package name and SDK path, writes a
+/// README, and emits `plugin.json`.
+///
+/// # Errors
+///
+/// Returns filesystem errors from template lookup, tree copy, reading/writing
+/// `Cargo.toml`, README, or `plugin.json`.
+pub fn scaffold_rust(
+    name: &str,
+    dest: impl AsRef<Path>,
+    template_dir: impl AsRef<Path>,
+    sdk_path: &str,
+) -> io::Result<()> {
+    let dest = dest.as_ref();
+    let template_dir = template_dir.as_ref();
+    if !template_dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Rust template not found at {}", template_dir.display()),
+        ));
+    }
+
+    copy_tree(template_dir, dest)?;
+
+    let cargo_path = dest.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path)?;
+    let cargo = rewrite_rust_cargo_toml(&cargo, name, sdk_path);
+    fs::write(&cargo_path, cargo)?;
+
+    fs::write(dest.join("README.md"), rust_readme(name, dest, sdk_path))?;
+    fs::write(
+        dest.join("plugin.json"),
+        build_manifest_json(name, PluginLanguage::Rust),
+    )?;
+    Ok(())
 }
 
 /// Validate a plugin scaffold name.
@@ -87,6 +127,58 @@ pub fn build_manifest_json(name: &str, lang: PluginLanguage) -> String {
         Err(error) => format!(r#"{{"error":"manifest serialization failed: {error}"}}"#),
     };
     format!("{text}\n")
+}
+
+fn rewrite_rust_cargo_toml(cargo: &str, name: &str, sdk_path: &str) -> String {
+    let mut rewritten = cargo
+        .lines()
+        .map(|line| {
+            if line.starts_with("name = ") {
+                format!(r#"name = "{name}""#)
+            } else if line.trim_start().starts_with("maw-plugin-sdk = { path = ") {
+                format!(r#"maw-plugin-sdk = {{ path = "{sdk_path}" }}"#)
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if cargo.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+fn rust_readme(name: &str, dest: &Path, sdk_path: &str) -> String {
+    let crate_name = name.replace('-', "_");
+    format!(
+        r#"# {name}
+
+A maw WASM command plugin (Rust).
+
+## Build
+
+```bash
+cd "{}"
+cargo build --release --target wasm32-unknown-unknown
+```
+
+Output: `target/wasm32-unknown-unknown/release/{crate_name}.wasm`
+
+## Install
+
+```bash
+maw plugin install "{}"
+```
+
+## SDK docs
+
+See the SDK at `{sdk_path}` for available host functions:
+`maw::print`, `maw::identity`, `maw::federation`, `maw::send`, `maw::fetch`.
+"#,
+        dest.display(),
+        dest.display()
+    )
 }
 
 fn copy_tree_inner(src: &Path, dest: &Path) -> io::Result<()> {
