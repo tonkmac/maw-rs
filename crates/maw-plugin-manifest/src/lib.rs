@@ -56,6 +56,23 @@ impl ApiMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCron {
+    pub schedule: String,
+    pub handler: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginModule {
+    pub exports: Vec<String>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTransport {
+    pub peer: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHooks {
     pub gate: Option<Vec<String>>,
     pub filter: Option<Vec<String>>,
@@ -199,6 +216,106 @@ pub fn parse_api(manifest: &Value) -> Result<Option<PluginApi>, String> {
         path: path.to_owned(),
         methods: parsed,
     }))
+}
+
+/// Parse the optional `cron` section.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed cron shapes.
+pub fn parse_cron(manifest: &Value) -> Result<Option<PluginCron>, String> {
+    let Some(cron) = manifest.get("cron") else {
+        return Ok(None);
+    };
+    let Some(cron) = cron.as_object() else {
+        return Err("plugin.json: cron must be an object".to_owned());
+    };
+
+    let Some(schedule) = cron
+        .get("schedule")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err("plugin.json: cron.schedule must be a non-empty string".to_owned());
+    };
+
+    let handler = match cron.get("handler") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| "plugin.json: cron.handler must be a string".to_owned())?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    Ok(Some(PluginCron {
+        schedule: schedule.to_owned(),
+        handler,
+    }))
+}
+
+/// Parse the optional `module` section.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed module shapes.
+pub fn parse_module(manifest: &Value) -> Result<Option<PluginModule>, String> {
+    let Some(module) = manifest.get("module") else {
+        return Ok(None);
+    };
+    let Some(module) = module.as_object() else {
+        return Err("plugin.json: module must be an object".to_owned());
+    };
+
+    let exports = parse_string_array(
+        module.get("exports").ok_or_else(|| {
+            "plugin.json: module.exports must be a non-empty array of strings".to_owned()
+        })?,
+        "plugin.json: module.exports must be a non-empty array of strings",
+        false,
+    )?;
+    if exports.is_empty() {
+        return Err("plugin.json: module.exports must be a non-empty array of strings".to_owned());
+    }
+
+    let Some(path) = module
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err("plugin.json: module.path must be a non-empty string".to_owned());
+    };
+
+    Ok(Some(PluginModule {
+        exports,
+        path: path.to_owned(),
+    }))
+}
+
+/// Parse the optional `transport` section.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed transport shapes.
+pub fn parse_transport(manifest: &Value) -> Result<Option<PluginTransport>, String> {
+    let Some(transport) = manifest.get("transport") else {
+        return Ok(None);
+    };
+    let Some(transport) = transport.as_object() else {
+        return Err("plugin.json: transport must be an object".to_owned());
+    };
+
+    let peer = match transport.get("peer") {
+        Some(value) => Some(
+            value
+                .as_bool()
+                .ok_or_else(|| "plugin.json: transport.peer must be a boolean".to_owned())?,
+        ),
+        None => None,
+    };
+
+    Ok(Some(PluginTransport { peer }))
 }
 
 /// Parse the optional `hooks` section.

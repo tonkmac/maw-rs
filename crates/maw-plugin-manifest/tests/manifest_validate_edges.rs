@@ -1,4 +1,7 @@
-use maw_plugin_manifest::{parse_api, parse_cli, parse_hooks, ApiMethod, CliFlagKind, HookPolicy};
+use maw_plugin_manifest::{
+    parse_api, parse_cli, parse_cron, parse_hooks, parse_module, parse_transport, ApiMethod,
+    CliFlagKind, HookPolicy,
+};
 use serde_json::json;
 
 #[test]
@@ -131,6 +134,67 @@ fn parse_hooks_validates_lifecycle_hook_branches() {
     );
 }
 
+#[test]
+fn parse_cron_module_and_transport_reject_malformed_sections() {
+    assert_eq!(parse_cron(&json!({})).expect("missing cron is valid"), None);
+    let cron = parse_cron(&json!({ "cron": { "schedule": "* * * * *", "handler": "tick" } }))
+        .expect("valid cron")
+        .expect("cron present");
+    assert_eq!(cron.schedule, "* * * * *");
+    assert_eq!(cron.handler, Some("tick".to_owned()));
+    expect_cron_error(
+        &json!({ "cron": [] }),
+        "plugin.json: cron must be an object",
+    );
+    expect_cron_error(
+        &json!({ "cron": { "schedule": "" } }),
+        "plugin.json: cron.schedule must be a non-empty string",
+    );
+    expect_cron_error(
+        &json!({ "cron": { "schedule": "* * * * *", "handler": 1 } }),
+        "plugin.json: cron.handler must be a string",
+    );
+
+    assert_eq!(
+        parse_module(&json!({})).expect("missing module is valid"),
+        None
+    );
+    let module = parse_module(&json!({ "module": { "exports": ["thing"], "path": "./mod.ts" } }))
+        .expect("valid module")
+        .expect("module present");
+    assert_eq!(module.exports, vec!["thing".to_owned()]);
+    assert_eq!(module.path, "./mod.ts");
+    expect_module_error(
+        &json!({ "module": [] }),
+        "plugin.json: module must be an object",
+    );
+    expect_module_error(
+        &json!({ "module": { "exports": [], "path": "./mod.ts" } }),
+        "plugin.json: module.exports must be a non-empty array of strings",
+    );
+    expect_module_error(
+        &json!({ "module": { "exports": ["thing"], "path": "" } }),
+        "plugin.json: module.path must be a non-empty string",
+    );
+
+    assert_eq!(
+        parse_transport(&json!({})).expect("missing transport is valid"),
+        None
+    );
+    let transport = parse_transport(&json!({ "transport": { "peer": false } }))
+        .expect("valid transport")
+        .expect("transport present");
+    assert_eq!(transport.peer, Some(false));
+    expect_transport_error(
+        &json!({ "transport": [] }),
+        "plugin.json: transport must be an object",
+    );
+    expect_transport_error(
+        &json!({ "transport": { "peer": "yes" } }),
+        "plugin.json: transport.peer must be a boolean",
+    );
+}
+
 fn expect_error(input: &serde_json::Value, expected: &str) {
     let error = parse_cli(input).expect_err("expected parse_cli error");
     assert!(
@@ -149,6 +213,30 @@ fn expect_api_error(input: &serde_json::Value, expected: &str) {
 
 fn expect_hooks_error(input: &serde_json::Value, expected: &str) {
     let error = parse_hooks(input).expect_err("expected parse_hooks error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_cron_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_cron(input).expect_err("expected parse_cron error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_module_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_module(input).expect_err("expected parse_module error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_transport_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_transport(input).expect_err("expected parse_transport error");
     assert!(
         error.contains(expected),
         "{error:?} did not contain {expected:?}"
