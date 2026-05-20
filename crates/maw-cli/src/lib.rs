@@ -24,6 +24,7 @@ use maw_peer::{
     resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
     PeerSourceMode, PeerSourceResult,
 };
+use maw_plugin_manifest::{load_manifest_from_dir, parse_manifest, LoadedPlugin, PluginManifest};
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
 };
@@ -67,6 +68,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "hub" => run_hub_plan(&argv[1..]),
         "xdg" => run_xdg_plan(&argv[1..]),
         "plugin-scaffold" => run_plugin_scaffold_plan(&argv[1..]),
+        "plugin-manifest" => run_plugin_manifest_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -998,6 +1000,241 @@ fn plugin_scaffold_usage_error(message: &str) -> CliOutput {
             "{message}\nusage: maw-rs plugin-scaffold validate-name --name <name> [--plan-json]\n       maw-rs plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n"
         ),
     }
+}
+
+fn run_plugin_manifest_plan(argv: &[String]) -> CliOutput {
+    let action = match parse_plugin_manifest_args(argv) {
+        Ok(action) => action,
+        Err(message) => return plugin_manifest_usage_error(&message),
+    };
+    match action {
+        PluginManifestAction::Parse {
+            plan_json,
+            dir,
+            json_text,
+        } => match parse_manifest(&json_text, &dir) {
+            Ok(manifest) => CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    format!(
+                        "{{\"command\":\"plugin-manifest\",\"kind\":\"parse\",\"dir\":{},\"manifest\":{}}}\n",
+                        json_string(&path_string(&dir)),
+                        render_plugin_manifest_json(&manifest)
+                    )
+                } else {
+                    format!("{}\n", manifest.name)
+                },
+                stderr: String::new(),
+            },
+            Err(message) => plugin_manifest_usage_error(&message),
+        },
+        PluginManifestAction::Load { plan_json, dir } => match load_manifest_from_dir(&dir) {
+            Ok(plugin) => CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    let plugin_json = plugin
+                        .as_ref()
+                        .map_or_else(|| "null".to_owned(), render_loaded_plugin_json);
+                    format!(
+                        "{{\"command\":\"plugin-manifest\",\"kind\":\"load\",\"dir\":{},\"present\":{},\"plugin\":{plugin_json}}}\n",
+                        json_string(&path_string(&dir)),
+                        plugin.is_some()
+                    )
+                } else {
+                    plugin.map_or_else(
+                        || "missing\n".to_owned(),
+                        |plugin| format!("{} {}\n", plugin.kind.as_str(), plugin.manifest.name),
+                    )
+                },
+                stderr: String::new(),
+            },
+            Err(message) => plugin_manifest_usage_error(&message),
+        },
+    }
+}
+
+enum PluginManifestAction {
+    Parse {
+        plan_json: bool,
+        dir: std::path::PathBuf,
+        json_text: String,
+    },
+    Load {
+        plan_json: bool,
+        dir: std::path::PathBuf,
+    },
+}
+
+fn parse_plugin_manifest_args(argv: &[String]) -> Result<PluginManifestAction, String> {
+    let Some(kind) = argv.first().map(String::as_str) else {
+        return Err("plugin-manifest: expected parse or load".to_owned());
+    };
+    match kind {
+        "parse" => parse_plugin_manifest_parse_args(&argv[1..]),
+        "load" => parse_plugin_manifest_load_args(&argv[1..]),
+        other => Err(format!("plugin-manifest: unknown subcommand {other}")),
+    }
+}
+
+fn parse_plugin_manifest_parse_args(argv: &[String]) -> Result<PluginManifestAction, String> {
+    let mut plan_json = false;
+    let mut dir = std::path::PathBuf::from(".");
+    let mut json_text = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--dir" => {
+                dir = take_plugin_manifest_path(argv, index, "--dir")?;
+                index += 1;
+            }
+            "--json" => {
+                json_text = Some(take_plugin_manifest_value(argv, index, "--json")?);
+                index += 1;
+            }
+            other => return Err(format!("plugin-manifest parse: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(PluginManifestAction::Parse {
+        plan_json,
+        dir,
+        json_text: json_text
+            .ok_or_else(|| "plugin-manifest parse: --json is required".to_owned())?,
+    })
+}
+
+fn parse_plugin_manifest_load_args(argv: &[String]) -> Result<PluginManifestAction, String> {
+    let mut plan_json = false;
+    let mut dir = std::path::PathBuf::from(".");
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--dir" => {
+                dir = take_plugin_manifest_path(argv, index, "--dir")?;
+                index += 1;
+            }
+            other => return Err(format!("plugin-manifest load: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(PluginManifestAction::Load { plan_json, dir })
+}
+
+fn take_plugin_manifest_path(
+    argv: &[String],
+    index: usize,
+    name: &str,
+) -> Result<std::path::PathBuf, String> {
+    Ok(std::path::PathBuf::from(take_plugin_manifest_value(
+        argv, index, name,
+    )?))
+}
+
+fn take_plugin_manifest_value(argv: &[String], index: usize, name: &str) -> Result<String, String> {
+    argv.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("plugin-manifest: missing {name} value"))
+}
+
+fn plugin_manifest_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n"
+        ),
+    }
+}
+
+fn render_loaded_plugin_json(plugin: &LoadedPlugin) -> String {
+    format!(
+        "{{\"dir\":{},\"wasmPath\":{},\"entryPath\":{},\"kind\":{},\"disabled\":{},\"manifest\":{}}}",
+        json_string(&path_string(&plugin.dir)),
+        json_string(&path_string(&plugin.wasm_path)),
+        plugin.entry_path.as_ref().map_or_else(|| "null".to_owned(), |path| {
+            json_string(&path_string(path))
+        }),
+        json_string(plugin.kind.as_str()),
+        plugin.disabled,
+        render_plugin_manifest_json(&plugin.manifest)
+    )
+}
+
+fn render_plugin_manifest_json(manifest: &PluginManifest) -> String {
+    let weight = manifest
+        .weight
+        .map_or_else(|| "null".to_owned(), |weight| weight.to_string());
+    format!(
+        "{{\"name\":{},\"version\":{},\"weight\":{weight},\"tier\":{},\"wasm\":{},\"entry\":{},\"sdk\":{},\"cli\":{},\"api\":{},\"description\":{},\"author\":{},\"target\":{},\"capabilityNamespaces\":{},\"capabilities\":{},\"capabilityWarnings\":{},\"artifact\":{}}}",
+        json_string(&manifest.name),
+        json_string(&manifest.version),
+        manifest.tier.map_or_else(|| "null".to_owned(), |tier| json_string(tier.as_str())),
+        json_opt_string(manifest.wasm.as_deref()),
+        json_opt_string(manifest.entry.as_deref()),
+        json_string(&manifest.sdk),
+        render_plugin_cli_json(manifest.cli.as_ref()),
+        render_plugin_api_json(manifest.api.as_ref()),
+        json_opt_string(manifest.description.as_deref()),
+        json_opt_string(manifest.author.as_deref()),
+        manifest.target.map_or_else(|| "null".to_owned(), |target| json_string(target.as_str())),
+        manifest.capability_namespaces.as_ref().map_or_else(|| "null".to_owned(), |values| json_string_array(values)),
+        manifest.capabilities.as_ref().map_or_else(|| "null".to_owned(), |values| json_string_array(values)),
+        json_string_array(&manifest.capability_warnings),
+        manifest.artifact.as_ref().map_or_else(|| "null".to_owned(), |artifact| {
+            format!(
+                "{{\"path\":{},\"sha256\":{}}}",
+                json_string(&artifact.path),
+                json_opt_string(artifact.sha256.as_deref())
+            )
+        })
+    )
+}
+
+fn render_plugin_cli_json(cli: Option<&maw_plugin_manifest::PluginCli>) -> String {
+    let Some(cli) = cli else {
+        return "null".to_owned();
+    };
+    let flags = cli.flags.as_ref().map_or_else(
+        || "null".to_owned(),
+        |flags| {
+            let entries = flags
+                .iter()
+                .map(|(name, kind)| format!("{}:{}", json_string(name), json_string(kind.as_str())))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{entries}}}")
+        },
+    );
+    format!(
+        "{{\"command\":{},\"aliases\":{},\"help\":{},\"flags\":{flags}}}",
+        json_string(&cli.command),
+        cli.aliases
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |values| json_string_array(values)),
+        json_opt_string(cli.help.as_deref())
+    )
+}
+
+fn render_plugin_api_json(api: Option<&maw_plugin_manifest::PluginApi>) -> String {
+    let Some(api) = api else {
+        return "null".to_owned();
+    };
+    let methods = api
+        .methods
+        .iter()
+        .map(|method| method.as_str().to_owned())
+        .collect::<Vec<_>>();
+    format!(
+        "{{\"path\":{},\"methods\":{}}}",
+        json_string(&api.path),
+        json_string_array(&methods)
+    )
+}
+
+fn json_opt_string(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_owned(), json_string)
 }
 
 fn run_bind_host_plan(argv: &[String]) -> CliOutput {

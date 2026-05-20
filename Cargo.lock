@@ -120,6 +120,7 @@ dependencies = [
  "maw-identity",
  "maw-matcher",
  "maw-peer",
+ "maw-plugin-manifest",
  "maw-plugin-scaffold",
  "maw-policy",
  "maw-routing",
