@@ -17,6 +17,17 @@ const DEFAULT_CAPTURE_LINES: u32 = 80;
 const DEFAULT_PTY_COLS_LIMIT: u32 = 500;
 const DEFAULT_PTY_ROWS_LIMIT: u32 = 200;
 const MAX_SUBMIT_ATTEMPTS: u32 = 4;
+const COOLDOWN_MS: u64 = 500;
+const QUOTA_PER_MINUTE: u32 = 100;
+const QUOTA_WINDOW_MS: u64 = 60_000;
+
+const VALID_LAYOUTS: [&str; 5] = [
+    "even-horizontal",
+    "even-vertical",
+    "main-horizontal",
+    "main-vertical",
+    "tiled",
+];
 
 /// Tmux window metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +138,125 @@ pub struct TmuxLsPaneRef {
 pub struct DestructiveCheck {
     pub destructive: bool,
     pub reasons: Vec<String>,
+}
+
+/// Options for Rust's maw-js-compatible `maw tmux send` action wrapper.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TmuxSendCommandOptions {
+    pub literal: bool,
+    pub allow_destructive: bool,
+    pub force: bool,
+}
+
+/// Options for Rust's maw-js-compatible `maw tmux split` action wrapper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmuxSplitActionOptions {
+    pub vertical: bool,
+    pub pct: f64,
+    pub command: Option<String>,
+}
+
+impl Default for TmuxSplitActionOptions {
+    fn default() -> Self {
+        Self {
+            vertical: false,
+            pct: 50.0,
+            command: None,
+        }
+    }
+}
+
+/// Per-pane heartbeat throttle state for `maw tmux send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendTrackerEntry {
+    pub last_ts: u64,
+    pub count: u32,
+    pub window_start: u64,
+}
+
+/// Send throttle outcome before tmux mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendThrottle {
+    Allowed,
+    Cooldown { cooldown_ms: u64 },
+    Quota { quota_per_minute: u32 },
+}
+
+/// In-memory cooldown + quota tracker ported from maw-js `_sendTracker`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TmuxSendTracker {
+    entries: BTreeMap<String, SendTrackerEntry>,
+}
+
+impl TmuxSendTracker {
+    /// Return the current entry for tests/diagnostics.
+    #[must_use]
+    pub fn get(&self, resolved: &str) -> Option<SendTrackerEntry> {
+        self.entries.get(resolved).copied()
+    }
+
+    /// Insert or replace a tracker entry for tests/recovery.
+    pub fn set(&mut self, resolved: impl Into<String>, entry: SendTrackerEntry) {
+        self.entries.insert(resolved.into(), entry);
+    }
+
+    /// Clear all tracker entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Apply maw-js heartbeat cooldown and quota gates.
+    ///
+    /// `force` bypasses the tracker and does not mutate it, matching the JavaScript action.
+    pub fn check(&mut self, resolved: &str, now_ms: u64, force: bool) -> SendThrottle {
+        if force {
+            return SendThrottle::Allowed;
+        }
+        let Some(prev) = self.entries.get_mut(resolved) else {
+            self.entries.insert(
+                resolved.to_owned(),
+                SendTrackerEntry {
+                    last_ts: now_ms,
+                    count: 1,
+                    window_start: now_ms,
+                },
+            );
+            return SendThrottle::Allowed;
+        };
+        if now_ms.saturating_sub(prev.last_ts) < COOLDOWN_MS {
+            return SendThrottle::Cooldown {
+                cooldown_ms: COOLDOWN_MS,
+            };
+        }
+        if now_ms.saturating_sub(prev.window_start) > QUOTA_WINDOW_MS {
+            prev.count = 0;
+            prev.window_start = now_ms;
+        }
+        if prev.count >= QUOTA_PER_MINUTE {
+            return SendThrottle::Quota {
+                quota_per_minute: QUOTA_PER_MINUTE,
+            };
+        }
+        prev.last_ts = now_ms;
+        prev.count += 1;
+        SendThrottle::Allowed
+    }
+}
+
+/// Outcome from a high-level `maw tmux send` action attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxSendCommandOutcome {
+    Sent,
+    Throttled(SendThrottle),
+}
+
+/// Execution action selected by maw-js `maw tmux attach`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxAttachAction {
+    Print { session: String },
+    SwitchClient { session: String },
+    Attach { session: String },
+    Recover { session: String },
 }
 
 /// Error returned by an injected tmux runner.
@@ -564,6 +694,27 @@ where
         Ok(raw.lines().next().unwrap_or_default().to_owned())
     }
 
+    /// Return the current command for a pane through tmux `display-message`.
+    ///
+    /// This matches the safety lookup used by maw-js `cmdTmuxSend`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot inspect the target.
+    pub fn display_pane_current_command(&mut self, target: &str) -> Result<String, TmuxError> {
+        self.runner
+            .run(
+                "display-message",
+                &[
+                    "-p".to_owned(),
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    "#{pane_current_command}".to_owned(),
+                ],
+            )
+            .map(|raw| raw.trim().to_owned())
+    }
+
     /// Return command and cwd for a pane.
     ///
     /// # Errors
@@ -635,6 +786,21 @@ where
             args.push(shell_command.clone());
         }
         self.runner.run("split-window", &args).map(|_| ())
+    }
+
+    /// Run the high-level maw-js `maw tmux split` mutation against an already-resolved pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation or runner errors.
+    pub fn split_pane_action(
+        &mut self,
+        resolved: &str,
+        options: &TmuxSplitActionOptions,
+    ) -> Result<(), TmuxError> {
+        self.runner
+            .run("split-window", &tmux_split_action_args(resolved, options)?)
+            .map(|_| ())
     }
 
     /// Select a pane, optionally setting its title.
@@ -735,6 +901,17 @@ where
             .map(|_| ())
     }
 
+    /// Apply a maw-js `maw tmux layout` preset after validating the allowed set.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation or runner errors.
+    pub fn select_valid_layout(&mut self, resolved: &str, preset: &str) -> Result<(), TmuxError> {
+        validate_layout_preset(preset)?;
+        let window = tmux_window_target(resolved);
+        self.select_layout(&window, preset)
+    }
+
     /// Send tmux keys to a target.
     ///
     /// # Errors
@@ -763,6 +940,60 @@ where
                 ],
             )
             .map(|_| ())
+    }
+
+    /// Run the high-level maw-js `maw tmux send` mutation against an already-resolved pane.
+    ///
+    /// The caller owns target resolution and user-facing output; this method ports the action
+    /// gates and exact `send-keys` argument shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, safety, lookup, or runner errors.
+    pub fn send_command_to_pane(
+        &mut self,
+        tracker: &mut TmuxSendTracker,
+        resolved: &str,
+        command: &str,
+        options: &TmuxSendCommandOptions,
+        now_ms: u64,
+    ) -> Result<TmuxSendCommandOutcome, TmuxError> {
+        if command.is_empty() {
+            return Err(TmuxError::new(
+                "usage: maw tmux send <target> <command> [--literal] [--allow-destructive] [--force]",
+            ));
+        }
+        match tracker.check(resolved, now_ms, options.force) {
+            SendThrottle::Allowed => {}
+            throttle => return Ok(TmuxSendCommandOutcome::Throttled(throttle)),
+        }
+
+        let destructive = check_destructive(command);
+        if destructive.destructive && !options.allow_destructive {
+            return Err(TmuxError::new(format!(
+                "refusing to send: command matches destructive patterns:\n{}\n  pass --allow-destructive to bypass (review carefully first)",
+                destructive
+                    .reasons
+                    .iter()
+                    .map(|reason| format!("  - {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )));
+        }
+
+        let pane_current_command = self.display_pane_current_command(resolved)?;
+        if is_claude_like_pane(Some(&pane_current_command)) && !options.force {
+            return Err(TmuxError::new(format!(
+                "refusing to send: pane '{resolved}' is running '{pane_current_command}' (claude-like).\n  injecting keys would collide with the AI's turn.\n  pass --force to override (you really want to type into a live claude pane)"
+            )));
+        }
+
+        self.runner
+            .run(
+                "send-keys",
+                &tmux_send_command_args(resolved, command, options.literal),
+            )
+            .map(|_| TmuxSendCommandOutcome::Sent)
     }
 
     /// Paste tmux buffer into a target.
@@ -1187,6 +1418,117 @@ pub fn is_fleet_or_view_session(session_name: &str, fleet_sessions: &BTreeSet<St
     fleet_sessions.contains(session_name)
         || session_name == "maw-view"
         || session_name.ends_with("-view")
+}
+
+/// Validate maw-js `maw tmux layout` presets.
+///
+/// # Errors
+///
+/// Returns a message listing every valid preset when `preset` is invalid.
+pub fn validate_layout_preset(preset: &str) -> Result<(), TmuxError> {
+    if VALID_LAYOUTS.contains(&preset) {
+        Ok(())
+    } else {
+        Err(TmuxError::new(format!(
+            "invalid layout '{preset}'. Valid: {}",
+            VALID_LAYOUTS.join(", ")
+        )))
+    }
+}
+
+/// Strip a pane suffix from a tmux target so layout applies to the window.
+#[must_use]
+pub fn tmux_window_target(resolved: &str) -> String {
+    let Some(dot) = resolved.rfind('.') else {
+        return resolved.to_owned();
+    };
+    let Some(colon) = resolved.rfind(':') else {
+        return resolved.to_owned();
+    };
+    if dot > colon + 1
+        && resolved[dot + 1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        resolved[..dot].to_owned()
+    } else {
+        resolved.to_owned()
+    }
+}
+
+/// Validate and render maw-js `maw tmux split --pct`.
+///
+/// # Errors
+///
+/// Returns the maw-js-compatible bounds message for NaN, infinities, and values outside `1..=99`.
+pub fn split_pct_arg(pct: f64) -> Result<String, TmuxError> {
+    if !pct.is_finite() || !(1.0..=99.0).contains(&pct) {
+        return Err(TmuxError::new(format!("--pct must be 1-99 (got {pct})")));
+    }
+    Ok(format_js_number(pct))
+}
+
+fn format_js_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
+    }
+}
+
+/// Build tmux args for maw-js `cmdTmuxSplit`.
+///
+/// # Errors
+///
+/// Returns pct validation errors.
+pub fn tmux_split_action_args(
+    resolved: &str,
+    options: &TmuxSplitActionOptions,
+) -> Result<Vec<String>, TmuxError> {
+    let mut args = vec![
+        if options.vertical { "-v" } else { "-h" }.to_owned(),
+        "-l".to_owned(),
+        format!("{}%", split_pct_arg(options.pct)?),
+        "-t".to_owned(),
+        resolved.to_owned(),
+    ];
+    if let Some(command) = &options.command {
+        args.push(command.clone());
+    }
+    Ok(args)
+}
+
+/// Build tmux args for maw-js `cmdTmuxSend`.
+#[must_use]
+pub fn tmux_send_command_args(resolved: &str, command: &str, literal: bool) -> Vec<String> {
+    let mut args = vec!["-t".to_owned(), resolved.to_owned(), command.to_owned()];
+    if !literal {
+        args.push("Enter".to_owned());
+    }
+    args
+}
+
+/// Pure branch selector for maw-js `cmdTmuxAttach`.
+#[must_use]
+pub fn decide_tmux_attach_action(
+    resolved: &str,
+    alive_sessions: &BTreeSet<String>,
+    print: bool,
+    is_tty: bool,
+    in_tmux: bool,
+) -> TmuxAttachAction {
+    let session = resolved.split(':').next().unwrap_or_default().to_owned();
+    if !alive_sessions.contains(&session) {
+        return TmuxAttachAction::Recover { session };
+    }
+    if print || !is_tty {
+        return TmuxAttachAction::Print { session };
+    }
+    if in_tmux {
+        TmuxAttachAction::SwitchClient { session }
+    } else {
+        TmuxAttachAction::Attach { session }
+    }
 }
 
 /// Parse `tmux list-sessions -F '#{session_name}\t#{session_created}'` style epoch rows.
@@ -1874,6 +2216,242 @@ mod tests {
         assert!(!is_fleet_or_view_session("view-something", &fleet));
         assert!(is_fleet_or_view_session("maw-view", &BTreeSet::new()));
         assert!(is_fleet_or_view_session("anything-view", &BTreeSet::new()));
+    }
+
+    #[test]
+    fn tmux_action_layout_and_split_validation_match_maw_js_cases() {
+        let error = validate_layout_preset("bogus").expect_err("invalid layout");
+        assert!(error.message.contains("invalid layout 'bogus'"));
+        assert!(error.message.contains("even-horizontal"));
+        assert!(error.message.contains("main-horizontal"));
+        assert!(error.message.contains("tiled"));
+        assert!(validate_layout_preset("tiled").is_ok());
+
+        for pct in [0.0, 100.0, -5.0, f64::NAN] {
+            let error = split_pct_arg(pct).expect_err("invalid pct");
+            assert!(error.message.contains("--pct must be 1-99"));
+        }
+        assert_eq!(split_pct_arg(50.0).expect("valid pct"), "50");
+        assert_eq!(split_pct_arg(12.5).expect("valid fractional pct"), "12.5");
+        assert_eq!(
+            tmux_split_action_args(
+                "alpha:0.1",
+                &TmuxSplitActionOptions {
+                    vertical: false,
+                    pct: 40.0,
+                    command: Some("bash -lc 'echo hi'".to_owned()),
+                },
+            )
+            .expect("valid split args"),
+            vec!["-h", "-l", "40%", "-t", "alpha:0.1", "bash -lc 'echo hi'"]
+        );
+        assert_eq!(tmux_window_target("some-session:0.1"), "some-session:0");
+        assert_eq!(tmux_window_target("some-session"), "some-session");
+    }
+
+    #[test]
+    fn tmux_attach_action_branches_match_maw_js_cases() {
+        let alive = BTreeSet::from(["some-session".to_owned()]);
+        assert_eq!(
+            decide_tmux_attach_action(
+                "%999",
+                &BTreeSet::from(["%999".to_owned()]),
+                true,
+                true,
+                false
+            ),
+            TmuxAttachAction::Print {
+                session: "%999".to_owned()
+            }
+        );
+        assert_eq!(
+            decide_tmux_attach_action("some-session:0.1", &alive, true, true, false),
+            TmuxAttachAction::Print {
+                session: "some-session".to_owned()
+            }
+        );
+        assert_eq!(
+            decide_tmux_attach_action("some-session:0.1", &alive, false, false, false),
+            TmuxAttachAction::Print {
+                session: "some-session".to_owned()
+            }
+        );
+        assert_eq!(
+            decide_tmux_attach_action("some-session:0.1", &alive, false, true, true),
+            TmuxAttachAction::SwitchClient {
+                session: "some-session".to_owned()
+            }
+        );
+        assert_eq!(
+            decide_tmux_attach_action("some-session:0.1", &alive, false, true, false),
+            TmuxAttachAction::Attach {
+                session: "some-session".to_owned()
+            }
+        );
+        assert_eq!(
+            decide_tmux_attach_action("ghost-session", &alive, false, true, false),
+            TmuxAttachAction::Recover {
+                session: "ghost-session".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_send_tracker_matches_maw_js_cooldown_and_quota_gate() {
+        let mut tracker = TmuxSendTracker::default();
+        assert_eq!(tracker.check("%1", 1_000, false), SendThrottle::Allowed);
+        assert_eq!(
+            tracker.check("%1", 1_100, false),
+            SendThrottle::Cooldown { cooldown_ms: 500 }
+        );
+        assert_eq!(tracker.check("%1", 1_600, false), SendThrottle::Allowed);
+        assert_eq!(
+            tracker.get("%1"),
+            Some(SendTrackerEntry {
+                last_ts: 1_600,
+                count: 2,
+                window_start: 1_000,
+            })
+        );
+
+        tracker.set(
+            "%2",
+            SendTrackerEntry {
+                last_ts: 10_000,
+                count: 100,
+                window_start: 0,
+            },
+        );
+        assert_eq!(
+            tracker.check("%2", 11_000, false),
+            SendThrottle::Quota {
+                quota_per_minute: 100
+            }
+        );
+        assert_eq!(tracker.check("%2", 61_001, false), SendThrottle::Allowed);
+        assert_eq!(
+            tracker.get("%2"),
+            Some(SendTrackerEntry {
+                last_ts: 61_001,
+                count: 1,
+                window_start: 61_001,
+            })
+        );
+
+        tracker.set(
+            "%3",
+            SendTrackerEntry {
+                last_ts: 20_000,
+                count: 100,
+                window_start: 0,
+            },
+        );
+        assert_eq!(tracker.check("%3", 20_001, true), SendThrottle::Allowed);
+        assert_eq!(
+            tracker.get("%3"),
+            Some(SendTrackerEntry {
+                last_ts: 20_000,
+                count: 100,
+                window_start: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tmux_send_action_gates_and_args_match_maw_js_cases() {
+        assert_eq!(
+            tmux_send_command_args("%1", "echo hello", false),
+            vec!["-t", "%1", "echo hello", "Enter"]
+        );
+        assert_eq!(
+            tmux_send_command_args("%1", "C-c", true),
+            vec!["-t", "%1", "C-c"]
+        );
+
+        let runner = FakeRunner::with_responses(vec![Ok("bash\n"), Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        let mut tracker = TmuxSendTracker::default();
+        let outcome = client
+            .send_command_to_pane(
+                &mut tracker,
+                "%1",
+                "echo hello",
+                &TmuxSendCommandOptions::default(),
+                1_000,
+            )
+            .expect("send succeeds");
+        assert_eq!(outcome, TmuxSendCommandOutcome::Sent);
+        assert_eq!(client.runner.calls[0].0, "display-message");
+        assert_eq!(
+            client.runner.calls[0].1,
+            vec!["-p", "-t", "%1", "#{pane_current_command}"]
+        );
+        assert_eq!(
+            client.runner.calls[1],
+            (
+                "send-keys".to_owned(),
+                vec!["-t", "%1", "echo hello", "Enter"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            )
+        );
+
+        let runner = FakeRunner::with_responses(vec![Ok("bash\n")]);
+        let mut client = TmuxClient::new(runner);
+        let mut tracker = TmuxSendTracker::default();
+        let error = client
+            .send_command_to_pane(
+                &mut tracker,
+                "%2",
+                "rm -rf /tmp/junk",
+                &TmuxSendCommandOptions::default(),
+                2_000,
+            )
+            .expect_err("destructive command blocked");
+        assert!(error.message.contains("refusing to send"));
+        assert!(error.message.contains("--allow-destructive"));
+        assert!(client.runner.calls.is_empty());
+
+        let runner = FakeRunner::with_responses(vec![Ok("claude\n")]);
+        let mut client = TmuxClient::new(runner);
+        let mut tracker = TmuxSendTracker::default();
+        let error = client
+            .send_command_to_pane(
+                &mut tracker,
+                "%3",
+                "echo hello",
+                &TmuxSendCommandOptions::default(),
+                3_000,
+            )
+            .expect_err("claude-like pane blocked");
+        assert!(error.message.contains("claude-like"));
+        assert_eq!(client.runner.calls.len(), 1);
+
+        let runner = FakeRunner::with_responses(vec![Ok("claude\n"), Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        let mut tracker = TmuxSendTracker::default();
+        let outcome = client
+            .send_command_to_pane(
+                &mut tracker,
+                "%4",
+                "C-c",
+                &TmuxSendCommandOptions {
+                    literal: true,
+                    allow_destructive: false,
+                    force: true,
+                },
+                4_000,
+            )
+            .expect("force bypasses claude-like pane");
+        assert_eq!(outcome, TmuxSendCommandOutcome::Sent);
+        assert_eq!(
+            client.runner.calls[1].1,
+            vec!["-t", "%4", "C-c"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
