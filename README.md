@@ -31,6 +31,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-bind` | `src/core/bind-host.ts` | `test/bind-heuristic.test.ts` |
 | `maw-fuzzy` | `src/core/util/fuzzy.ts` | `test/fuzzy-match.test.ts` |
 | `maw-plugin-scaffold` | `src/commands/shared/plugin-create-scaffold.ts` | `test/plugin-create.test.ts` (pure validation/manifest cases) |
+| `maw-plugin-manifest` | `src/plugin/manifest-validate.ts` | `test/plugin-manifest-validate-edges.test.ts` (cli/api validators) |
 
 Current local gates:
 
