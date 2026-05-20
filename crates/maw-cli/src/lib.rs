@@ -37,8 +37,10 @@ use maw_plugin_scaffold::{
 };
 use maw_policy::{default_active_group, weight_to_tier, DEFAULT_TIER, KNOWN_TIERS};
 use maw_routing::{
-    resolve_target as resolve_route_target, MawConfig as RouteConfig, NamedPeer as RouteNamedPeer,
-    ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
+    apply_sync_diff, compute_sync_diff, resolve_target as resolve_route_target,
+    MawConfig as RouteConfig, NamedPeer as RouteNamedPeer, PeerIdentity as SyncPeerIdentity,
+    ResolveResult as RouteResult, Session as RouteSession, SyncApplyOptions, SyncApplyResult,
+    SyncDiff, Window as RouteWindow,
 };
 use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
 use maw_tmux::{
@@ -58,8 +60,17 @@ use maw_xdg::{
     maw_cache_path, maw_config_dir, maw_config_path, maw_data_dir, maw_data_path,
     maw_runtime_home_dir, maw_state_dir, maw_state_path, MawCorePaths, MawXdgEnv,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+struct FederationSyncFlags {
+    dry_run: bool,
+    check: bool,
+    force: bool,
+    prune: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOutput {
@@ -93,6 +104,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
         "route" => run_route_plan(&argv[1..]),
         "discover" => run_discover_plan(&argv[1..]),
+        "federation-sync" => run_federation_sync_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
@@ -3532,6 +3544,278 @@ fn render_peer_sources_plan_text(result: &PeerSourceResult) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+fn run_federation_sync_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut flags = FederationSyncFlags::default();
+    let mut node = "local".to_owned();
+    let mut agents = HashMap::<String, String>::new();
+    let mut identities = Vec::<SyncPeerIdentity>::new();
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--dry-run" => flags.dry_run = true,
+            "--check" => flags.check = true,
+            "--force" => flags.force = true,
+            "--prune" => flags.prune = true,
+            "--node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_sync_usage_error("federation-sync: missing --node value");
+                };
+                value.clone_into(&mut node);
+                index += 1;
+            }
+            "--agent" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_sync_usage_error("federation-sync: missing --agent value");
+                };
+                match parse_key_value(value, "federation-sync: --agent must use <oracle=node>") {
+                    Ok((oracle, node)) => {
+                        agents.insert(oracle, node);
+                    }
+                    Err(message) => return federation_sync_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--identity" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_sync_usage_error(
+                        "federation-sync: missing --identity value",
+                    );
+                };
+                match parse_sync_identity(value) {
+                    Ok(identity) => identities.push(identity),
+                    Err(message) => return federation_sync_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return federation_sync_usage_error(&format!(
+                    "federation-sync: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let diff = compute_sync_diff(&agents, &identities, &node);
+    let dirty = sync_diff_is_dirty(&diff);
+    let result = if flags.check || flags.dry_run {
+        SyncApplyResult {
+            agents: agents.clone(),
+            applied: Vec::new(),
+        }
+    } else {
+        apply_sync_diff(
+            &agents,
+            &diff,
+            SyncApplyOptions {
+                force: flags.force,
+                prune: flags.prune,
+            },
+        )
+    };
+    let code = i32::from(flags.check && dirty);
+
+    CliOutput {
+        code,
+        stdout: if plan_json {
+            render_federation_sync_plan_json(&node, flags, dirty, &diff, &result)
+        } else {
+            render_federation_sync_plan_text(flags, &diff, &result)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_sync_identity(value: &str) -> Result<SyncPeerIdentity, String> {
+    let parts: Vec<&str> = value.split('|').collect();
+    if !(parts.len() == 5 || parts.len() == 6) {
+        return Err(
+            "federation-sync: --identity must use <peer|url|node|agents|reachable|unreachable[,error]>"
+                .to_owned(),
+        );
+    }
+    let reachable = match parts[4] {
+        "reachable" => true,
+        "unreachable" => false,
+        _ => {
+            return Err(
+                "federation-sync: --identity reachability must be reachable or unreachable"
+                    .to_owned(),
+            )
+        }
+    };
+    Ok(SyncPeerIdentity {
+        peer_name: parts[0].to_owned(),
+        url: parts[1].to_owned(),
+        node: parts[2].to_owned(),
+        agents: parts[3]
+            .split(',')
+            .filter(|agent| !agent.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        reachable,
+        error: parts
+            .get(5)
+            .and_then(|error| (!error.is_empty()).then(|| (*error).to_owned())),
+    })
+}
+
+fn sync_diff_is_dirty(diff: &SyncDiff) -> bool {
+    !(diff.add.is_empty() && diff.stale.is_empty() && diff.conflict.is_empty())
+}
+
+fn render_federation_sync_plan_json(
+    node: &str,
+    flags: FederationSyncFlags,
+    dirty: bool,
+    diff: &SyncDiff,
+    result: &SyncApplyResult,
+) -> String {
+    format!(
+        "{{\"command\":\"federation-sync\",\"node\":{},\"dryRun\":{},\"check\":{},\"force\":{},\"prune\":{},\"dirty\":{dirty},\"diff\":{},\"applied\":{},\"agents\":{}}}\n",
+        json_string(node),
+        flags.dry_run,
+        flags.check,
+        flags.force,
+        flags.prune,
+        render_sync_diff_json(diff),
+        json_string_array(&result.applied),
+        render_agents_json(&result.agents)
+    )
+}
+
+fn render_sync_diff_json(diff: &SyncDiff) -> String {
+    format!(
+        "{{\"add\":{},\"stale\":{},\"conflict\":{},\"unreachable\":{}}}",
+        render_sync_adds_json(diff),
+        render_sync_stale_json(diff),
+        render_sync_conflicts_json(diff),
+        render_sync_unreachable_json(diff)
+    )
+}
+
+fn render_sync_adds_json(diff: &SyncDiff) -> String {
+    format!(
+        "[{}]",
+        diff.add
+            .iter()
+            .map(|add| {
+                format!(
+                    "{{\"oracle\":{},\"peerNode\":{},\"fromPeer\":{}}}",
+                    json_string(&add.oracle),
+                    json_string(&add.peer_node),
+                    json_string(&add.from_peer)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_sync_stale_json(diff: &SyncDiff) -> String {
+    format!(
+        "[{}]",
+        diff.stale
+            .iter()
+            .map(|stale| {
+                format!(
+                    "{{\"oracle\":{},\"peerNode\":{}}}",
+                    json_string(&stale.oracle),
+                    json_string(&stale.peer_node)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_sync_conflicts_json(diff: &SyncDiff) -> String {
+    format!(
+        "[{}]",
+        diff.conflict
+            .iter()
+            .map(|conflict| {
+                format!(
+                    "{{\"oracle\":{},\"current\":{},\"proposed\":{},\"fromPeer\":{}}}",
+                    json_string(&conflict.oracle),
+                    json_string(&conflict.current),
+                    json_string(&conflict.proposed),
+                    json_string(&conflict.from_peer)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_sync_unreachable_json(diff: &SyncDiff) -> String {
+    format!(
+        "[{}]",
+        diff.unreachable
+            .iter()
+            .map(|peer| {
+                let mut fields = vec![
+                    format!("\"peerName\":{}", json_string(&peer.peer_name)),
+                    format!("\"url\":{}", json_string(&peer.url)),
+                ];
+                push_json_opt(&mut fields, "error", peer.error.as_deref());
+                format!("{{{}}}", fields.join(","))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_agents_json(agents: &HashMap<String, String>) -> String {
+    let sorted = agents
+        .iter()
+        .map(|(oracle, node)| (oracle.as_str(), node.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    format!(
+        "{{{}}}",
+        sorted
+            .iter()
+            .map(|(oracle, node)| format!("{}:{}", json_string(oracle), json_string(node)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_federation_sync_plan_text(
+    flags: FederationSyncFlags,
+    diff: &SyncDiff,
+    result: &SyncApplyResult,
+) -> String {
+    format!(
+        "federation-sync add={} conflict={} stale={} unreachable={} applied={} dryRun={} check={} force={} prune={}\n",
+        diff.add.len(),
+        diff.conflict.len(),
+        diff.stale.len(),
+        diff.unreachable.len(),
+        result.applied.len(),
+        flags.dry_run,
+        flags.check,
+        flags.force,
+        flags.prune
+    )
+}
+
+fn federation_sync_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", federation_sync_usage()),
+    }
+}
+
+fn federation_sync_usage() -> &'static str {
+    "usage: maw-rs federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]"
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_discover_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
     let mut json = false;
@@ -5185,7 +5469,7 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
