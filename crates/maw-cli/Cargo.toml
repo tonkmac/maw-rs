@@ -11,6 +11,7 @@ name = "maw-rs"
 path = "src/main.rs"
 
 [dependencies]
+maw-auth = { path = "../maw-auth" }
 maw-bring = { path = "../maw-bring" }
 maw-bind = { path = "../maw-bind" }
 maw-calver = { path = "../maw-calver" }

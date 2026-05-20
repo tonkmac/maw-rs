@@ -3,6 +3,10 @@
 //! This crate intentionally starts with plan-only output so command parity can
 //! be tested against maw-js parser contracts before host IO is wired.
 
+use maw_auth::{
+    sign_headers_v3_at, sign_request_v3, verify_request, FromVerifyDecision, Headers,
+    VerifyRequestArgs,
+};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
@@ -48,6 +52,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     };
     match command {
         "--help" | "-h" | "help" => usage_ok(),
+        "auth" => run_auth_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -67,6 +72,344 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+fn run_auth_plan(argv: &[String]) -> CliOutput {
+    let action = match parse_auth_plan_args(argv) {
+        Ok(action) => action,
+        Err(message) => return auth_usage_error(&message),
+    };
+    match action {
+        AuthPlanAction::SignV3 {
+            plan_json,
+            peer_key,
+            from_address,
+            method,
+            path,
+            timestamp,
+            body,
+        } => match sign_request_v3(
+            &peer_key,
+            &from_address,
+            &method,
+            &path,
+            timestamp,
+            body.as_deref().map(str::as_bytes),
+        ) {
+            Ok(signature) => {
+                let headers = sign_headers_v3_at(
+                    &peer_key,
+                    &from_address,
+                    &method,
+                    &path,
+                    body.as_deref().map(str::as_bytes),
+                    timestamp,
+                )
+                .expect("sign_request_v3 succeeded with the same inputs");
+                CliOutput {
+                    code: 0,
+                    stdout: if plan_json {
+                        render_auth_sign_v3_json(
+                            &method,
+                            &path,
+                            timestamp,
+                            &from_address,
+                            &signature.signature,
+                            &signature.body_hash,
+                            &headers,
+                        )
+                    } else {
+                        format!("{}\n", signature.signature)
+                    },
+                    stderr: String::new(),
+                }
+            }
+            Err(message) => auth_usage_error(&message),
+        },
+        AuthPlanAction::VerifyRequest {
+            plan_json,
+            method,
+            path,
+            timestamp,
+            body,
+            cached_pubkey,
+            headers,
+        } => {
+            let decision = verify_request(&VerifyRequestArgs {
+                method,
+                path,
+                headers: Headers::new(headers),
+                body: body.map(std::string::String::into_bytes),
+                cached_pubkey,
+                now: timestamp,
+            });
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_auth_verify_json(&decision)
+                } else {
+                    format!("{}\n", decision.kind())
+                },
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+enum AuthPlanAction {
+    SignV3 {
+        plan_json: bool,
+        peer_key: String,
+        from_address: String,
+        method: String,
+        path: String,
+        timestamp: i64,
+        body: Option<String>,
+    },
+    VerifyRequest {
+        plan_json: bool,
+        method: String,
+        path: String,
+        timestamp: i64,
+        body: Option<String>,
+        cached_pubkey: Option<String>,
+        headers: Vec<(String, String)>,
+    },
+}
+
+struct AuthCommonArgs {
+    plan_json: bool,
+    method: String,
+    path: String,
+    timestamp: i64,
+    body: Option<String>,
+}
+
+fn parse_auth_plan_args(argv: &[String]) -> Result<AuthPlanAction, String> {
+    let Some(kind) = argv.first().map(String::as_str) else {
+        return Err("auth: expected sign-v3 or verify-request".to_owned());
+    };
+    match kind {
+        "sign-v3" => parse_auth_sign_v3_args(&argv[1..]),
+        "verify-request" => parse_auth_verify_args(&argv[1..]),
+        other => Err(format!("auth: unknown subcommand {other}")),
+    }
+}
+
+fn parse_auth_sign_v3_args(argv: &[String]) -> Result<AuthPlanAction, String> {
+    let mut common = AuthCommonArgs {
+        plan_json: false,
+        method: "GET".to_owned(),
+        path: "/".to_owned(),
+        timestamp: 0,
+        body: None,
+    };
+    let mut peer_key = None;
+    let mut from_address = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => common.plan_json = true,
+            "--peer-key" => {
+                peer_key = Some(take_auth_value(argv, index, "--peer-key")?);
+                index += 1;
+            }
+            "--from" => {
+                from_address = Some(take_auth_value(argv, index, "--from")?);
+                index += 1;
+            }
+            "--method" => {
+                common.method = take_auth_value(argv, index, "--method")?;
+                index += 1;
+            }
+            "--path" => {
+                common.path = take_auth_value(argv, index, "--path")?;
+                index += 1;
+            }
+            "--now" => {
+                let raw = take_auth_value(argv, index, "--now")?;
+                common.timestamp = parse_i64_arg(&raw, "auth: --now")?;
+                index += 1;
+            }
+            "--body" => {
+                common.body = Some(take_auth_value(argv, index, "--body")?);
+                index += 1;
+            }
+            other => return Err(format!("auth sign-v3: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(AuthPlanAction::SignV3 {
+        plan_json: common.plan_json,
+        peer_key: peer_key.ok_or_else(|| "auth sign-v3: --peer-key is required".to_owned())?,
+        from_address: from_address.ok_or_else(|| "auth sign-v3: --from is required".to_owned())?,
+        method: common.method,
+        path: common.path,
+        timestamp: common.timestamp,
+        body: common.body,
+    })
+}
+
+fn parse_auth_verify_args(argv: &[String]) -> Result<AuthPlanAction, String> {
+    let mut common = AuthCommonArgs {
+        plan_json: false,
+        method: "GET".to_owned(),
+        path: "/".to_owned(),
+        timestamp: 0,
+        body: None,
+    };
+    let mut cached_pubkey = None;
+    let mut headers = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => common.plan_json = true,
+            "--method" => {
+                common.method = take_auth_value(argv, index, "--method")?;
+                index += 1;
+            }
+            "--path" => {
+                common.path = take_auth_value(argv, index, "--path")?;
+                index += 1;
+            }
+            "--now" => {
+                let raw = take_auth_value(argv, index, "--now")?;
+                common.timestamp = parse_i64_arg(&raw, "auth: --now")?;
+                index += 1;
+            }
+            "--body" => {
+                common.body = Some(take_auth_value(argv, index, "--body")?);
+                index += 1;
+            }
+            "--cached-pubkey" => {
+                cached_pubkey = Some(take_auth_value(argv, index, "--cached-pubkey")?);
+                index += 1;
+            }
+            "--header" => {
+                let raw = take_auth_value(argv, index, "--header")?;
+                let Some((name, value)) = raw.split_once('=') else {
+                    return Err("auth verify-request: --header must be key=value".to_owned());
+                };
+                headers.push((name.to_owned(), value.to_owned()));
+                index += 1;
+            }
+            other => return Err(format!("auth verify-request: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(AuthPlanAction::VerifyRequest {
+        plan_json: common.plan_json,
+        method: common.method,
+        path: common.path,
+        timestamp: common.timestamp,
+        body: common.body,
+        cached_pubkey,
+        headers,
+    })
+}
+
+fn take_auth_value(argv: &[String], index: usize, name: &str) -> Result<String, String> {
+    argv.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("auth: missing {name} value"))
+}
+
+fn parse_i64_arg(value: &str, name: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("{name} must be an integer"))
+}
+
+fn render_auth_sign_v3_json(
+    method: &str,
+    path: &str,
+    timestamp: i64,
+    from_address: &str,
+    signature: &str,
+    body_hash: &str,
+    headers: &Headers,
+) -> String {
+    let header_map = headers.to_btree_map();
+    let mut header_fields = Vec::new();
+    for key in [
+        "x-maw-auth-version",
+        "x-maw-from",
+        "x-maw-signature-v3",
+        "x-maw-timestamp",
+    ] {
+        if let Some(value) = header_map.get(key) {
+            let rendered_key = match key {
+                "x-maw-auth-version" => "X-Maw-Auth-Version",
+                "x-maw-from" => "X-Maw-From",
+                "x-maw-signature-v3" => "X-Maw-Signature-V3",
+                "x-maw-timestamp" => "X-Maw-Timestamp",
+                _ => key,
+            };
+            header_fields.push(format!(
+                "{}:{}",
+                json_string(rendered_key),
+                json_string(value)
+            ));
+        }
+    }
+    format!(
+        "{{\"command\":\"auth\",\"kind\":\"sign-v3\",\"method\":{},\"path\":{},\"timestamp\":{timestamp},\"from\":{},\"signature\":{},\"bodyHash\":{},\"headers\":{{{}}}}}\n",
+        json_string(method),
+        json_string(path),
+        json_string(from_address),
+        json_string(signature),
+        json_string(body_hash),
+        header_fields.join(",")
+    )
+}
+
+fn render_auth_verify_json(decision: &FromVerifyDecision) -> String {
+    format!(
+        "{{\"command\":\"auth\",\"kind\":\"verify-request\",\"decision\":{{{}}}}}\n",
+        render_auth_decision_fields(decision).join(",")
+    )
+}
+
+fn render_auth_decision_fields(decision: &FromVerifyDecision) -> Vec<String> {
+    let mut fields = vec![format!("\"kind\":{}", json_string(decision.kind()))];
+    match decision {
+        FromVerifyDecision::AcceptLegacy { reason }
+        | FromVerifyDecision::RefuseMalformed { reason } => {
+            fields.push(format!("\"reason\":{}", json_string(reason)));
+        }
+        FromVerifyDecision::AcceptTofuRecord { reason, from }
+        | FromVerifyDecision::AcceptVerified { reason, from }
+        | FromVerifyDecision::RefuseMismatch { reason, from } => {
+            fields.push(format!("\"reason\":{}", json_string(reason)));
+            fields.push(format!("\"from\":{}", json_string(from)));
+        }
+        FromVerifyDecision::RefuseUnsigned { reason, from } => {
+            fields.push(format!("\"reason\":{}", json_string(reason)));
+            if let Some(from) = from {
+                fields.push(format!("\"from\":{}", json_string(from)));
+            }
+        }
+        FromVerifyDecision::RefuseSkew {
+            reason,
+            from,
+            delta,
+        } => {
+            fields.push(format!("\"reason\":{}", json_string(reason)));
+            fields.push(format!("\"from\":{}", json_string(from)));
+            fields.push(format!("\"delta\":{delta}"));
+        }
+    }
+    fields
+}
+
+fn auth_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs auth sign-v3 --peer-key <key> --from <oracle:node> [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--plan-json]\n       maw-rs auth verify-request [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--cached-pubkey <key>] [--header <key=value>]... [--plan-json]\n"
+        ),
     }
 }
 
