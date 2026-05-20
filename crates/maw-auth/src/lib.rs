@@ -54,6 +54,119 @@ pub struct AutoPairIdentity {
     pub pubkey: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConsentAction {
+    Hey,
+    TeamInvite,
+    PluginInstall,
+}
+
+impl ConsentAction {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hey => "hey",
+            Self::TeamInvite => "team-invite",
+            Self::PluginInstall => "plugin-install",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovedBy {
+    Human,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustEntry {
+    pub from: String,
+    pub to: String,
+    pub action: ConsentAction,
+    pub approved_at: String,
+    pub approved_by: ApprovedBy,
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRequest {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub action: ConsentAction,
+    pub summary: String,
+    pub pin_hash: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub status: ConsentStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsentStore {
+    trust: BTreeMap<String, TrustEntry>,
+    pending: BTreeMap<String, PendingRequest>,
+}
+
+impl ConsentStore {
+    pub fn record_trust(&mut self, entry: TrustEntry) {
+        self.trust
+            .insert(trust_key(&entry.from, &entry.to, entry.action), entry);
+    }
+
+    #[must_use]
+    pub fn remove_trust(&mut self, from: &str, to: &str, action: ConsentAction) -> bool {
+        self.trust.remove(&trust_key(from, to, action)).is_some()
+    }
+
+    #[must_use]
+    pub fn is_trusted(&self, from: &str, to: &str, action: ConsentAction) -> bool {
+        self.trust.contains_key(&trust_key(from, to, action))
+    }
+
+    #[must_use]
+    pub fn list_trust(&self) -> Vec<TrustEntry> {
+        let mut entries = self.trust.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.approved_at.cmp(&b.approved_at));
+        entries
+    }
+
+    pub fn write_pending(&mut self, request: PendingRequest) {
+        self.pending.insert(request.id.clone(), request);
+    }
+
+    #[must_use]
+    pub fn read_pending(&self, id: &str) -> Option<PendingRequest> {
+        self.pending.get(id).cloned()
+    }
+
+    #[must_use]
+    pub fn list_pending(&self) -> Vec<PendingRequest> {
+        let mut entries = self.pending.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        entries
+    }
+
+    pub fn update_status(&mut self, id: &str, status: ConsentStatus) -> bool {
+        let Some(request) = self.pending.get_mut(id) else {
+            return false;
+        };
+        request.status = status;
+        true
+    }
+
+    pub fn delete_pending(&mut self, id: &str) -> bool {
+        self.pending.remove(id).is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairEntry {
     pub code: String,
@@ -358,6 +471,24 @@ pub fn verify_consent_pin(pin: &str, expected_hash: &str) -> bool {
 }
 
 #[must_use]
+pub fn trust_key(from: &str, to: &str, action: ConsentAction) -> String {
+    format!("{from}→{to}:{}", action.as_str())
+}
+
+#[must_use]
+pub fn apply_consent_expiry(request: &PendingRequest, now_ms: i64) -> PendingRequest {
+    if request.status == ConsentStatus::Pending
+        && parse_iso_millis(&request.expires_at).is_some_and(|expires_at| now_ms > expires_at)
+    {
+        return PendingRequest {
+            status: ConsentStatus::Expired,
+            ..request.clone()
+        };
+    }
+    request.clone()
+}
+
+#[must_use]
 pub fn build_from_sign_payload(
     from: &str,
     timestamp: i64,
@@ -588,6 +719,10 @@ fn parse_unix_seconds(raw: &str) -> Option<i64> {
 }
 
 fn parse_iso_seconds(iso: &str) -> Option<i64> {
+    parse_iso_millis(iso).map(|millis| millis / 1_000)
+}
+
+fn parse_iso_millis(iso: &str) -> Option<i64> {
     let (date, time) = iso.split_once('T')?;
     let time = time.strip_suffix('Z').unwrap_or(time);
     let mut date_parts = date.split('-');
@@ -598,11 +733,34 @@ fn parse_iso_seconds(iso: &str) -> Option<i64> {
     let hour = time_parts.next()?.parse::<u32>().ok()?;
     let minute = time_parts.next()?.parse::<u32>().ok()?;
     let sec_part = time_parts.next()?;
-    let second = sec_part.split('.').next()?.parse::<u32>().ok()?;
+    let (second, millis) = parse_second_millis(sec_part)?;
     if date_parts.next().is_some() || time_parts.next().is_some() {
         return None;
     }
-    timestamp_seconds(year, month, day, hour, minute, second)
+    timestamp_seconds(year, month, day, hour, minute, second).map(|seconds| {
+        seconds
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(millis))
+    })
+}
+
+fn parse_second_millis(sec_part: &str) -> Option<(u32, u16)> {
+    let (second, fraction) = sec_part.split_once('.').unwrap_or((sec_part, ""));
+    let second = second.parse::<u32>().ok()?;
+    let mut value = 0_u16;
+    let mut count = 0_u8;
+    for ch in fraction.chars().take(3) {
+        let digit = u16::try_from(ch.to_digit(10)?).ok()?;
+        value = (value * 10) + digit;
+        count += 1;
+    }
+    let millis = match count {
+        0 => 0,
+        1 => value * 100,
+        2 => value * 10,
+        _ => value,
+    };
+    Some((second, millis))
 }
 
 fn timestamp_seconds(
