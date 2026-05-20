@@ -18,6 +18,10 @@ use maw_routing::{
     ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
 };
 use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
+use maw_transport::{
+    classify_error, Transport, TransportFailureReason, TransportResult, TransportRouter,
+    TransportTarget,
+};
 use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
     WorktreeWindowResolution,
@@ -47,12 +51,221 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "route" => run_route_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "split-policy" => run_split_policy_plan(&argv[1..]),
+        "transport" => run_transport_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_transport_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut classify = None;
+    let mut should_send = false;
+    let mut transport_specs = Vec::new();
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--classify-error" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return transport_usage_error("transport: missing --classify-error value");
+                };
+                classify = Some(value.to_owned());
+                index += 1;
+            }
+            "--classify-empty" => classify = Some(String::new()),
+            "--send" => should_send = true,
+            "--transport" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return transport_usage_error("transport: missing --transport value");
+                };
+                match parse_transport_spec(value) {
+                    Ok(transport) => transport_specs.push(transport),
+                    Err(message) => return transport_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => return transport_usage_error(&format!("transport: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    if let Some(error) = classify {
+        let classified = if error.is_empty() {
+            classify_error(None)
+        } else {
+            classify_error(Some(&error))
+        };
+        return CliOutput {
+            code: 0,
+            stdout: if plan_json {
+                format!(
+                    "{{\"command\":\"transport\",\"kind\":\"classifyError\",\"reason\":{},\"retryable\":{}}}\n",
+                    json_string(classified.reason.as_str()),
+                    classified.retryable
+                )
+            } else {
+                format!(
+                    "transport classify reason={} retryable={}\n",
+                    classified.reason.as_str(),
+                    classified.retryable
+                )
+            },
+            stderr: String::new(),
+        };
+    }
+
+    if !should_send {
+        return transport_usage_error("transport: expected --classify-error or --send");
+    }
+
+    let sent_order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut router = TransportRouter::new();
+    for spec in transport_specs {
+        router.register(CliTransport {
+            spec,
+            sent: std::rc::Rc::clone(&sent_order),
+        });
+    }
+    let target = TransportTarget {
+        oracle: "neo".to_owned(),
+        host: None,
+        tmux_target: Some("neo:1".to_owned()),
+    };
+    let result = router.send(&target, "hello", "codex");
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_transport_send_plan_json(&result, &sent_order.borrow())
+        } else {
+            render_transport_send_plan_text(&result, &sent_order.borrow())
+        },
+        stderr: String::new(),
+    }
+}
+
+fn transport_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+        ),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CliTransportSpec {
+    name: String,
+    connected: bool,
+    can_reach: bool,
+    action: CliTransportAction,
+}
+
+#[derive(Debug, Clone)]
+enum CliTransportAction {
+    Ok,
+    False,
+    Throw(String),
+}
+
+fn parse_transport_spec(value: &str) -> Result<CliTransportSpec, String> {
+    let mut parts = value.splitn(4, ':');
+    let name = parts.next().unwrap_or_default();
+    if name.is_empty() {
+        return Err("transport: --transport requires a name".to_owned());
+    }
+    let connected = parse_optional_bool(parts.next(), true, "connected")?;
+    let can_reach = parse_optional_bool(parts.next(), true, "canReach")?;
+    let action = match parts.next() {
+        None | Some("" | "ok") => CliTransportAction::Ok,
+        Some("false") => CliTransportAction::False,
+        Some(value) => {
+            let Some(error) = value.strip_prefix("throw=") else {
+                return Err("transport: action must be ok, false, or throw=<error>".to_owned());
+            };
+            CliTransportAction::Throw(error.to_owned())
+        }
+    };
+    Ok(CliTransportSpec {
+        name: name.to_owned(),
+        connected,
+        can_reach,
+        action,
+    })
+}
+
+fn parse_optional_bool(value: Option<&str>, default: bool, name: &str) -> Result<bool, String> {
+    match value {
+        None | Some("") => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(format!("transport: invalid {name} boolean")),
+    }
+}
+
+struct CliTransport {
+    spec: CliTransportSpec,
+    sent: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl Transport for CliTransport {
+    fn name(&self) -> &str {
+        &self.spec.name
+    }
+
+    fn connected(&self) -> bool {
+        self.spec.connected
+    }
+
+    fn can_reach(&self, _target: &TransportTarget) -> bool {
+        self.spec.can_reach
+    }
+
+    fn send(
+        &mut self,
+        _target: &TransportTarget,
+        _message: &str,
+        _from: &str,
+    ) -> Result<bool, String> {
+        self.sent.borrow_mut().push(self.spec.name.clone());
+        match &self.spec.action {
+            CliTransportAction::Ok => Ok(true),
+            CliTransportAction::False => Ok(false),
+            CliTransportAction::Throw(error) => Err(error.clone()),
+        }
+    }
+}
+
+fn render_transport_send_plan_json(result: &TransportResult, sent: &[String]) -> String {
+    let mut fields = vec![
+        "\"command\":\"transport\"".to_owned(),
+        "\"kind\":\"send\"".to_owned(),
+        format!("\"ok\":{}", result.ok),
+        format!("\"via\":{}", json_string(&result.via)),
+        format!("\"retryable\":{}", result.retryable),
+        format!("\"sent\":{}", json_string_array(sent)),
+    ];
+    if let Some(reason) = result.reason {
+        fields.push(format!("\"reason\":{}", json_string(reason.as_str())));
+    }
+    format!("{{{}}}\n", fields.join(","))
+}
+
+fn render_transport_send_plan_text(result: &TransportResult, sent: &[String]) -> String {
+    let reason = result.reason.map_or("-", TransportFailureReason::as_str);
+    format!(
+        "transport send ok={} via={} reason={} retryable={} sent={}\n",
+        result.ok,
+        result.via,
+        reason,
+        result.retryable,
+        sent.join(",")
+    )
 }
 
 fn run_split_policy_plan(argv: &[String]) -> CliOutput {
@@ -1017,7 +1230,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
