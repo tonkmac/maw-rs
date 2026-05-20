@@ -109,6 +109,61 @@ pub struct PendingRequest {
     pub status: ConsentStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerPendingRequest {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub action: ConsentAction,
+    pub summary: String,
+    pub pin_hash: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub status: ConsentStatus,
+    pub pin: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerPostResult {
+    Skipped,
+    Ok,
+    HttpStatus(u16),
+    NetworkError(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentRequestArgs {
+    pub from: String,
+    pub to: String,
+    pub action: ConsentAction,
+    pub summary: String,
+    pub peer_url: Option<String>,
+    pub request_id: String,
+    pub pin: String,
+    pub now_ms: i64,
+    pub peer_post: PeerPostResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentRequestResult {
+    pub ok: bool,
+    pub request_id: Option<String>,
+    pub pin: Option<String>,
+    pub expires_at: Option<String>,
+    pub error: Option<String>,
+    pub already_trusted: bool,
+    pub peer_url: Option<String>,
+    pub peer_method: Option<String>,
+    pub peer_body: Option<PeerPendingRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentApprovalResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub entry: Option<TrustEntry>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConsentStore {
     trust: BTreeMap<String, TrustEntry>,
@@ -488,6 +543,136 @@ pub fn apply_consent_expiry(request: &PendingRequest, now_ms: i64) -> PendingReq
     request.clone()
 }
 
+pub fn request_consent_plan(
+    store: &mut ConsentStore,
+    args: ConsentRequestArgs,
+) -> ConsentRequestResult {
+    const TTL_MS: i64 = 10 * 60 * 1_000;
+    let created_at = iso_from_unix_millis(args.now_ms);
+    let expires_at = iso_from_unix_millis(args.now_ms.saturating_add(TTL_MS));
+    let pending = PendingRequest {
+        id: args.request_id.clone(),
+        from: args.from,
+        to: args.to,
+        action: args.action,
+        summary: args.summary,
+        pin_hash: hash_consent_pin(&args.pin),
+        created_at,
+        expires_at: expires_at.clone(),
+        status: ConsentStatus::Pending,
+    };
+    store.write_pending(pending.clone());
+
+    let peer_url = args
+        .peer_url
+        .as_deref()
+        .map(|url| format!("{}/api/consent/request", url.trim_end_matches('/')));
+    let peer_body = peer_url.as_ref().map(|_| PeerPendingRequest {
+        id: pending.id.clone(),
+        from: pending.from.clone(),
+        to: pending.to.clone(),
+        action: pending.action,
+        summary: pending.summary.clone(),
+        pin_hash: pending.pin_hash.clone(),
+        created_at: pending.created_at.clone(),
+        expires_at: pending.expires_at.clone(),
+        status: pending.status,
+        pin: None,
+    });
+
+    match args.peer_post {
+        PeerPostResult::HttpStatus(status) if status >= 400 => ConsentRequestResult {
+            ok: false,
+            request_id: Some(args.request_id),
+            pin: None,
+            expires_at: Some(expires_at),
+            error: Some(format!("peer rejected request: HTTP {status}")),
+            already_trusted: false,
+            peer_url,
+            peer_method: Some("POST".to_owned()),
+            peer_body,
+        },
+        PeerPostResult::NetworkError(message) => ConsentRequestResult {
+            ok: false,
+            request_id: Some(args.request_id),
+            pin: None,
+            expires_at: Some(expires_at),
+            error: Some(format!("network error contacting peer: {message}")),
+            already_trusted: false,
+            peer_url,
+            peer_method: Some("POST".to_owned()),
+            peer_body,
+        },
+        PeerPostResult::Skipped | PeerPostResult::Ok | PeerPostResult::HttpStatus(_) => {
+            ConsentRequestResult {
+                ok: true,
+                request_id: Some(args.request_id),
+                pin: Some(args.pin),
+                expires_at: Some(expires_at),
+                error: None,
+                already_trusted: false,
+                peer_method: peer_url.as_ref().map(|_| "POST".to_owned()),
+                peer_url,
+                peer_body,
+            }
+        }
+    }
+}
+
+pub fn approve_consent_plan(
+    store: &mut ConsentStore,
+    request_id: &str,
+    pin: &str,
+    now_ms: i64,
+) -> ConsentApprovalResult {
+    let Some(request) = store.read_pending(request_id) else {
+        return consent_error(format!("request not found: {request_id}"));
+    };
+    let request = apply_consent_expiry(&request, now_ms);
+    if request.status != ConsentStatus::Pending {
+        return consent_error(format!(
+            "request is {}, cannot approve",
+            consent_status_str(request.status)
+        ));
+    }
+    if !verify_consent_pin(pin, &request.pin_hash) {
+        return consent_error("PIN mismatch");
+    }
+    store.update_status(request_id, ConsentStatus::Approved);
+    let entry = TrustEntry {
+        from: request.from,
+        to: request.to,
+        action: request.action,
+        approved_at: iso_from_unix_millis(now_ms),
+        approved_by: ApprovedBy::Human,
+        request_id: Some(request_id.to_owned()),
+    };
+    store.record_trust(entry.clone());
+    ConsentApprovalResult {
+        ok: true,
+        error: None,
+        entry: Some(entry),
+    }
+}
+
+pub fn reject_consent_plan(store: &mut ConsentStore, request_id: &str) -> ConsentApprovalResult {
+    let Some(request) = store.read_pending(request_id) else {
+        return consent_error(format!("request not found: {request_id}"));
+    };
+    if request.status != ConsentStatus::Pending {
+        return consent_error(format!(
+            "request is {}, cannot reject",
+            consent_status_str(request.status)
+        ));
+    }
+    store.update_status(request_id, ConsentStatus::Rejected);
+    ConsentApprovalResult {
+        ok: true,
+        error: None,
+        entry: None,
+    }
+}
+
 #[must_use]
 pub fn build_from_sign_payload(
     from: &str,
@@ -716,6 +901,53 @@ fn parse_unix_seconds(raw: &str) -> Option<i64> {
         return None;
     }
     raw.parse().ok()
+}
+
+fn consent_error(error: impl Into<String>) -> ConsentApprovalResult {
+    ConsentApprovalResult {
+        ok: false,
+        error: Some(error.into()),
+        entry: None,
+    }
+}
+
+fn consent_status_str(status: ConsentStatus) -> &'static str {
+    match status {
+        ConsentStatus::Pending => "pending",
+        ConsentStatus::Approved => "approved",
+        ConsentStatus::Rejected => "rejected",
+        ConsentStatus::Expired => "expired",
+    }
+}
+
+fn iso_from_unix_millis(ms: i64) -> String {
+    let seconds = ms.div_euclid(1_000);
+    let millis = ms.rem_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).expect("civil month fits u32"),
+        u32::try_from(day).expect("civil day fits u32"),
+    )
 }
 
 fn parse_iso_seconds(iso: &str) -> Option<i64> {
