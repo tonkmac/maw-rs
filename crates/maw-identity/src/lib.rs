@@ -3,10 +3,12 @@
 //! This crate mirrors pure functions from maw-js:
 //! - `src/core/fleet/session-name.ts`
 //! - `src/core/fleet/node-identity.ts`
+//! - `src/core/fleet/validate.ts`
 //!
-//! Behavior is locked by the maw-js portable fixture files:
+//! Behavior is locked by the maw-js portable fixture files and parity tests:
 //! - `test/spec/canonical-session-name.fixtures.json`
 //! - `test/spec/canonical-node-identity.fixtures.json`
+//! - `test/validate-oracle-name.test.ts`
 
 /// Input for [`canonical_session_name`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,38 @@ pub struct CanonicalSessionNameInput {
     /// Optional numeric fleet slot. When present, returns `NN-<stem>`.
     pub slot: Option<u32>,
 }
+
+/// Error returned when an oracle name is reserved or invalid at user-input
+/// boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleNameError {
+    name: String,
+    suggestion: String,
+}
+
+impl OracleNameError {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn suggestion(&self) -> &str {
+        &self.suggestion
+    }
+}
+
+impl std::fmt::Display for OracleNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Oracle name cannot end in '-view' — reserved for ephemeral view sessions. Try '{}' instead.",
+            self.suggestion
+        )
+    }
+}
+
+impl std::error::Error for OracleNameError {}
 
 impl CanonicalSessionNameInput {
     #[must_use]
@@ -69,6 +103,27 @@ pub fn canonical_session_name(input: &CanonicalSessionNameInput) -> Result<Strin
 /// [`canonical_session_name`].
 pub fn canonical_session_stem(oracle: &str) -> Result<String, String> {
     canonical_session_name(&CanonicalSessionNameInput::new(oracle))
+}
+
+/// Validate oracle names at creation/wake user-input boundaries.
+///
+/// This intentionally mirrors maw-js `assertValidOracleName`: today it only
+/// reserves the `-view` suffix because view sessions use that suffix
+/// internally and allowing oracle names like `foo-view` creates ambiguous
+/// `foo-view-view` chains.
+///
+/// # Errors
+///
+/// Returns [`OracleNameError`] when `name` ends in the reserved `-view` suffix.
+pub fn assert_valid_oracle_name(name: &str) -> Result<(), OracleNameError> {
+    let Some(suggestion) = name.strip_suffix("-view") else {
+        return Ok(());
+    };
+
+    Err(OracleNameError {
+        name: name.to_owned(),
+        suggestion: suggestion.to_owned(),
+    })
 }
 
 /// Canonical service identity for federation-visible nodes.
