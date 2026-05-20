@@ -1,10 +1,10 @@
 //! Pure plugin scaffold helpers ported from maw-js
 //! `src/commands/shared/plugin-create-scaffold.ts`.
 //!
-//! This crate intentionally starts with the deterministic validation and
-//! manifest-emission helpers from `test/plugin-create.test.ts`. Filesystem
-//! scaffold/copy behavior can be layered on top once the pure contract is
-//! locked.
+//! This crate ports the deterministic validation/manifest helpers plus the
+//! template tree-copy contract from `test/plugin-create.test.ts`.
+
+use std::{fs, io, path::Path};
 
 use serde_json::{json, Map, Value};
 
@@ -12,6 +12,20 @@ use serde_json::{json, Map, Value};
 pub enum PluginLanguage {
     Rust,
     AssemblyScript,
+}
+
+/// Copy a scaffold template tree while skipping build and package artifacts.
+///
+/// Mirrors maw-js `copyTree`: create the destination directory, recurse into
+/// subdirectories, copy files, and skip `target`, `.git`, and `node_modules`
+/// entries wherever they appear.
+///
+/// # Errors
+///
+/// Returns filesystem errors from reading the source tree, creating
+/// directories, or copying files.
+pub fn copy_tree(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> io::Result<()> {
+    copy_tree_inner(src.as_ref(), dest.as_ref())
 }
 
 /// Validate a plugin scaffold name.
@@ -73,6 +87,29 @@ pub fn build_manifest_json(name: &str, lang: PluginLanguage) -> String {
         Err(error) => format!(r#"{{"error":"manifest serialization failed: {error}"}}"#),
     };
     format!("{text}\n")
+}
+
+fn copy_tree_inner(src: &Path, dest: &Path) -> io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if should_skip_entry(&file_name) {
+            continue;
+        }
+        let source_path = entry.path();
+        let dest_path = dest.join(file_name);
+        if entry.file_type()?.is_dir() {
+            copy_tree_inner(&source_path, &dest_path)?;
+        } else {
+            fs::copy(&source_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_entry(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some("target" | ".git" | "node_modules"))
 }
 
 fn is_valid_plugin_name(name: &str) -> bool {
