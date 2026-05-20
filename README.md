@@ -25,6 +25,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-peer` | `src/commands/shared/peer-sources.ts` | `peer-source-resolver.fixtures.json` |
 | `maw-tmux` | `src/core/transport/tmux-class.ts`, `src/commands/shared/discover-live-state.ts` | tmux parser unit tests, `discover-tmux-live-state.fixtures.json` |
 | `maw-hub` | `src/transports/hub-config.ts` | `test/isolated/hub-config.test.ts`, hub config loader coverage |
+| `maw-feed` | `src/lib/feed.ts` | `test/isolated/feed-lib-coverage.test.ts` |
 
 Current local gates:
 
