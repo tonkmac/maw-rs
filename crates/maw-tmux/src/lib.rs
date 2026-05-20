@@ -265,6 +265,27 @@ pub enum TmuxAttachAction {
     Recover { session: String },
 }
 
+/// Options for Rust's maw-js-compatible `maw tmux kill` action wrapper.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TmuxKillCommandOptions {
+    pub force: bool,
+    pub session: bool,
+}
+
+/// Target plus source metadata after kill fallback resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxKillTarget {
+    pub resolved: String,
+    pub source: String,
+}
+
+/// Successful tmux kill operation kind and concrete target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxKillOutcome {
+    Pane { target: String },
+    Session { session: String },
+}
+
 /// Candidate name that can resolve to a live tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneTargetCandidate {
@@ -707,6 +728,49 @@ where
     /// Kill a tmux pane best-effort.
     pub fn kill_pane(&mut self, target: &str) {
         self.try_run("kill-pane", &["-t".to_owned(), target.to_owned()]);
+    }
+
+    /// Run maw-js `cmdTmuxKill` against an already-resolved/fallback-adjusted target.
+    ///
+    /// # Errors
+    ///
+    /// Returns safety refusal or runner errors.
+    pub fn kill_target_action(
+        &mut self,
+        target: &TmuxKillTarget,
+        fleet_sessions: &BTreeSet<String>,
+        options: &TmuxKillCommandOptions,
+    ) -> Result<TmuxKillOutcome, TmuxError> {
+        let session = tmux_session_from_target(&target.resolved);
+        if is_fleet_or_view_session(&session, fleet_sessions) && !options.force {
+            return Err(TmuxError::new(format!(
+                "refusing to kill: session '{session}' is fleet or view.\n  killing would terminate a live oracle (or its mirror).\n  pass --force to override (you really want to kill a fleet session)"
+            )));
+        }
+
+        if options.session {
+            self.runner
+                .run("kill-session", &["-t".to_owned(), session.clone()])
+                .map_err(|error| {
+                    TmuxError::new(format!(
+                        "kill failed for '{}' (from {}): {}",
+                        target.resolved, target.source, error.message
+                    ))
+                })?;
+            Ok(TmuxKillOutcome::Session { session })
+        } else {
+            self.runner
+                .run("kill-pane", &["-t".to_owned(), target.resolved.clone()])
+                .map_err(|error| {
+                    TmuxError::new(format!(
+                        "kill failed for '{}' (from {}): {}",
+                        target.resolved, target.source, error.message
+                    ))
+                })?;
+            Ok(TmuxKillOutcome::Pane {
+                target: target.resolved.clone(),
+            })
+        }
     }
 
     /// Return the command running in a pane.
@@ -1562,6 +1626,73 @@ pub fn decide_tmux_attach_action(
     } else {
         TmuxAttachAction::Attach { session }
     }
+}
+
+/// Return the session component from a tmux target.
+#[must_use]
+pub fn tmux_session_from_target(resolved: &str) -> String {
+    resolved.split(':').next().unwrap_or_default().to_owned()
+}
+
+/// Apply maw-js orphan-pane fallback for `cmdTmuxKill`.
+///
+/// Only unresolved bare session-name fallbacks (`source == "session-name"` and `resolved == target`)
+/// consult pane titles, tile roles, and worktree aliases. Exact pane IDs and qualified targets are
+/// preserved.
+///
+/// # Errors
+///
+/// Returns an ambiguity error with concrete candidates when a natural name matches multiple panes.
+pub fn resolve_kill_target_with_pane_fallback(
+    target: &str,
+    resolved: &str,
+    source: &str,
+    session_kill: bool,
+    list_panes_output: &str,
+) -> Result<TmuxKillTarget, TmuxError> {
+    if !session_kill && source == "session-name" && resolved == target {
+        match resolve_pane_target_from_list_panes_output(target, list_panes_output) {
+            PaneTargetResolution::Match { candidate } => {
+                return Ok(TmuxKillTarget {
+                    resolved: candidate.resolved,
+                    source: format!("{} ({})", candidate.source, candidate.name),
+                });
+            }
+            PaneTargetResolution::Ambiguous { candidates } => {
+                return Err(TmuxError::new(format_pane_ambiguity_error(
+                    target,
+                    &candidates,
+                )));
+            }
+            PaneTargetResolution::None => {}
+        }
+    }
+    Ok(TmuxKillTarget {
+        resolved: resolved.to_owned(),
+        source: source.to_owned(),
+    })
+}
+
+fn format_pane_ambiguity_error(target: &str, candidates: &[PaneTargetCandidate]) -> String {
+    let lines = candidates
+        .iter()
+        .map(|candidate| {
+            let target_note = if candidate.target.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", candidate.target)
+            };
+            format!(
+                "    • {} → {}{} [{}]",
+                candidate.name, candidate.resolved, target_note, candidate.source
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "'{target}' is ambiguous — matches {} panes:\n{lines}\n  use the pane id or full session:window.pane target",
+        candidates.len()
+    )
 }
 
 fn basename(path: &str) -> &str {
@@ -2714,6 +2845,133 @@ mod tests {
             resolve_pane_target_from_candidates("view", &candidates),
             PaneTargetResolution::Ambiguous {
                 candidates: vec![candidates[1].clone(), candidates[2].clone()]
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_kill_action_refuses_fleet_and_force_kills_session() {
+        let runner = FakeRunner::with_responses(vec![Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        let fleet = BTreeSet::from(["101-mawjs".to_owned()]);
+        let target = TmuxKillTarget {
+            resolved: "101-mawjs:0.1".to_owned(),
+            source: "session:w.p".to_owned(),
+        };
+
+        let error = client
+            .kill_target_action(&target, &fleet, &TmuxKillCommandOptions::default())
+            .expect_err("fleet session protected");
+        assert!(error
+            .message
+            .contains("refusing to kill: session '101-mawjs' is fleet or view"));
+        assert!(client.runner.calls.is_empty());
+
+        let outcome = client
+            .kill_target_action(
+                &target,
+                &fleet,
+                &TmuxKillCommandOptions {
+                    force: true,
+                    session: true,
+                },
+            )
+            .expect("forced session kill succeeds");
+        assert_eq!(
+            outcome,
+            TmuxKillOutcome::Session {
+                session: "101-mawjs".to_owned()
+            }
+        );
+        assert_eq!(
+            client.runner.calls,
+            vec![(
+                "kill-session".to_owned(),
+                vec!["-t".to_owned(), "101-mawjs".to_owned()]
+            )]
+        );
+    }
+
+    #[test]
+    fn tmux_kill_action_uses_orphan_pane_fallback_and_wraps_errors() {
+        let raw = "%101|||scratch:0.0|||worker|||tile-a|||/tmp/repo.wt-1-scout\n";
+        let target =
+            resolve_kill_target_with_pane_fallback("scout", "scout", "session-name", false, raw)
+                .expect("fallback target");
+        assert_eq!(
+            target,
+            TmuxKillTarget {
+                resolved: "%101".to_owned(),
+                source: "worktree-role (scout)".to_owned(),
+            }
+        );
+
+        let runner = FakeRunner::with_responses(vec![Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        let outcome = client
+            .kill_target_action(
+                &target,
+                &BTreeSet::new(),
+                &TmuxKillCommandOptions::default(),
+            )
+            .expect("pane kill succeeds");
+        assert_eq!(
+            outcome,
+            TmuxKillOutcome::Pane {
+                target: "%101".to_owned()
+            }
+        );
+        assert_eq!(
+            client.runner.calls,
+            vec![(
+                "kill-pane".to_owned(),
+                vec!["-t".to_owned(), "%101".to_owned()]
+            )]
+        );
+
+        let runner = FakeRunner::with_responses(vec![Err(TmuxError::new("kill denied"))]);
+        let mut client = TmuxClient::new(runner);
+        let error = client
+            .kill_target_action(
+                &target,
+                &BTreeSet::new(),
+                &TmuxKillCommandOptions::default(),
+            )
+            .expect_err("kill failure wrapped");
+        assert_eq!(
+            error.message,
+            "kill failed for '%101' (from worktree-role (scout)): kill denied"
+        );
+    }
+
+    #[test]
+    fn tmux_kill_fallback_reports_ambiguous_pane_aliases() {
+        let raw = [
+            "%71|||demo:2.0|||codex||||||/repos/a",
+            "%72|||demo:3.0|||codex||||||/repos/b",
+        ]
+        .join("\n");
+        let error =
+            resolve_kill_target_with_pane_fallback("codex", "codex", "session-name", false, &raw)
+                .expect_err("ambiguous alias refused");
+        assert!(error
+            .message
+            .contains("'codex' is ambiguous — matches 2 panes:"));
+        assert!(error
+            .message
+            .contains("• codex → %71 (demo:2.0) [pane-title]"));
+        assert!(error
+            .message
+            .contains("• codex → %72 (demo:3.0) [pane-title]"));
+
+        let preserved =
+            resolve_kill_target_with_pane_fallback("codex", "codex", "session-name", true, &raw)
+                .expect("session kill does not fallback");
+        assert_eq!(
+            preserved,
+            TmuxKillTarget {
+                resolved: "codex".to_owned(),
+                source: "session-name".to_owned(),
             }
         );
     }
