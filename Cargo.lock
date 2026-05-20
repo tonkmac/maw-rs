@@ -87,6 +87,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "maw-auto-wake"
+version = "0.1.0"
+
+[[package]]
 name = "maw-bind"
 version = "0.1.0"
 
@@ -111,6 +115,7 @@ name = "maw-cli"
 version = "0.1.0"
 dependencies = [
  "maw-auth",
+ "maw-auto-wake",
  "maw-bind",
  "maw-bring",
  "maw-calver",

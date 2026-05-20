@@ -7,6 +7,7 @@ use maw_auth::{
     sign_headers_v3_at, sign_request_v3, verify_request, FromVerifyDecision, Headers,
     VerifyRequestArgs,
 };
+use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
@@ -74,6 +75,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     match command {
         "--help" | "-h" | "help" => usage_ok(),
         "auth" => run_auth_plan(&argv[1..]),
+        "auto-wake" => run_auto_wake_plan(&argv[1..]),
         "hub" => run_hub_plan(&argv[1..]),
         "xdg" => run_xdg_plan(&argv[1..]),
         "plugin-scaffold" => run_plugin_scaffold_plan(&argv[1..]),
@@ -99,6 +101,192 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_auto_wake_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut target: Option<String> = None;
+    let mut site = AutoWakeSite::View;
+    let mut is_live = None;
+    let mut is_fleet_known = None;
+    let mut force = false;
+    let mut no_wake = false;
+    let mut is_canonical_target = false;
+    let mut manifest_sources = Vec::new();
+    let mut manifest_live = None;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--site" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return auto_wake_usage_error("auto-wake: missing --site value");
+                };
+                let Some(parsed) = parse_auto_wake_site(value) else {
+                    return auto_wake_usage_error("auto-wake: invalid --site value");
+                };
+                site = parsed;
+                index += 1;
+            }
+            arg if arg.starts_with("--site=") => {
+                let Some(parsed) = parse_auto_wake_site(&arg["--site=".len()..]) else {
+                    return auto_wake_usage_error("auto-wake: invalid --site value");
+                };
+                site = parsed;
+            }
+            "--live" => is_live = Some(true),
+            "--not-live" => is_live = Some(false),
+            "--fleet-known" => is_fleet_known = Some(true),
+            "--unknown-fleet" => is_fleet_known = Some(false),
+            "--wake" => force = true,
+            "--no-wake" => no_wake = true,
+            "--canonical-target" => is_canonical_target = true,
+            "--manifest-source" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return auto_wake_usage_error("auto-wake: missing --manifest-source value");
+                };
+                manifest_sources.push(value.to_owned());
+                index += 1;
+            }
+            arg if arg.starts_with("--manifest-live=") => {
+                let value = &arg["--manifest-live=".len()..];
+                match parse_bool(value, "auto-wake: --manifest-live must be true or false") {
+                    Ok(parsed) => manifest_live = Some(parsed),
+                    Err(message) => return auto_wake_usage_error(&message),
+                }
+            }
+            "--manifest-live" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return auto_wake_usage_error("auto-wake: missing --manifest-live value");
+                };
+                match parse_bool(value, "auto-wake: --manifest-live must be true or false") {
+                    Ok(parsed) => manifest_live = Some(parsed),
+                    Err(message) => return auto_wake_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg if arg.starts_with('-') => {
+                return auto_wake_usage_error(&format!("auto-wake: unknown argument {arg}"));
+            }
+            value => {
+                if target.is_some() {
+                    return auto_wake_usage_error("auto-wake: target already provided");
+                }
+                target = Some(value.to_owned());
+            }
+        }
+        index += 1;
+    }
+
+    let Some(target) = target else {
+        return auto_wake_usage_error("auto-wake: missing target");
+    };
+    let manifest =
+        (!manifest_sources.is_empty() || manifest_live.is_some()).then(|| AutoWakeManifest {
+            name: target.clone(),
+            sources: manifest_sources,
+            is_live: manifest_live.unwrap_or(false),
+        });
+    let options = AutoWakeOptions {
+        site,
+        is_live,
+        is_fleet_known,
+        force,
+        no_wake,
+        is_canonical_target,
+        manifest,
+    };
+    let decision = should_auto_wake(&target, options.clone());
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_auto_wake_plan_json(&target, &options, &decision)
+        } else {
+            format!(
+                "auto-wake {} wake={} reason={}\n",
+                target, decision.wake, decision.reason
+            )
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_auto_wake_site(value: &str) -> Option<AutoWakeSite> {
+    match value {
+        "view" => Some(AutoWakeSite::View),
+        "hey" => Some(AutoWakeSite::Hey),
+        "api-send" => Some(AutoWakeSite::ApiSend),
+        "api-wake" => Some(AutoWakeSite::ApiWake),
+        "peek" => Some(AutoWakeSite::Peek),
+        "bud" => Some(AutoWakeSite::Bud),
+        "wake-cmd" => Some(AutoWakeSite::WakeCmd),
+        _ => None,
+    }
+}
+
+fn render_auto_wake_plan_json(
+    target: &str,
+    options: &AutoWakeOptions,
+    decision: &maw_auto_wake::AutoWakeDecision,
+) -> String {
+    let manifest = options.manifest.as_ref().map_or_else(
+        || "null".to_owned(),
+        |manifest| {
+            format!(
+                "{{\"name\":{},\"sources\":{},\"isLive\":{}}}",
+                json_string(&manifest.name),
+                json_string_array(&manifest.sources),
+                manifest.is_live
+            )
+        },
+    );
+    format!(
+        "{{\"command\":\"auto-wake\",\"ok\":true,\"target\":{},\"site\":{},\"wake\":{},\"reason\":{},\"isLive\":{},\"isFleetKnown\":{},\"force\":{},\"noWake\":{},\"isCanonicalTarget\":{},\"manifest\":{}}}\n",
+        json_string(target),
+        json_string(auto_wake_site_name(options.site)),
+        decision.wake,
+        json_string(&decision.reason),
+        json_opt_bool(options.is_live),
+        json_opt_bool(options.is_fleet_known),
+        options.force,
+        options.no_wake,
+        options.is_canonical_target,
+        manifest
+    )
+}
+
+fn auto_wake_site_name(site: AutoWakeSite) -> &'static str {
+    match site {
+        AutoWakeSite::View => "view",
+        AutoWakeSite::Hey => "hey",
+        AutoWakeSite::ApiSend => "api-send",
+        AutoWakeSite::ApiWake => "api-wake",
+        AutoWakeSite::Peek => "peek",
+        AutoWakeSite::Bud => "bud",
+        AutoWakeSite::WakeCmd => "wake-cmd",
+    }
+}
+
+fn json_opt_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    }
+}
+
+fn auto_wake_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", auto_wake_usage()),
+    }
+}
+
+fn auto_wake_usage() -> &'static str {
+    "usage: maw-rs auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]"
 }
 
 fn run_auth_plan(argv: &[String]) -> CliOutput {
@@ -4760,7 +4948,8 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
