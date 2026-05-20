@@ -148,3 +148,129 @@ fn discover_plan_awake_json_filters_peers_but_preserves_live_panes() {
     assert_eq!(output["plugins"]["records"], json!([]));
     assert_eq!(output["ghq"]["repos"], json!([]));
 }
+
+#[test]
+fn discover_plan_includes_registered_plugins_and_deduped_ghq_repos_in_json_tree() {
+    let output = json_output(&run_cli(&[
+        "discover".to_owned(),
+        "--peers".to_owned(),
+        "config".to_owned(),
+        "--plugin".to_owned(),
+        "buddy|1.2.3|ts|standard|12|false|/plugins/buddy|buddy|buddy-alias|sdk:identity|base"
+            .to_owned(),
+        "--ghq".to_owned(),
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js".to_owned(),
+        "--ghq".to_owned(),
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js".to_owned(),
+        "--ghq".to_owned(),
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js.wt-features".to_owned(),
+        "--tree".to_owned(),
+        "--json".to_owned(),
+        "--plan-json".to_owned(),
+    ]));
+
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["total"], 3);
+    assert_eq!(output["plugins"]["total"], 1);
+    assert_eq!(
+        output["plugins"]["records"][0],
+        json!({
+            "source": "plugin-registry",
+            "type": "plugin",
+            "name": "buddy",
+            "version": "1.2.3",
+            "kind": "ts",
+            "tier": "standard",
+            "weight": 12,
+            "disabled": false,
+            "dir": "/plugins/buddy",
+            "command": "buddy",
+            "aliases": ["buddy-alias"],
+            "capabilities": ["sdk:identity"],
+            "dependencies": ["base"]
+        })
+    );
+    assert_eq!(output["ghq"]["total"], 2);
+    assert_eq!(
+        output["ghq"]["repos"][0],
+        json!({
+            "source": "ghq",
+            "type": "repo",
+            "path": "/opt/Code/github.com/Soul-Brews-Studio/maw-js",
+            "name": "maw-js",
+            "owner": "Soul-Brews-Studio",
+            "host": "github.com",
+            "oracleLike": false,
+            "worktree": false
+        })
+    );
+    assert_eq!(output["ghq"]["repos"][1]["worktree"], true);
+    assert_eq!(output["tree"]["plugins"][0]["name"], "buddy");
+    assert_eq!(
+        output["tree"]["ghq"][0]["path"],
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js"
+    );
+    assert_eq!(
+        output["tree"]["ghq"][1]["path"],
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js.wt-features"
+    );
+}
+
+#[test]
+fn discover_plan_joins_fleet_oracles_ghq_peers_and_live_in_json() {
+    let output = json_output(&run_cli(&[
+        "discover".to_owned(),
+        "--peers".to_owned(),
+        "config".to_owned(),
+        "--named-peer".to_owned(),
+        "mawjs=http://m5:3456".to_owned(),
+        "--agent".to_owned(),
+        "mawjs-oracle=m5".to_owned(),
+        "--fleet".to_owned(),
+        "50-mawjs.json|50|mawjs|50-mawjs|mawjs-oracle|Soul-Brews-Studio/maw-js".to_owned(),
+        "--ghq".to_owned(),
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js".to_owned(),
+        "--oracle".to_owned(),
+        "mawjs|fleet+agent+oracles-json|m5|50-mawjs|mawjs-oracle|Soul-Brews-Studio/maw-js|/opt/Code/github.com/Soul-Brews-Studio/maw-js|true|true".to_owned(),
+        "--pane".to_owned(),
+        "%9|claude|50-mawjs:mawjs-oracle.0|mawjs|-|/opt/Code/github.com/Soul-Brews-Studio/maw-js|-".to_owned(),
+        "--json".to_owned(),
+        "--tree".to_owned(),
+        "--plan-json".to_owned(),
+    ]));
+
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["fleet"]["records"][0]["endpoint"], "http://m5:3456");
+    assert_eq!(output["fleet"]["records"][0]["peerMatched"], true);
+    assert_eq!(output["oracles"]["records"][0]["awake"], true);
+    assert_eq!(
+        output["oracles"]["records"][0]["ghqPath"],
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js"
+    );
+    assert_eq!(output["oracles"]["records"][0]["worktree"], false);
+    assert_eq!(output["oracles"]["records"][0]["fleetMatched"], true);
+    assert_eq!(
+        output["oracles"]["records"][0]["peerUrls"],
+        json!(["http://m5:3456"])
+    );
+    assert_eq!(output["tree"]["oracles"][0]["awake"], true);
+}
+
+#[test]
+fn discover_plan_renders_plugin_registry_in_text_output() {
+    let output = run_cli(&[
+        "discover".to_owned(),
+        "--peers=config".to_owned(),
+        "--plugin".to_owned(),
+        "handover|1.2.3|ts|standard|12|true|/plugins/handover|handover|-|-|-".to_owned(),
+    ]);
+
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert!(
+        output.stdout.contains("plugin registry"),
+        "{}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("handover"), "{}", output.stdout);
+    assert!(output.stdout.contains("disabled"), "{}", output.stdout);
+}

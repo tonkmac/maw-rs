@@ -55,7 +55,7 @@ use maw_xdg::{
     maw_cache_path, maw_config_dir, maw_config_path, maw_data_dir, maw_data_path,
     maw_runtime_home_dir, maw_state_dir, maw_state_path, MawCorePaths, MawXdgEnv,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3117,6 +3117,7 @@ fn run_discover_plan(argv: &[String]) -> CliOutput {
     let mut config = PeerConfig::default();
     let mut discovery_rows = Vec::new();
     let mut panes = Vec::new();
+    let mut inventory_input = DiscoverInventoryInput::default();
 
     let mut index = 0;
     while index < argv.len() {
@@ -3174,6 +3175,55 @@ fn run_discover_plan(argv: &[String]) -> CliOutput {
                 }
                 index += 1;
             }
+            "--plugin" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --plugin value");
+                };
+                match parse_discover_plugin(value) {
+                    Ok(plugin) => inventory_input.plugins.push(plugin),
+                    Err(message) => return discover_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--ghq" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --ghq value");
+                };
+                inventory_input.ghq_paths.push(value.to_owned());
+                index += 1;
+            }
+            "--agent" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --agent value");
+                };
+                match parse_key_value(value, "discover: --agent must use <window=node>") {
+                    Ok((window, node)) => {
+                        inventory_input.agents.insert(window, node);
+                    }
+                    Err(message) => return discover_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--fleet" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --fleet value");
+                };
+                match parse_discover_fleet(value) {
+                    Ok(record) => inventory_input.fleet.push(record),
+                    Err(message) => return discover_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--oracle" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return discover_usage_error("discover: missing --oracle value");
+                };
+                match parse_discover_oracle(value) {
+                    Ok(record) => inventory_input.oracles.push(record),
+                    Err(message) => return discover_usage_error(&message),
+                }
+                index += 1;
+            }
             arg => return discover_usage_error(&format!("discover: unknown argument {arg}")),
         }
         index += 1;
@@ -3217,6 +3267,7 @@ fn run_discover_plan(argv: &[String]) -> CliOutput {
     } else {
         peers_with_live
     };
+    let inventory = build_discover_inventory(inventory_input, &visible_peers, &live_state.live);
 
     CliOutput {
         code: 0,
@@ -3225,13 +3276,17 @@ fn run_discover_plan(argv: &[String]) -> CliOutput {
                 &result,
                 &visible_peers,
                 &live_state,
+                &inventory,
+                tree,
                 awake,
                 live_probe_calls,
             )
         } else if awake {
             render_discover_live_text(&live_state)
+        } else if tree {
+            render_discover_tree_text(&visible_peers, &live_state, &inventory)
         } else {
-            render_peer_sources_plan_text(&result)
+            render_discover_inventory_text(&result, &inventory)
         },
         stderr: String::new(),
     }
@@ -3263,7 +3318,82 @@ fn discover_usage_error(message: &str) -> CliOutput {
 }
 
 fn discover_usage() -> &'static str {
-    "usage: maw-rs discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]"
+    "usage: maw-rs discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--plugin <name|version|kind|tier|weight|disabled|dir|command|aliases|capabilities|dependencies>] [--ghq <path>] [--agent <window=node>] [--fleet <file|slot|group|session|window|repo>] [--oracle <name|sources|node|session|window|repo|local_path|has_psi|has_fleet_config>] [--json] [--tree] [--awake] [--plan-json]"
+}
+
+#[derive(Debug, Clone)]
+struct DiscoverPluginRecord {
+    name: String,
+    version: String,
+    kind: String,
+    tier: String,
+    weight: i64,
+    disabled: bool,
+    dir: String,
+    command: String,
+    aliases: Vec<String>,
+    capabilities: Vec<String>,
+    dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GhqRepoRecord {
+    path: String,
+    name: String,
+    owner: Option<String>,
+    host: Option<String>,
+    oracle_like: bool,
+    worktree: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FleetConfigRecord {
+    file: String,
+    slot: String,
+    name: String,
+    session: String,
+    window: String,
+    repo: String,
+    node: String,
+    endpoint: Option<String>,
+    peer_matched: bool,
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+struct RegisteredOracleRecord {
+    name: String,
+    sources: Vec<String>,
+    node: Option<String>,
+    session: Option<String>,
+    window: Option<String>,
+    repo: Option<String>,
+    local_path: Option<String>,
+    has_psi: bool,
+    has_fleet_config: bool,
+    awake: bool,
+    ghq_path: Option<String>,
+    worktree: bool,
+    fleet_matched: bool,
+    peer_urls: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct DiscoverInventoryInput {
+    plugins: Vec<DiscoverPluginRecord>,
+    ghq_paths: Vec<String>,
+    agents: BTreeMap<String, String>,
+    fleet: Vec<FleetConfigRecord>,
+    oracles: Vec<RegisteredOracleRecord>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct DiscoverInventory {
+    plugins: Vec<DiscoverPluginRecord>,
+    ghq: Vec<GhqRepoRecord>,
+    fleet: Vec<FleetConfigRecord>,
+    oracles: Vec<RegisteredOracleRecord>,
+    warnings: Vec<String>,
 }
 
 fn parse_discover_pane(value: &str) -> Result<TmuxPane, String> {
@@ -3285,6 +3415,96 @@ fn parse_discover_pane(value: &str) -> Result<TmuxPane, String> {
             "discover: pane last_activity must be an integer",
         )?,
     })
+}
+
+fn parse_discover_plugin(value: &str) -> Result<DiscoverPluginRecord, String> {
+    let parts = value.splitn(11, '|').collect::<Vec<_>>();
+    if parts.len() != 11 {
+        return Err("discover: --plugin must use <name|version|kind|tier|weight|disabled|dir|command|aliases|capabilities|dependencies>".to_owned());
+    }
+    Ok(DiscoverPluginRecord {
+        name: parts[0].to_owned(),
+        version: parts[1].to_owned(),
+        kind: parts[2].to_owned(),
+        tier: parts[3].to_owned(),
+        weight: parts[4]
+            .parse::<i64>()
+            .map_err(|_| "discover: plugin weight must be an integer".to_owned())?,
+        disabled: parse_bool(parts[5], "discover: plugin disabled must be true or false")?,
+        dir: parts[6].to_owned(),
+        command: parts[7].to_owned(),
+        aliases: parse_list_field(parts[8]),
+        capabilities: parse_list_field(parts[9]),
+        dependencies: parse_list_field(parts[10]),
+    })
+}
+
+fn parse_discover_fleet(value: &str) -> Result<FleetConfigRecord, String> {
+    let parts = value.splitn(6, '|').collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return Err("discover: --fleet must use <file|slot|group|session|window|repo>".to_owned());
+    }
+    Ok(FleetConfigRecord {
+        file: parts[0].to_owned(),
+        slot: parts[1].to_owned(),
+        name: parts[2].to_owned(),
+        session: parts[3].to_owned(),
+        window: parts[4].to_owned(),
+        repo: parts[5].to_owned(),
+        node: "local".to_owned(),
+        endpoint: None,
+        peer_matched: false,
+    })
+}
+
+fn parse_discover_oracle(value: &str) -> Result<RegisteredOracleRecord, String> {
+    let parts = value.splitn(9, '|').collect::<Vec<_>>();
+    if parts.len() != 9 {
+        return Err("discover: --oracle must use <name|sources|node|session|window|repo|local_path|has_psi|has_fleet_config>".to_owned());
+    }
+    Ok(RegisteredOracleRecord {
+        name: parts[0].to_owned(),
+        sources: parse_plus_list_field(parts[1]),
+        node: optional_field(parts[2]),
+        session: optional_field(parts[3]),
+        window: optional_field(parts[4]),
+        repo: optional_field(parts[5]),
+        local_path: optional_field(parts[6]),
+        has_psi: parse_bool(parts[7], "discover: oracle has_psi must be true or false")?,
+        has_fleet_config: parse_bool(
+            parts[8],
+            "discover: oracle has_fleet_config must be true or false",
+        )?,
+        awake: false,
+        ghq_path: None,
+        worktree: false,
+        fleet_matched: false,
+        peer_urls: Vec::new(),
+    })
+}
+
+fn parse_bool(value: &str, message: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(message.to_owned()),
+    }
+}
+
+fn parse_list_field(value: &str) -> Vec<String> {
+    if value.is_empty() || value == "-" {
+        Vec::new()
+    } else {
+        value.split(',').map(ToOwned::to_owned).collect()
+    }
+}
+
+fn parse_plus_list_field(value: &str) -> Vec<String> {
+    if value.is_empty() || value == "-" {
+        Vec::new()
+    } else {
+        value.split('+').map(ToOwned::to_owned).collect()
+    }
 }
 
 fn parse_optional_u32(value: &str, message: &str) -> Result<Option<u32>, String> {
@@ -3320,10 +3540,177 @@ fn peer_with_no_live(peer: &maw_peer::PeerTarget) -> PeerTargetWithLive {
     }
 }
 
+fn build_discover_inventory(
+    mut input: DiscoverInventoryInput,
+    peers: &[PeerTargetWithLive],
+    live_panes: &[DiscoverLivePane],
+) -> DiscoverInventory {
+    let mut seen_paths = BTreeSet::new();
+    let ghq = input
+        .ghq_paths
+        .iter()
+        .map(|path| path.trim_end_matches('/').replace('\\', "/"))
+        .filter(|path| seen_paths.insert(path.to_lowercase()))
+        .map(|path| ghq_repo_record(&path))
+        .collect::<Vec<_>>();
+
+    let mut seen_fleet = BTreeSet::new();
+    let fleet = input
+        .fleet
+        .drain(..)
+        .filter_map(|mut record| {
+            record.node = input
+                .agents
+                .get(&record.window)
+                .cloned()
+                .unwrap_or_else(|| "local".to_owned());
+            if let Some(peer) = peers.iter().find(|peer| {
+                peer_matches_name(peer, &record.node)
+                    || peer_matches_name(peer, &record.name)
+                    || peer_matches_name(peer, &record.window)
+            }) {
+                record.endpoint = Some(peer.url.clone());
+                record.peer_matched = true;
+            }
+            let key = format!(
+                "{}\0{}\0{}",
+                record.node.to_lowercase(),
+                record.name.to_lowercase(),
+                record.repo.to_lowercase()
+            );
+            seen_fleet.insert(key).then_some(record)
+        })
+        .collect::<Vec<_>>();
+
+    let mut seen_oracles = BTreeSet::new();
+    let oracles = input
+        .oracles
+        .drain(..)
+        .filter_map(|mut oracle| {
+            let key = oracle.name.to_lowercase();
+            if !seen_oracles.insert(key) {
+                return None;
+            }
+            join_oracle_inventory(&mut oracle, &ghq, &fleet, peers, live_panes);
+            Some(oracle)
+        })
+        .collect::<Vec<_>>();
+
+    DiscoverInventory {
+        plugins: input.plugins,
+        ghq,
+        fleet,
+        oracles,
+        warnings: Vec::new(),
+    }
+}
+
+fn ghq_repo_record(path: &str) -> GhqRepoRecord {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let name = parts.last().copied().unwrap_or(path).to_owned();
+    let host_index = parts.iter().position(|part| part.contains('.'));
+    let host = host_index.map(|index| parts[index].to_owned());
+    let owner = host_index
+        .and_then(|index| parts.get(index + 1))
+        .or_else(|| parts.get(parts.len().saturating_sub(2)))
+        .map(|owner| (*owner).to_owned());
+    GhqRepoRecord {
+        path: path.to_owned(),
+        oracle_like: is_oracle_like(&name),
+        worktree: path.contains(".wt-") || path.contains(".wt/") || path.contains(".wt."),
+        name,
+        owner,
+        host,
+    }
+}
+
+fn is_oracle_like(name: &str) -> bool {
+    name.contains("oracle")
+}
+
+fn join_oracle_inventory(
+    oracle: &mut RegisteredOracleRecord,
+    ghq: &[GhqRepoRecord],
+    fleet: &[FleetConfigRecord],
+    peers: &[PeerTargetWithLive],
+    live_panes: &[DiscoverLivePane],
+) {
+    if let Some(repo) = ghq.iter().find(|repo| ghq_matches_oracle(repo, oracle)) {
+        oracle.ghq_path = Some(repo.path.clone());
+        oracle.worktree = repo.worktree;
+    }
+    oracle.fleet_matched = fleet.iter().any(|record| {
+        names_match(&record.name, &oracle.name) || names_match(&record.window, &oracle.name)
+    });
+    oracle.peer_urls = peers
+        .iter()
+        .filter(|peer| {
+            peer_matches_name(peer, &oracle.name)
+                || oracle
+                    .node
+                    .as_deref()
+                    .is_some_and(|node| peer_matches_name(peer, node))
+        })
+        .map(|peer| peer.url.clone())
+        .collect();
+    oracle.awake = live_panes
+        .iter()
+        .any(|pane| pane_matches_oracle(pane, oracle));
+}
+
+fn ghq_matches_oracle(repo: &GhqRepoRecord, oracle: &RegisteredOracleRecord) -> bool {
+    if oracle.local_path.as_deref() == Some(repo.path.as_str()) {
+        return true;
+    }
+    if oracle.repo.as_deref().is_some_and(|slug| {
+        slug.rsplit('/').next() == Some(repo.name.as_str()) || slug.ends_with(&repo.name)
+    }) {
+        return true;
+    }
+    names_match(&repo.name, &oracle.name)
+}
+
+fn names_match(candidate: &str, name: &str) -> bool {
+    let candidate = candidate.to_lowercase();
+    let name = name.to_lowercase();
+    candidate == name
+        || candidate == format!("{name}-oracle")
+        || candidate.ends_with(&format!("-{name}"))
+}
+
+fn peer_matches_name(peer: &PeerTargetWithLive, name: &str) -> bool {
+    peer.name
+        .as_deref()
+        .is_some_and(|candidate| names_match(candidate, name))
+        || peer
+            .node
+            .as_deref()
+            .is_some_and(|candidate| names_match(candidate, name))
+        || peer
+            .oracle
+            .as_deref()
+            .is_some_and(|candidate| names_match(candidate, name))
+}
+
+fn pane_matches_oracle(pane: &DiscoverLivePane, oracle: &RegisteredOracleRecord) -> bool {
+    oracle.session.as_deref() == Some(pane.session.as_str())
+        || oracle.window.as_deref() == Some(pane.window.as_str())
+        || names_match(&pane.window, &oracle.name)
+        || pane
+            .matches
+            .iter()
+            .any(|matched| names_match(matched, &oracle.name))
+}
+
 fn render_discover_plan_json(
     result: &PeerSourceResult,
     peers: &[PeerTargetWithLive],
     live_state: &TmuxLiveStateResult,
+    inventory: &DiscoverInventory,
+    tree: bool,
     awake: bool,
     live_probe_calls: usize,
 ) -> String {
@@ -3331,21 +3718,218 @@ fn render_discover_plan_json(
         .warnings
         .iter()
         .chain(live_state.warnings.iter())
+        .chain(inventory.warnings.iter())
         .cloned()
         .collect::<Vec<_>>();
+    let total = if tree {
+        peers.len()
+            + live_state.live.len()
+            + inventory.fleet.len()
+            + inventory.oracles.len()
+            + inventory.plugins.len()
+            + inventory.ghq.len()
+    } else {
+        peers.len()
+    };
+    let tree_field = if tree {
+        format!(
+            ",\"tree\":{{\"live\":{},\"peers\":{},\"fleet\":{},\"oracles\":{},\"plugins\":{},\"ghq\":{}}}",
+            render_live_sessions_json(&live_state.live),
+            render_live_peer_targets_json(peers),
+            render_fleet_records_json(&inventory.fleet),
+            render_oracle_records_json(&inventory.oracles),
+            render_plugin_records_json(&inventory.plugins),
+            render_ghq_records_json(&inventory.ghq)
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{{\"command\":\"discover\",\"ok\":true,\"mode\":{},\"total\":{},\"awake\":{},\"awakeOnly\":{},\"peers\":{},\"fleet\":{{\"source\":\"fleet-config\",\"total\":0,\"records\":[]}},\"oracles\":{{\"source\":\"oracle-manifest\",\"total\":0,\"records\":[]}},\"plugins\":{{\"source\":\"plugin-registry\",\"total\":0,\"records\":[]}},\"ghq\":{{\"source\":\"ghq\",\"total\":0,\"repos\":[]}},\"liveTotal\":{},\"live\":{},\"warnings\":{},\"fetchCalls\":{},\"liveProbeCalls\":{}}}\n",
+        "{{\"command\":\"discover\",\"ok\":true,\"mode\":{},\"total\":{},\"awake\":{},\"awakeOnly\":{},\"peers\":{},\"fleet\":{{\"source\":\"fleet-config\",\"total\":{},\"records\":{}}},\"oracles\":{{\"source\":\"oracle-manifest\",\"total\":{},\"records\":{}}},\"plugins\":{{\"source\":\"plugin-registry\",\"total\":{},\"records\":{}}},\"ghq\":{{\"source\":\"ghq\",\"total\":{},\"repos\":{}}},\"liveTotal\":{},\"live\":{}{},\"warnings\":{},\"fetchCalls\":{},\"liveProbeCalls\":{}}}\n",
         json_string(result.mode.as_str()),
-        peers.len(),
+        total,
         awake,
         awake,
         render_live_peer_targets_json(peers),
+        inventory.fleet.len(),
+        render_fleet_records_json(&inventory.fleet),
+        inventory.oracles.len(),
+        render_oracle_records_json(&inventory.oracles),
+        inventory.plugins.len(),
+        render_plugin_records_json(&inventory.plugins),
+        inventory.ghq.len(),
+        render_ghq_records_json(&inventory.ghq),
         live_state.live.len(),
         render_live_state_json(live_state),
+        tree_field,
         json_string_array(&warnings),
         result.fetch_calls,
         live_probe_calls
     )
+}
+
+fn render_plugin_records_json(records: &[DiscoverPluginRecord]) -> String {
+    format!(
+        "[{}]",
+        records
+            .iter()
+            .map(|record| {
+                format!(
+                    "{{\"source\":\"plugin-registry\",\"type\":\"plugin\",\"name\":{},\"version\":{},\"kind\":{},\"tier\":{},\"weight\":{},\"disabled\":{},\"dir\":{},\"command\":{},\"aliases\":{},\"capabilities\":{},\"dependencies\":{}}}",
+                    json_string(&record.name),
+                    json_string(&record.version),
+                    json_string(&record.kind),
+                    json_string(&record.tier),
+                    record.weight,
+                    record.disabled,
+                    json_string(&record.dir),
+                    json_string(&record.command),
+                    json_string_array(&record.aliases),
+                    json_string_array(&record.capabilities),
+                    json_string_array(&record.dependencies)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_ghq_records_json(records: &[GhqRepoRecord]) -> String {
+    format!(
+        "[{}]",
+        records
+            .iter()
+            .map(|record| {
+                format!(
+                    "{{\"source\":\"ghq\",\"type\":\"repo\",\"path\":{},\"name\":{},\"owner\":{},\"host\":{},\"oracleLike\":{},\"worktree\":{}}}",
+                    json_string(&record.path),
+                    json_string(&record.name),
+                    json_opt_string(record.owner.as_deref()),
+                    json_opt_string(record.host.as_deref()),
+                    record.oracle_like,
+                    record.worktree
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_fleet_records_json(records: &[FleetConfigRecord]) -> String {
+    format!(
+        "[{}]",
+        records
+            .iter()
+            .map(|record| {
+                format!(
+                    "{{\"source\":\"fleet-config\",\"type\":\"workspace\",\"file\":{},\"slot\":{},\"name\":{},\"session\":{},\"window\":{},\"repo\":{},\"node\":{},\"endpoint\":{},\"peerMatched\":{}}}",
+                    json_string(&record.file),
+                    json_string(&record.slot),
+                    json_string(&record.name),
+                    json_string(&record.session),
+                    json_string(&record.window),
+                    json_string(&record.repo),
+                    json_string(&record.node),
+                    json_opt_string(record.endpoint.as_deref()),
+                    record.peer_matched
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_oracle_records_json(records: &[RegisteredOracleRecord]) -> String {
+    format!(
+        "[{}]",
+        records
+            .iter()
+            .map(|record| {
+                format!(
+                    "{{\"source\":\"oracle-manifest\",\"type\":\"oracle\",\"name\":{},\"sources\":{},\"node\":{},\"session\":{},\"window\":{},\"repo\":{},\"localPath\":{},\"hasPsi\":{},\"hasFleetConfig\":{},\"awake\":{},\"ghqPath\":{},\"worktree\":{},\"fleetMatched\":{},\"peerUrls\":{}}}",
+                    json_string(&record.name),
+                    json_string_array(&record.sources),
+                    json_opt_string(record.node.as_deref()),
+                    json_opt_string(record.session.as_deref()),
+                    json_opt_string(record.window.as_deref()),
+                    json_opt_string(record.repo.as_deref()),
+                    json_opt_string(record.local_path.as_deref()),
+                    record.has_psi,
+                    record.has_fleet_config,
+                    record.awake,
+                    json_opt_string(record.ghq_path.as_deref()),
+                    record.worktree,
+                    record.fleet_matched,
+                    json_string_array(&record.peer_urls)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_discover_inventory_text(
+    result: &PeerSourceResult,
+    inventory: &DiscoverInventory,
+) -> String {
+    let mut output = render_peer_sources_plan_text(result);
+    if !inventory.oracles.is_empty() {
+        output.push_str("registered oracles\n");
+        for oracle in &inventory.oracles {
+            let status = if oracle.awake { "awake" } else { "offline" };
+            let _ = writeln!(output, "{} {}", oracle.name, status);
+        }
+    }
+    if !inventory.fleet.is_empty() {
+        output.push_str("fleet config\n");
+        for record in &inventory.fleet {
+            let _ = writeln!(output, "{} {} {}", record.name, record.node, record.repo);
+        }
+    }
+    if !inventory.plugins.is_empty() {
+        output.push_str("plugin registry\n");
+        for plugin in &inventory.plugins {
+            let status = if plugin.disabled {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            let _ = writeln!(output, "{} {} {}", plugin.name, plugin.version, status);
+        }
+    }
+    if !inventory.ghq.is_empty() {
+        output.push_str("ghq repos\n");
+        for repo in &inventory.ghq {
+            let _ = writeln!(output, "{} {}", repo.name, repo.path);
+        }
+    }
+    output
+}
+
+fn render_discover_tree_text(
+    peers: &[PeerTargetWithLive],
+    live_state: &TmuxLiveStateResult,
+    inventory: &DiscoverInventory,
+) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "discover tree");
+    let _ = writeln!(output, "live ({} sessions)", live_state.live.len());
+    let _ = writeln!(output, "peers ({} configured)", peers.len());
+    let _ = writeln!(
+        output,
+        "fleet config ({} configured)",
+        inventory.fleet.len()
+    );
+    let _ = writeln!(output, "registered oracles ({})", inventory.oracles.len());
+    let _ = writeln!(output, "plugins ({} registered)", inventory.plugins.len());
+    for plugin in &inventory.plugins {
+        let _ = writeln!(output, "  - {}", plugin.name);
+    }
+    let _ = writeln!(output, "ghq ({} repos)", inventory.ghq.len());
+    for repo in &inventory.ghq {
+        let _ = writeln!(output, "  - {}", repo.path);
+    }
+    output
 }
 
 fn render_live_peer_targets_json(peers: &[PeerTargetWithLive]) -> String {
