@@ -31,6 +31,109 @@ pub struct SplitBringPolicy<'a> {
     pub allow_self_bring: bool,
 }
 
+/// Parsed legacy `maw bring` alias options from maw-js `parseBringArgs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedBringArgs {
+    pub oracle: String,
+    pub opts: BringAliasOptions,
+}
+
+/// Wake-shaped options produced by the `maw bring` alias parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringAliasOptions {
+    pub split: bool,
+    pub engine: Option<String>,
+    pub pick: bool,
+    pub session: Option<String>,
+    pub split_target: Option<String>,
+}
+
+impl Default for BringAliasOptions {
+    fn default() -> Self {
+        Self {
+            split: true,
+            engine: None,
+            pick: false,
+            session: None,
+            split_target: None,
+        }
+    }
+}
+
+/// Parser error for legacy bring alias arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringArgsError {
+    pub message: String,
+    pub usage: Vec<String>,
+}
+
+/// Parse `maw bring <oracle>` alias args into wake-shaped options.
+///
+/// This ports the tiny maw-js `src/cli/top-aliases.ts` `parseBringArgs`
+/// compatibility parser. Runtime dispatch still belongs to wake/bring execution;
+/// this helper only locks the alias contract.
+///
+/// # Errors
+///
+/// Returns `bring: missing oracle name` with maw-js usage lines when no oracle
+/// positional argument is present.
+pub fn parse_bring_args(argv: &[String]) -> Result<ParsedBringArgs, BringArgsError> {
+    let mut oracle = None;
+    let mut opts = BringAliasOptions::default();
+    let mut index = 0;
+
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--engine" | "-e" => {
+                if let Some(value) = argv.get(index + 1) {
+                    opts.engine = Some(value.clone());
+                    index += 1;
+                }
+            }
+            "--pick" => opts.pick = true,
+            "--to" => {
+                if let Some(value) = argv.get(index + 1) {
+                    let target = parse_bring_to_target(value);
+                    opts.session = Some(target.session.clone());
+                    opts.split_target = target
+                        .window
+                        .map(|window| format!("{}:{window}", target.session));
+                    index += 1;
+                }
+            }
+            "--split" | "--tab" => {}
+            arg if arg.starts_with('-') => {}
+            arg => {
+                let _ = oracle.get_or_insert_with(|| arg.to_owned());
+            }
+        }
+        index += 1;
+    }
+
+    let Some(oracle) = oracle else {
+        return Err(BringArgsError {
+            message: "bring: missing oracle name".to_owned(),
+            usage: bring_usage_lines(),
+        });
+    };
+
+    Ok(ParsedBringArgs { oracle, opts })
+}
+
+/// Usage lines printed by maw-js for missing `maw bring` oracle names.
+#[must_use]
+pub fn bring_usage_lines() -> Vec<String> {
+    vec![
+        "usage: maw bring <oracle> [--to <session[:window]>] [wake flags...]".to_owned(),
+        "       maw b <oracle> [--to <session[:window]>] [wake flags...]".to_owned(),
+        "  Thin alias: maw bring <oracle> ≡ maw wake <oracle> --split".to_owned(),
+        "  Supports the same flags as `maw wake`, including --task, --wt, --dry-run, and -e/--engine.".to_owned(),
+        "  --to <session[:window]> targets a workspace session, optionally splitting inside a specific tab (#1816).".to_owned(),
+        "  --pick prompts when a fuzzy live window match needs an explicit bring target (#1816).".to_owned(),
+        "  Refuses to split-bring an oracle into its own pane (set MAW_ALLOW_SELF_BRING=1 to override).".to_owned(),
+    ]
+}
+
 /// Translate `--to <session[:window]>` to wake-shaped flags.
 ///
 /// `--to` without a following value is preserved so downstream parsing can
