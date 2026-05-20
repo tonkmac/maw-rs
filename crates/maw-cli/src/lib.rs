@@ -4384,9 +4384,34 @@ fn run_peer_probe_plan(argv: &[String]) -> CliOutput {
     };
     match action {
         "classify" => run_peer_probe_classify_plan(&argv[1..]),
+        "constants" => run_peer_probe_constants_plan(&argv[1..]),
         "format" => run_peer_probe_format_plan(&argv[1..]),
         "handshake" => run_peer_probe_handshake_plan(&argv[1..]),
         _ => peer_probe_usage_error("peer-probe: invalid action"),
+    }
+}
+
+fn run_peer_probe_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            other => {
+                return peer_probe_constants_usage_error(&format!(
+                    "peer-probe constants: unknown argument {other}"
+                ));
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_peer_probe_constants_json()
+        } else {
+            "peer-probe codes=DNS,REFUSED,TIMEOUT,HTTP_4XX,HTTP_5XX,TLS,BAD_BODY,UNKNOWN exitCodes=DNS:3,REFUSED:4,TIMEOUT:5,HTTP_4XX:6,HTTP_5XX:6,TLS:2,BAD_BODY:2,UNKNOWN:2\n".to_owned()
+        },
+        stderr: String::new(),
     }
 }
 
@@ -4599,6 +4624,10 @@ fn parse_probe_error_code(value: &str) -> Option<ProbeErrorCode> {
     }
 }
 
+fn render_peer_probe_constants_json() -> String {
+    "{\"command\":\"peer-probe\",\"action\":\"constants\",\"codes\":[\"DNS\",\"REFUSED\",\"TIMEOUT\",\"HTTP_4XX\",\"HTTP_5XX\",\"TLS\",\"BAD_BODY\",\"UNKNOWN\"],\"exitCodes\":{\"DNS\":3,\"REFUSED\":4,\"TIMEOUT\":5,\"HTTP_4XX\":6,\"HTTP_5XX\":6,\"TLS\":2,\"BAD_BODY\":2,\"UNKNOWN\":2}}\n".to_owned()
+}
+
 fn peer_probe_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
@@ -4608,7 +4637,19 @@ fn peer_probe_usage_error(message: &str) -> CliOutput {
 }
 
 fn peer_probe_usage() -> &'static str {
-    "usage: maw-rs peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]\n       maw-rs peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]\n       maw-rs peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]"
+    "usage: maw-rs peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]\n       maw-rs peer-probe constants [--plan-json]\n       maw-rs peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]\n       maw-rs peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]"
+}
+
+fn peer_probe_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", peer_probe_constants_usage()),
+    }
+}
+
+fn peer_probe_constants_usage() -> &'static str {
+    "usage: maw-rs peer-probe constants [--plan-json]"
 }
 
 fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
@@ -9746,6 +9787,7 @@ fn usage_ok() -> CliOutput {
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
   auth sign-v1 --token <token> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth sign-headers --token <token> --now <ts> [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v1 --token <token> --signature <hex> --signed-at <ts> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth verify-legacy-from --from <oracle:node> --signed-at <iso> --signature <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v3-from --from <oracle:node> --timestamp <ts> --signature-v3 <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth from-sign-payload --from <oracle:node> (--timestamp <ts>|--legacy --signed-at <iso>) [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth hmac-sign --secret <secret> --payload <payload> [--plan-json]\n  auth hmac-verify --secret <secret> --payload <payload> --signature <hex> [--plan-json]\n  auth constants [--plan-json]\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  auth loopback --address <address> [--plan-json]\n  auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n  auth hash-body [--body <body>] [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-constants [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]\n  consent-expiry --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...> --now <ms> [--plan-json]\n  consent-cleanup --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>... --delete <id> [--plan-json]\n  consent-trust-revoke [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --revoke <from:to:action> [--plan-json]\n  consent-trust-check [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --check <from:to:action> [--plan-json]\n  consent-pending-read [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --id <id> [--plan-json]\n  consent-pending-status [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --set-status <id:pending|approved|rejected|expired> [--plan-json]\n  recent-hello [--hello <zid:seen_at_ms>]... --zid <zid> --now <ms> [--plan-json]\n  recent-hello constants [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  pair-code constants [--plan-json]\n  pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  peer-probe constants [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
