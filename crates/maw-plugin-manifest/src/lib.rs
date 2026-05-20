@@ -877,6 +877,76 @@ pub enum LoadedPluginKind {
     Wasm,
 }
 
+impl LoadedPluginKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ts => "ts",
+            Self::Wasm => "wasm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvokeSource {
+    Cli,
+    Api,
+    Peer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokeContext {
+    pub source: InvokeSource,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokeResult {
+    pub ok: bool,
+    pub output: Option<String>,
+    pub error: Option<String>,
+}
+
+impl InvokeResult {
+    #[must_use]
+    pub const fn ok() -> Self {
+        Self {
+            ok: true,
+            output: None,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn output(output: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            output: Some(output.into()),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn error(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            output: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+pub trait PluginInvokeRuntime {
+    fn invoke_ts(&mut self, plugin: &LoadedPlugin, ctx: &InvokeContext) -> InvokeResult;
+
+    fn invoke_wasm(
+        &mut self,
+        plugin: &LoadedPlugin,
+        ctx: &InvokeContext,
+        wasm_bytes: &[u8],
+    ) -> InvokeResult;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginNameAndTier {
     pub name: String,
@@ -1183,6 +1253,30 @@ where
     Ok(value)
 }
 
+/// Invoke a loaded plugin through maw-js-compatible universal dispatch guards.
+///
+/// This ports `src/plugin/registry-invoke.ts` universal CLI metadata/help,
+/// TS-entry dispatch gating, and WASM file-read handoff while leaving the actual
+/// JS/TS and WASM runtime engines injectable to callers.
+#[must_use]
+pub fn invoke_plugin<R>(plugin: &LoadedPlugin, ctx: &InvokeContext, runtime: &mut R) -> InvokeResult
+where
+    R: PluginInvokeRuntime,
+{
+    if let Some(result) = handle_universal_cli_flag(plugin, ctx) {
+        return result;
+    }
+
+    if plugin.kind == LoadedPluginKind::Ts && plugin.entry_path.is_some() {
+        return runtime.invoke_ts(plugin, ctx);
+    }
+
+    match std::fs::read(&plugin.wasm_path) {
+        Ok(wasm_bytes) => runtime.invoke_wasm(plugin, ctx, &wasm_bytes),
+        Err(error) => InvokeResult::error(format!("failed to read wasm: {error}")),
+    }
+}
+
 /// Default plugin scan roots.
 #[must_use]
 pub fn scan_dirs() -> Vec<PathBuf> {
@@ -1310,6 +1404,157 @@ fn resolve_plugin_module_path(plugin: &LoadedPlugin) -> Result<PathBuf, String> 
         ));
     }
     Ok(real_path)
+}
+
+fn handle_universal_cli_flag(plugin: &LoadedPlugin, ctx: &InvokeContext) -> Option<InvokeResult> {
+    if ctx.source != InvokeSource::Cli {
+        return None;
+    }
+    let first = ctx.args.first()?;
+    if matches!(first.as_str(), "-v" | "--version" | "-version") {
+        return Some(InvokeResult::output(render_version_output(plugin)));
+    }
+    if ctx
+        .args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "-help"))
+    {
+        return Some(InvokeResult::output(render_help_output(plugin)));
+    }
+    None
+}
+
+fn render_version_output(plugin: &LoadedPlugin) -> String {
+    let manifest = &plugin.manifest;
+    format!(
+        "{} v{} ({}, weight:{})\n  {}\n  surfaces: {}\n  dir: {}",
+        manifest.name,
+        manifest.version,
+        plugin.kind.as_str(),
+        manifest.weight.unwrap_or(50),
+        manifest.description.as_deref().unwrap_or_default(),
+        version_surfaces(plugin),
+        plugin.dir.display()
+    )
+}
+
+fn render_help_output(plugin: &LoadedPlugin) -> String {
+    let manifest = &plugin.manifest;
+    let effective_cmd = effective_cli_command(plugin);
+    let mut lines = Vec::new();
+    lines.push(format!("{} v{}", manifest.name, manifest.version));
+    if let Some(description) = &manifest.description {
+        lines.push(format!("  {description}"));
+    }
+    lines.push(String::new());
+    if let Some(help) = manifest.cli.as_ref().and_then(|cli| cli.help.as_ref()) {
+        lines.push(format!("  usage: {help}"));
+    } else if let Some(command) = &effective_cmd {
+        lines.push(format!("  usage: maw {command}"));
+    }
+    if let Some(aliases) = manifest.cli.as_ref().and_then(|cli| cli.aliases.as_ref()) {
+        if !aliases.is_empty() {
+            lines.push(format!("  aliases: {}", aliases.join(", ")));
+        }
+    }
+    if let Some(flags) = manifest.cli.as_ref().and_then(|cli| cli.flags.as_ref()) {
+        lines.push("  flags:".to_owned());
+        for (name, kind) in flags {
+            lines.push(format!("    {name:<20} {}", kind.as_str()));
+        }
+    }
+    lines.push(String::new());
+    lines.push("  surfaces:".to_owned());
+    if let Some(command) = effective_cmd {
+        lines.push(format!("    cli: maw {command}"));
+    }
+    if let Some(api) = &manifest.api {
+        lines.push(format!(
+            "    api: {} {}",
+            api.methods
+                .iter()
+                .map(|method| method.as_str())
+                .collect::<Vec<_>>()
+                .join("/"),
+            api.path
+        ));
+    }
+    if manifest
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.peer)
+        .unwrap_or(false)
+    {
+        lines.push(format!("    peer: maw hey plugin:{}", manifest.name));
+    }
+    if let Some(hooks) = help_hook_keys(manifest.hooks.as_ref()) {
+        lines.push(format!("    hooks: {}", hooks.join(", ")));
+    }
+    lines.push(format!("\n  dir: {}", plugin.dir.display()));
+    lines.join("\n")
+}
+
+fn version_surfaces(plugin: &LoadedPlugin) -> String {
+    let manifest = &plugin.manifest;
+    let mut surfaces = Vec::new();
+    if let Some(command) = effective_cli_command(plugin) {
+        surfaces.push(format!("cli:{command}"));
+    }
+    if let Some(api) = &manifest.api {
+        surfaces.push(format!("api:{}", api.path));
+    }
+    if manifest.hooks.is_some() {
+        surfaces.push("hooks".to_owned());
+    }
+    if manifest
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.peer)
+        .unwrap_or(false)
+    {
+        surfaces.push("peer".to_owned());
+    }
+    surfaces.join(", ")
+}
+
+fn effective_cli_command(plugin: &LoadedPlugin) -> Option<String> {
+    plugin.manifest.cli.as_ref().map_or_else(
+        || {
+            let dispatchable = match plugin.kind {
+                LoadedPluginKind::Ts => plugin.entry_path.is_some(),
+                LoadedPluginKind::Wasm => !plugin.wasm_path.as_os_str().is_empty(),
+            };
+            dispatchable.then(|| plugin.manifest.name.clone())
+        },
+        |cli| Some(cli.command.clone()),
+    )
+}
+
+fn help_hook_keys(hooks: Option<&PluginHooks>) -> Option<Vec<&'static str>> {
+    let hooks = hooks?;
+    let mut keys = Vec::new();
+    if hooks.gate.is_some() {
+        keys.push("gate");
+    }
+    if hooks.filter.is_some() {
+        keys.push("filter");
+    }
+    if hooks.on.is_some() {
+        keys.push("on");
+    }
+    if hooks.late.is_some() {
+        keys.push("late");
+    }
+    if hooks.wake.is_some() {
+        keys.push("wake");
+    }
+    if hooks.sleep.is_some() {
+        keys.push("sleep");
+    }
+    if hooks.serve.is_some() {
+        keys.push("serve");
+    }
+    Some(keys)
 }
 
 fn cached_discover_plugins() -> Option<Vec<LoadedPlugin>> {
