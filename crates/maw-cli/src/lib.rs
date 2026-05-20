@@ -25,8 +25,9 @@ use maw_peer::{
     PeerSourceMode, PeerSourceResult,
 };
 use maw_plugin_manifest::{
-    discover_packages, import_plugin_symbol, load_manifest_from_dir, parse_manifest,
-    DiscoverPackagesOptions, LoadedPlugin, PluginManifest,
+    discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
+    DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
+    PluginInvokeRuntime, PluginManifest,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -1086,6 +1087,23 @@ fn run_plugin_manifest_plan(argv: &[String]) -> CliOutput {
             &symbol,
             &module_symbols,
         ),
+        PluginManifestAction::Invoke {
+            plan_json,
+            options,
+            plugin,
+            source,
+            args,
+            fake_ts_output,
+            fake_wasm_output,
+        } => run_plugin_manifest_invoke_plan(
+            plan_json,
+            &options,
+            &plugin,
+            source,
+            args,
+            fake_ts_output,
+            fake_wasm_output,
+        ),
     }
 }
 
@@ -1121,6 +1139,82 @@ fn run_plugin_manifest_import_symbol_plan(
     }
 }
 
+fn run_plugin_manifest_invoke_plan(
+    plan_json: bool,
+    options: &DiscoverPackagesOptions,
+    plugin_name: &str,
+    source: InvokeSource,
+    args: Vec<String>,
+    fake_ts_output: Option<String>,
+    fake_wasm_output: Option<String>,
+) -> CliOutput {
+    let report = discover_packages(options);
+    let Some(plugin) = report
+        .plugins
+        .iter()
+        .find(|plugin| plugin.manifest.name == plugin_name)
+    else {
+        return plugin_manifest_usage_error(&format!("plugin '{plugin_name}' not found"));
+    };
+    if plugin.disabled {
+        return plugin_manifest_usage_error(&format!("plugin '{plugin_name}' is disabled"));
+    }
+    let ctx = InvokeContext { source, args };
+    let mut runtime = PlanInvokeRuntime::new(fake_ts_output, fake_wasm_output);
+    let result = invoke_plugin(plugin, &ctx, &mut runtime);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_plugin_invoke_json(plugin_name, &ctx, &result, &runtime, &report.warnings)
+        } else if result.ok {
+            result
+                .output
+                .map_or_else(|| "ok\n".to_owned(), |output| format!("{output}\n"))
+        } else {
+            format!("{}\n", result.error.unwrap_or_else(|| "error".to_owned()))
+        },
+        stderr: String::new(),
+    }
+}
+
+struct PlanInvokeRuntime {
+    ts_calls: usize,
+    wasm_calls: usize,
+    last_wasm_bytes_len: usize,
+    ts_result: InvokeResult,
+    wasm_result: InvokeResult,
+}
+
+impl PlanInvokeRuntime {
+    fn new(fake_ts_output: Option<String>, fake_wasm_output: Option<String>) -> Self {
+        Self {
+            ts_calls: 0,
+            wasm_calls: 0,
+            last_wasm_bytes_len: 0,
+            ts_result: fake_ts_output.map_or_else(InvokeResult::ok, InvokeResult::output),
+            wasm_result: fake_wasm_output.map_or_else(InvokeResult::ok, InvokeResult::output),
+        }
+    }
+}
+
+impl PluginInvokeRuntime for PlanInvokeRuntime {
+    fn invoke_ts(&mut self, _plugin: &LoadedPlugin, _ctx: &InvokeContext) -> InvokeResult {
+        self.ts_calls += 1;
+        self.ts_result.clone()
+    }
+
+    fn invoke_wasm(
+        &mut self,
+        _plugin: &LoadedPlugin,
+        _ctx: &InvokeContext,
+        wasm_bytes: &[u8],
+    ) -> InvokeResult {
+        self.wasm_calls += 1;
+        self.last_wasm_bytes_len = wasm_bytes.len();
+        self.wasm_result.clone()
+    }
+}
+
 enum PluginManifestAction {
     Parse {
         plan_json: bool,
@@ -1142,6 +1236,15 @@ enum PluginManifestAction {
         symbol: String,
         module_symbols: BTreeMap<String, String>,
     },
+    Invoke {
+        plan_json: bool,
+        options: DiscoverPackagesOptions,
+        plugin: String,
+        source: InvokeSource,
+        args: Vec<String>,
+        fake_ts_output: Option<String>,
+        fake_wasm_output: Option<String>,
+    },
 }
 
 fn parse_plugin_manifest_args(argv: &[String]) -> Result<PluginManifestAction, String> {
@@ -1153,6 +1256,7 @@ fn parse_plugin_manifest_args(argv: &[String]) -> Result<PluginManifestAction, S
         "load" => parse_plugin_manifest_load_args(&argv[1..]),
         "discover" => parse_plugin_manifest_discover_args(&argv[1..]),
         "import-symbol" => parse_plugin_manifest_import_symbol_args(&argv[1..]),
+        "invoke" => parse_plugin_manifest_invoke_args(&argv[1..]),
         other => Err(format!("plugin-manifest: unknown subcommand {other}")),
     }
 }
@@ -1220,6 +1324,92 @@ fn parse_plugin_manifest_import_symbol_args(
         symbol: import.symbol,
         module_symbols: import.module_symbols,
     })
+}
+
+fn parse_plugin_manifest_invoke_args(argv: &[String]) -> Result<PluginManifestAction, String> {
+    let mut plan_json = false;
+    let mut scan_dirs = Vec::new();
+    let mut disabled_plugins = Vec::new();
+    let mut runtime_version = "1.0.0".to_owned();
+    let mut use_cache = false;
+    let mut plugin = None;
+    let mut source = InvokeSource::Cli;
+    let mut invoke_args = Vec::new();
+    let mut fake_ts_output = None;
+    let mut fake_wasm_output = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--scan-dir" => {
+                scan_dirs.push(take_plugin_manifest_path(argv, index, "--scan-dir")?);
+                index += 1;
+            }
+            "--disabled" => {
+                disabled_plugins.push(take_plugin_manifest_value(argv, index, "--disabled")?);
+                index += 1;
+            }
+            "--runtime-version" => {
+                runtime_version = take_plugin_manifest_value(argv, index, "--runtime-version")?;
+                index += 1;
+            }
+            "--use-cache" => use_cache = true,
+            "--plugin" => {
+                plugin = Some(take_plugin_manifest_value(argv, index, "--plugin")?);
+                index += 1;
+            }
+            "--source" => {
+                source = parse_plugin_manifest_invoke_source(&take_plugin_manifest_value(
+                    argv, index, "--source",
+                )?)?;
+                index += 1;
+            }
+            "--arg" => {
+                invoke_args.push(take_plugin_manifest_value(argv, index, "--arg")?);
+                index += 1;
+            }
+            "--fake-ts-output" => {
+                fake_ts_output = Some(take_plugin_manifest_value(argv, index, "--fake-ts-output")?);
+                index += 1;
+            }
+            "--fake-wasm-output" => {
+                fake_wasm_output = Some(take_plugin_manifest_value(
+                    argv,
+                    index,
+                    "--fake-wasm-output",
+                )?);
+                index += 1;
+            }
+            other => return Err(format!("plugin-manifest invoke: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    if scan_dirs.is_empty() {
+        return Err("plugin-manifest invoke: --scan-dir is required".to_owned());
+    }
+    Ok(PluginManifestAction::Invoke {
+        plan_json,
+        options: DiscoverPackagesOptions {
+            scan_dirs,
+            disabled_plugins,
+            runtime_version,
+            use_cache,
+        },
+        plugin: plugin.ok_or_else(|| "plugin-manifest invoke: --plugin is required".to_owned())?,
+        source,
+        args: invoke_args,
+        fake_ts_output,
+        fake_wasm_output,
+    })
+}
+
+fn parse_plugin_manifest_invoke_source(value: &str) -> Result<InvokeSource, String> {
+    match value {
+        "cli" => Ok(InvokeSource::Cli),
+        "api" => Ok(InvokeSource::Api),
+        "peer" => Ok(InvokeSource::Peer),
+        other => Err(format!("plugin-manifest invoke: unknown --source {other}")),
+    }
 }
 
 struct PluginManifestImportArgs {
@@ -1336,7 +1526,7 @@ fn plugin_manifest_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n       maw-rs plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n       maw-rs plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n"
+            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n       maw-rs plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n       maw-rs plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n       maw-rs plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n"
         ),
     }
 }
@@ -1382,6 +1572,35 @@ fn render_plugin_import_symbol_json(
             json_string(&path_string(path))
         }),
         json_string_array(warnings)
+    )
+}
+
+fn render_plugin_invoke_json(
+    plugin: &str,
+    ctx: &InvokeContext,
+    result: &InvokeResult,
+    runtime: &PlanInvokeRuntime,
+    warnings: &[String],
+) -> String {
+    format!(
+        "{{\"command\":\"plugin-manifest\",\"kind\":\"invoke\",\"plugin\":{},\"source\":{},\"args\":{},\"result\":{},\"runtime\":{{\"tsCalls\":{},\"wasmCalls\":{},\"lastWasmBytesLen\":{}}},\"warnings\":{}}}\n",
+        json_string(plugin),
+        json_string(ctx.source.as_str()),
+        json_string_array(&ctx.args),
+        render_invoke_result_json(result),
+        runtime.ts_calls,
+        runtime.wasm_calls,
+        runtime.last_wasm_bytes_len,
+        json_string_array(warnings)
+    )
+}
+
+fn render_invoke_result_json(result: &InvokeResult) -> String {
+    format!(
+        "{{\"ok\":{},\"output\":{},\"error\":{}}}",
+        result.ok,
+        json_opt_string(result.output.as_deref()),
+        json_opt_string(result.error.as_deref())
     )
 }
 
@@ -3580,7 +3799,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
