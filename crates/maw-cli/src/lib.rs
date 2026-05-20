@@ -6,14 +6,15 @@
 use maw_auth::{
     approve_consent_plan, consent_request_id_from_bytes, generate_pair_code_from_bytes,
     hash_consent_pin, is_valid_pair_code_shape, normalize_pair_code, pair_api_accept_plan,
-    pair_api_generate_plan, pair_api_probe_plan, pair_api_status_plan, pretty_pair_code,
-    redact_pair_code, reject_consent_plan, request_consent_plan, sign_auto_pair_proof,
-    sign_headers_v3_at, sign_request_v3, verify_auto_pair_proof, verify_consent_pin,
-    verify_request, ApprovedBy, AutoPairIdentity, ConsentAction, ConsentApprovalResult,
-    ConsentRequestArgs, ConsentRequestResult, ConsentStore, FromVerifyDecision, Headers,
-    PairAcceptInput, PairApiAcceptResult, PairApiConfig, PairApiGenerateResult, PairApiProbeResult,
+    pair_api_auto_plan, pair_api_generate_plan, pair_api_probe_plan, pair_api_status_plan,
+    pretty_pair_code, redact_pair_code, reject_consent_plan, request_consent_plan,
+    sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3, verify_auto_pair_proof,
+    verify_consent_pin, verify_request, ApprovedBy, AutoPairAddOutcome, AutoPairIdentity,
+    AutoPairInput, ConsentAction, ConsentApprovalResult, ConsentRequestArgs, ConsentRequestResult,
+    ConsentStore, FromVerifyDecision, Headers, PairAcceptInput, PairApiAcceptResult,
+    PairApiAutoResult, PairApiConfig, PairApiGenerateResult, PairApiProbeResult,
     PairApiStatusResult, PairCodeStore, PeerPendingRequest, PeerPostResult, PendingRequest,
-    TrustEntry, VerifyRequestArgs,
+    RecentHelloStore, TrustEntry, VerifyRequestArgs,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -123,6 +124,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "consent-approval" => run_consent_approval_plan(&argv[1..]),
         "pair-code" => run_pair_code_plan(&argv[1..]),
         "pair-api" => run_pair_api_plan(&argv[1..]),
+        "pair-api-auto" => run_pair_api_auto_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
@@ -5384,6 +5386,255 @@ fn pair_api_usage_error(message: &str) -> CliOutput {
 
 fn pair_api_usage() -> &'static str {
     "usage: maw-rs pair-api <generate|probe|accept|status> --code <code> --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--expires-sec <sec>|--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--remote-node <node> --remote-url <url>] [--seed-accepted <node=url>] [--plan-json]"
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_pair_api_auto_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut node = None::<String>;
+    let mut oracle = None::<String>;
+    let mut port = None::<u16>;
+    let mut base_url = None::<String>;
+    let mut federation_token = None::<String>;
+    let mut pubkey = None::<String>;
+    let mut now_ms = None::<u64>;
+    let mut remote_node = None::<String>;
+    let mut remote_oracle = None::<String>;
+    let mut remote_url = None::<String>;
+    let mut zid = None::<String>;
+    let mut remote_pubkey = None::<String>;
+    let mut hellos = RecentHelloStore::default();
+    let mut add_outcome = AutoPairAddOutcome::Ok { one_way: false };
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --node value");
+                };
+                node = Some(value.to_owned());
+                index += 1;
+            }
+            "--oracle" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --oracle value");
+                };
+                oracle = Some(value.to_owned());
+                index += 1;
+            }
+            "--port" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --port value");
+                };
+                match parse_u16_arg(value, "pair-api-auto: --port") {
+                    Ok(parsed) => port = Some(parsed),
+                    Err(message) => return pair_api_auto_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--base-url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --base-url value");
+                };
+                base_url = Some(value.to_owned());
+                index += 1;
+            }
+            "--federation-token" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error(
+                        "pair-api-auto: missing --federation-token value",
+                    );
+                };
+                federation_token = Some(value.to_owned());
+                index += 1;
+            }
+            "--pubkey" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --pubkey value");
+                };
+                pubkey = Some(value.to_owned());
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --now value");
+                };
+                match parse_u64_arg(value, "pair-api-auto: --now") {
+                    Ok(parsed) => now_ms = Some(parsed),
+                    Err(message) => return pair_api_auto_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--remote-node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --remote-node value");
+                };
+                remote_node = Some(value.to_owned());
+                index += 1;
+            }
+            "--remote-oracle" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error(
+                        "pair-api-auto: missing --remote-oracle value",
+                    );
+                };
+                remote_oracle = Some(value.to_owned());
+                index += 1;
+            }
+            "--remote-url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --remote-url value");
+                };
+                remote_url = Some(value.to_owned());
+                index += 1;
+            }
+            "--zid" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --zid value");
+                };
+                zid = Some(value.to_owned());
+                index += 1;
+            }
+            "--remote-pubkey" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error(
+                        "pair-api-auto: missing --remote-pubkey value",
+                    );
+                };
+                remote_pubkey = Some(value.to_owned());
+                index += 1;
+            }
+            "--hello" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --hello value");
+                };
+                match parse_recent_hello(value) {
+                    Ok((zid, seen_at)) => hellos.record(&zid, seen_at),
+                    Err(message) => return pair_api_auto_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--add-ok" => add_outcome = AutoPairAddOutcome::Ok { one_way: false },
+            "--add-one-way" => add_outcome = AutoPairAddOutcome::Ok { one_way: true },
+            "--add-pubkey-mismatch" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error(
+                        "pair-api-auto: missing --add-pubkey-mismatch value",
+                    );
+                };
+                add_outcome = AutoPairAddOutcome::PubkeyMismatch(value.to_owned());
+                index += 1;
+            }
+            "--add-error" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_auto_usage_error("pair-api-auto: missing --add-error value");
+                };
+                add_outcome = AutoPairAddOutcome::Error(value.to_owned());
+                index += 1;
+            }
+            arg => {
+                return pair_api_auto_usage_error(&format!("pair-api-auto: unknown argument {arg}"))
+            }
+        }
+        index += 1;
+    }
+
+    let Some(now_ms) = now_ms else {
+        return pair_api_auto_usage_error("pair-api-auto: missing --now value");
+    };
+    let config = match build_pair_api_config(node, oracle, port, base_url, federation_token, pubkey)
+    {
+        Ok(config) => config,
+        Err(message) => {
+            return pair_api_auto_usage_error(&message.replace("pair-api", "pair-api-auto"))
+        }
+    };
+    let input = match (remote_node, remote_url, zid) {
+        (Some(node), Some(url), Some(zid)) => Some(AutoPairInput {
+            node,
+            oracle: remote_oracle,
+            url,
+            zid,
+            pubkey: remote_pubkey,
+        }),
+        _ => None,
+    };
+    let result = pair_api_auto_plan(&config, &hellos, input, add_outcome, now_ms);
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_pair_api_auto_json(&result)
+        } else {
+            format!("pair-api-auto status={} ok={}\n", result.status, result.ok)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_recent_hello(value: &str) -> Result<(String, u64), String> {
+    let Some((zid, seen_at)) = value.split_once(':') else {
+        return Err("pair-api-auto: --hello must be zid:seen_at_ms".to_owned());
+    };
+    if zid.is_empty() || seen_at.is_empty() {
+        return Err("pair-api-auto: --hello must be zid:seen_at_ms".to_owned());
+    }
+    Ok((
+        zid.to_owned(),
+        parse_u64_arg(seen_at, "pair-api-auto: --hello seen_at_ms")?,
+    ))
+}
+
+fn render_pair_api_auto_json(result: &PairApiAutoResult) -> String {
+    format!(
+        "{{\"command\":\"pair-api-auto\",\"status\":{},\"ok\":{},\"error\":{},\"node\":{},\"oracle\":{},\"url\":{},\"pubkey\":{},\"proof\":{},\"federationToken\":null,\"oneWay\":{},\"add\":{},\"markSymmetricCheck\":{}}}\n",
+        result.status,
+        result.ok,
+        json_optional_string(result.error.as_deref()),
+        json_optional_string(result.node.as_deref()),
+        json_optional_string(result.oracle.as_deref()),
+        json_optional_string(result.url.as_deref()),
+        json_optional_string(result.pubkey.as_deref()),
+        json_optional_string(result.proof.as_deref()),
+        json_optional_bool(result.one_way),
+        render_pair_api_auto_add_json(result),
+        result.mark_symmetric_check
+    )
+}
+
+fn render_pair_api_auto_add_json(result: &PairApiAutoResult) -> String {
+    if result.add_alias.is_none()
+        && result.add_url.is_none()
+        && result.add_node.is_none()
+        && result.add_pubkey.is_none()
+        && result.add_identity_oracle.is_none()
+        && result.add_identity_node.is_none()
+    {
+        return "null".to_owned();
+    }
+    format!(
+        "{{\"alias\":{},\"url\":{},\"node\":{},\"pubkey\":{},\"identityOracle\":{},\"identityNode\":{}}}",
+        json_optional_string(result.add_alias.as_deref()),
+        json_optional_string(result.add_url.as_deref()),
+        json_optional_string(result.add_node.as_deref()),
+        json_optional_string(result.add_pubkey.as_deref()),
+        json_optional_string(result.add_identity_oracle.as_deref()),
+        json_optional_string(result.add_identity_node.as_deref())
+    )
+}
+
+fn pair_api_auto_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", pair_api_auto_usage()),
+    }
+}
+
+fn pair_api_auto_usage() -> &'static str {
+    "usage: maw-rs pair-api-auto --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--remote-node <node> --remote-url <url> --zid <zid>] [--remote-oracle <oracle>] [--remote-pubkey <pubkey>] [--hello <zid:seen_at_ms>]... [--add-ok|--add-one-way|--add-pubkey-mismatch <message>|--add-error <message>] [--plan-json]"
 }
 
 #[allow(clippy::too_many_lines)]
