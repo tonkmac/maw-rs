@@ -24,6 +24,9 @@ use maw_peer::{
     resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
     PeerSourceMode, PeerSourceResult,
 };
+use maw_plugin_scaffold::{
+    build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
+};
 use maw_policy::{default_active_group, weight_to_tier, DEFAULT_TIER, KNOWN_TIERS};
 use maw_routing::{
     resolve_target as resolve_route_target, MawConfig as RouteConfig, NamedPeer as RouteNamedPeer,
@@ -63,6 +66,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "auth" => run_auth_plan(&argv[1..]),
         "hub" => run_hub_plan(&argv[1..]),
         "xdg" => run_xdg_plan(&argv[1..]),
+        "plugin-scaffold" => run_plugin_scaffold_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -829,6 +833,169 @@ fn xdg_usage_error(message: &str) -> CliOutput {
         stdout: String::new(),
         stderr: format!(
             "{message}\nusage: maw-rs xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n       maw-rs xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n       maw-rs xdg validate-instance --name <name> [--plan-json]\n"
+        ),
+    }
+}
+
+fn run_plugin_scaffold_plan(argv: &[String]) -> CliOutput {
+    let action = match parse_plugin_scaffold_args(argv) {
+        Ok(action) => action,
+        Err(message) => return plugin_scaffold_usage_error(&message),
+    };
+    match action {
+        PluginScaffoldAction::ValidateName { plan_json, name } => {
+            let error = validate_plugin_name(&name);
+            let valid = error.is_none();
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    let error_json = error.map_or("null".to_owned(), |error| json_string(&error));
+                    format!(
+                        "{{\"command\":\"plugin-scaffold\",\"kind\":\"validate-name\",\"name\":{},\"valid\":{valid},\"error\":{error_json}}}\n",
+                        json_string(&name)
+                    )
+                } else if valid {
+                    "valid\n".to_owned()
+                } else {
+                    format!("{}\n", error.expect("invalid name has error"))
+                },
+                stderr: String::new(),
+            }
+        }
+        PluginScaffoldAction::Manifest {
+            plan_json,
+            name,
+            language,
+        } => {
+            let manifest_text = build_manifest_json(&name, language);
+            let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+                .expect("maw-plugin-scaffold emits valid manifest JSON");
+            let language_name = match language {
+                ScaffoldLanguage::Rust => "rust",
+                ScaffoldLanguage::AssemblyScript => "assemblyscript",
+            };
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    format!(
+                        "{{\"command\":\"plugin-scaffold\",\"kind\":\"manifest\",\"language\":{},\"manifest\":{manifest}}}\n",
+                        json_string(language_name)
+                    )
+                } else {
+                    manifest_text
+                },
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+enum PluginScaffoldAction {
+    ValidateName {
+        plan_json: bool,
+        name: String,
+    },
+    Manifest {
+        plan_json: bool,
+        name: String,
+        language: ScaffoldLanguage,
+    },
+}
+
+fn parse_plugin_scaffold_args(argv: &[String]) -> Result<PluginScaffoldAction, String> {
+    let Some(kind) = argv.first().map(String::as_str) else {
+        return Err("plugin-scaffold: expected validate-name or manifest".to_owned());
+    };
+    match kind {
+        "validate-name" => parse_plugin_scaffold_validate_args(&argv[1..]),
+        "manifest" => parse_plugin_scaffold_manifest_args(&argv[1..]),
+        other => Err(format!("plugin-scaffold: unknown subcommand {other}")),
+    }
+}
+
+fn parse_plugin_scaffold_validate_args(argv: &[String]) -> Result<PluginScaffoldAction, String> {
+    let mut plan_json = false;
+    let mut name = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--name" => {
+                name = Some(take_plugin_scaffold_value(argv, index, "--name")?);
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "plugin-scaffold validate-name: unknown argument {other}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    Ok(PluginScaffoldAction::ValidateName {
+        plan_json,
+        name: name.ok_or_else(|| "plugin-scaffold validate-name: --name is required".to_owned())?,
+    })
+}
+
+fn parse_plugin_scaffold_manifest_args(argv: &[String]) -> Result<PluginScaffoldAction, String> {
+    let mut plan_json = false;
+    let mut name = None;
+    let mut rust = false;
+    let mut assembly_script = false;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--name" => {
+                name = Some(take_plugin_scaffold_value(argv, index, "--name")?);
+                index += 1;
+            }
+            "--rust" => rust = true,
+            "--as" => assembly_script = true,
+            other => {
+                return Err(format!(
+                    "plugin-scaffold manifest: unknown argument {other}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    if !rust && !assembly_script {
+        return Err("plugin-scaffold manifest: Specify either --rust or --as".to_owned());
+    }
+    if rust && assembly_script {
+        return Err("plugin-scaffold manifest: Specify --rust or --as, not both".to_owned());
+    }
+    let name = name.ok_or_else(|| "plugin-scaffold manifest: --name is required".to_owned())?;
+    if let Some(error) = validate_plugin_name(&name) {
+        return Err(format!(
+            "plugin-scaffold manifest: Invalid plugin name: {error}"
+        ));
+    }
+    Ok(PluginScaffoldAction::Manifest {
+        plan_json,
+        name,
+        language: if rust {
+            ScaffoldLanguage::Rust
+        } else {
+            ScaffoldLanguage::AssemblyScript
+        },
+    })
+}
+
+fn take_plugin_scaffold_value(argv: &[String], index: usize, name: &str) -> Result<String, String> {
+    argv.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("plugin-scaffold: missing {name} value"))
+}
+
+fn plugin_scaffold_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs plugin-scaffold validate-name --name <name> [--plan-json]\n       maw-rs plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n"
         ),
     }
 }
