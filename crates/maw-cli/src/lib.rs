@@ -4,8 +4,9 @@
 //! be tested against maw-js parser contracts before host IO is wired.
 
 use maw_auth::{
-    sign_headers_v3_at, sign_request_v3, verify_request, FromVerifyDecision, Headers,
-    VerifyRequestArgs,
+    generate_pair_code_from_bytes, is_valid_pair_code_shape, normalize_pair_code, pretty_pair_code,
+    redact_pair_code, sign_headers_v3_at, sign_request_v3, verify_request, FromVerifyDecision,
+    Headers, VerifyRequestArgs,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -109,6 +110,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "federation-identity" => run_federation_identity_plan(&argv[1..]),
         "federation-health" => run_federation_health_plan(&argv[1..]),
         "federation-sync" => run_federation_sync_plan(&argv[1..]),
+        "pair-code" => run_pair_code_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
@@ -4135,6 +4137,108 @@ fn federation_health_usage() -> &'static str {
     "usage: maw-rs federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|missing-peers|http|fetch-error|peer...>]... [--plan-json]"
 }
 
+fn run_pair_code_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut code = None::<String>;
+    let mut bytes = None::<Vec<u8>>;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_code_usage_error("pair-code: missing --code value");
+                };
+                code = Some(value.to_owned());
+                index += 1;
+            }
+            "--bytes" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_code_usage_error("pair-code: missing --bytes value");
+                };
+                match parse_pair_code_bytes(value) {
+                    Ok(parsed) => bytes = Some(parsed),
+                    Err(message) => return pair_code_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => return pair_code_usage_error(&format!("pair-code: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    if code.is_some() && bytes.is_some() {
+        return pair_code_usage_error("pair-code: expected exactly one of --code or --bytes");
+    }
+    let raw_code = match (code, bytes) {
+        (Some(code), None) => code,
+        (None, Some(bytes)) => generate_pair_code_from_bytes(&bytes),
+        (None, None) => return pair_code_usage_error("pair-code: expected --code or --bytes"),
+        (Some(_), Some(_)) => unreachable!("validated above"),
+    };
+    let normalized = normalize_pair_code(&raw_code);
+    let pretty = pretty_pair_code(&normalized);
+    let redacted = redact_pair_code(&normalized);
+    let valid = is_valid_pair_code_shape(&normalized);
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_pair_code_plan_json(&normalized, &pretty, &redacted, valid)
+        } else {
+            render_pair_code_plan_text(&pretty, &redacted, valid)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_pair_code_bytes(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return Err("pair-code: --bytes must use comma-separated u8 values".to_owned());
+    }
+    value
+        .split(',')
+        .map(|part| {
+            if part.is_empty() {
+                return Err("pair-code: --bytes must use comma-separated u8 values".to_owned());
+            }
+            part.parse::<u8>()
+                .map_err(|_| "pair-code: --bytes must use comma-separated u8 values".to_owned())
+        })
+        .collect()
+}
+
+fn render_pair_code_plan_json(
+    normalized: &str,
+    pretty: &str,
+    redacted: &str,
+    valid: bool,
+) -> String {
+    format!(
+        "{{\"command\":\"pair-code\",\"normalized\":{},\"pretty\":{},\"redacted\":{},\"valid\":{valid}}}\n",
+        json_string(normalized),
+        json_string(pretty),
+        json_string(redacted)
+    )
+}
+
+fn render_pair_code_plan_text(pretty: &str, redacted: &str, valid: bool) -> String {
+    format!("pair-code {pretty} valid={valid} redacted={redacted}\n")
+}
+
+fn pair_code_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", pair_code_usage()),
+    }
+}
+
+fn pair_code_usage() -> &'static str {
+    "usage: maw-rs pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]"
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_discover_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
@@ -5789,7 +5893,7 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
