@@ -87,6 +87,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "maw-bind"
+version = "0.1.0"
+
+[[package]]
 name = "maw-bring"
 version = "0.1.0"
 dependencies = [

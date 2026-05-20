@@ -28,6 +28,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-feed` | `src/lib/feed.ts` | `test/isolated/feed-lib-coverage.test.ts` |
 | `maw-auth` | `src/lib/federation-auth.ts` | federation auth pure helper and O6 decision tests |
 | `maw-xdg` | `src/core/xdg.ts` | `test/core-xdg.test.ts` |
+| `maw-bind` | `src/core/bind-host.ts` | `test/bind-heuristic.test.ts` |
 
 Current local gates:
 
