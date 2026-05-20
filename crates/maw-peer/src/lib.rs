@@ -5,6 +5,7 @@
 
 use std::{
     collections::BTreeMap,
+    error::Error,
     fmt::Write,
     fs, io,
     path::{Path, PathBuf},
@@ -453,7 +454,7 @@ pub enum ProbeRemoteIdentity {
 }
 
 /// Peer's self-reported `<oracle>:<node>` identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerIdentity {
     pub oracle: String,
     pub node: String,
@@ -627,6 +628,14 @@ pub struct PeerRecord {
     pub last_seen: Option<String>,
     #[serde(default, rename = "lastError")]
     pub last_error: Option<ProbeLastError>,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default, rename = "pubkeyFirstSeen")]
+    pub pubkey_first_seen: Option<String>,
+    #[serde(default)]
+    pub identity: Option<PeerIdentity>,
 }
 
 /// Peer store file shape, ported from maw-js peers `store.ts` schema v1.
@@ -661,6 +670,61 @@ pub struct PeerDoctorCheck {
     pub ok: bool,
     pub message: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TofuDecisionKind {
+    TofuBootstrap,
+    Match,
+    Mismatch,
+    LegacyFirstContact,
+    LegacyAfterPinned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TofuDecision {
+    pub kind: TofuDecisionKind,
+    pub alias: String,
+    pub cached: Option<String>,
+    pub observed: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerPubkeyMismatchError {
+    pub alias: String,
+    pub cached: String,
+    pub observed: String,
+}
+
+impl PeerPubkeyMismatchError {
+    #[must_use]
+    pub fn new(
+        alias: impl Into<String>,
+        cached: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        Self {
+            alias: alias.into(),
+            cached: cached.into(),
+            observed: observed.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PeerPubkeyMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "peer pubkey changed for {}: {}… → {}…; manually `maw peers forget {}` to re-TOFU",
+            self.alias,
+            prefix16(&self.cached),
+            prefix16(&self.observed),
+            self.alias
+        )
+    }
+}
+
+impl Error for PeerPubkeyMismatchError {}
 
 /// Deterministic peer-store environment for maw-js path resolution parity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -871,6 +935,173 @@ pub fn remove_stale_peers(env: &PeerStoreEnv, now_ms: u64) -> io::Result<PeerDoc
     })
 }
 
+#[must_use]
+pub fn evaluate_peer_identity(
+    alias: &str,
+    peer: Option<&PeerRecord>,
+    observed: Option<&str>,
+) -> TofuDecision {
+    let cached = peer
+        .and_then(|peer| peer.pubkey.as_deref())
+        .filter(|value| !value.is_empty());
+    let observed = observed.filter(|value| !value.is_empty());
+
+    let alias_string = alias.to_owned();
+    let cached_string = cached.map(str::to_owned);
+    let observed_string = observed.map(str::to_owned);
+
+    match (cached, observed) {
+        (None, Some(_)) => TofuDecision {
+            kind: TofuDecisionKind::TofuBootstrap,
+            alias: alias_string,
+            cached: None,
+            observed: observed_string,
+            message: format!("[tofu] caching pubkey for {alias} (first sight)"),
+        },
+        (None, None) => TofuDecision {
+            kind: TofuDecisionKind::LegacyFirstContact,
+            alias: alias_string,
+            cached: None,
+            observed: None,
+            message: format!("[tofu] {alias} did not advertise a pubkey (legacy peer; no pin established)"),
+        },
+        (Some(cached), None) => TofuDecision {
+            kind: TofuDecisionKind::LegacyAfterPinned,
+            alias: alias_string,
+            cached: cached_string,
+            observed: None,
+            message: format!(
+                "[tofu] {alias} previously advertised pubkey {}… but this response omits it; accepting during alpha migration, will hard-fail at v27",
+                prefix16(cached)
+            ),
+        },
+        (Some(cached), Some(observed)) if cached == observed => TofuDecision {
+            kind: TofuDecisionKind::Match,
+            alias: alias_string,
+            cached: cached_string,
+            observed: observed_string,
+            message: format!("[tofu] {alias} pubkey verified"),
+        },
+        (Some(cached), Some(observed)) => TofuDecision {
+            kind: TofuDecisionKind::Mismatch,
+            alias: alias_string,
+            cached: cached_string,
+            observed: observed_string,
+            message: PeerPubkeyMismatchError::new(alias, cached, observed).to_string(),
+        },
+    }
+}
+
+/// Persist a TOFU decision.
+///
+/// # Errors
+///
+/// Returns a structured mismatch error when the cached and observed pubkeys differ,
+/// or an IO error if the bootstrap mutation cannot be written.
+pub fn apply_tofu_decision(
+    env: &PeerStoreEnv,
+    decision: &TofuDecision,
+    now: &str,
+) -> Result<(), TofuApplyError> {
+    match decision.kind {
+        TofuDecisionKind::TofuBootstrap => {
+            mutate_peer_store(env, |data| {
+                let Some(peer) = data.peers.get_mut(&decision.alias) else {
+                    return;
+                };
+                if peer
+                    .pubkey
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    return;
+                }
+                peer.pubkey.clone_from(&decision.observed);
+                peer.pubkey_first_seen = Some(now.to_owned());
+            })?;
+            Ok(())
+        }
+        TofuDecisionKind::Mismatch => Err(PeerPubkeyMismatchError::new(
+            decision.alias.clone(),
+            decision.cached.clone().unwrap_or_default(),
+            decision.observed.clone().unwrap_or_default(),
+        )
+        .into()),
+        TofuDecisionKind::Match
+        | TofuDecisionKind::LegacyFirstContact
+        | TofuDecisionKind::LegacyAfterPinned => Ok(()),
+    }
+}
+
+/// Evaluate and persist a peer identity TOFU decision.
+///
+/// # Errors
+///
+/// Returns mismatch or peer-store IO failures from [`apply_tofu_decision`].
+pub fn tofu_record_peer_identity(
+    env: &PeerStoreEnv,
+    alias: &str,
+    peer: Option<&PeerRecord>,
+    observed: Option<&str>,
+    now: &str,
+) -> Result<TofuDecision, TofuApplyError> {
+    let decision = evaluate_peer_identity(alias, peer, observed);
+    apply_tofu_decision(env, &decision, now)?;
+    Ok(decision)
+}
+
+/// Clear a cached pubkey for `alias`.
+///
+/// # Errors
+///
+/// Returns peer-store mutation write failures.
+pub fn forget_peer_pubkey(env: &PeerStoreEnv, alias: &str) -> io::Result<&'static str> {
+    let mut outcome = "not-found";
+    mutate_peer_store(env, |data| {
+        let Some(peer) = data.peers.get_mut(alias) else {
+            outcome = "not-found";
+            return;
+        };
+        if peer.pubkey.is_none() {
+            outcome = "no-pubkey";
+            return;
+        }
+        peer.pubkey = None;
+        peer.pubkey_first_seen = None;
+        outcome = "cleared";
+    })?;
+    Ok(outcome)
+}
+
+#[derive(Debug)]
+pub enum TofuApplyError {
+    Io(io::Error),
+    Mismatch(PeerPubkeyMismatchError),
+}
+
+impl std::fmt::Display for TofuApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::Mismatch(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for TofuApplyError {}
+
+impl From<io::Error> for TofuApplyError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<PeerPubkeyMismatchError> for TofuApplyError {
+    fn from(value: PeerPubkeyMismatchError) -> Self {
+        Self::Mismatch(value)
+    }
+}
+
 fn read_peer_store_unlocked(path: &Path) -> PeerStoreFile {
     if !path.exists() {
         return empty_peer_store();
@@ -913,6 +1144,10 @@ fn corrupt_peer_store_path(path: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     PathBuf::from(format!("{}.corrupt-{stamp}", path.display()))
+}
+
+fn prefix16(value: &str) -> &str {
+    value.get(..16).unwrap_or(value)
 }
 
 /// Deterministic input for maw-js `cmdProbeAll`.

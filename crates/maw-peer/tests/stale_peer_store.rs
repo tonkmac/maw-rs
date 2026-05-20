@@ -18,6 +18,10 @@ fn peer(added_at: &str, last_seen: Option<&str>) -> PeerRecord {
         added_at: added_at.to_owned(),
         last_seen: last_seen.map(str::to_owned),
         last_error: None,
+        nickname: None,
+        pubkey: None,
+        pubkey_first_seen: None,
+        identity: None,
     }
 }
 
@@ -85,6 +89,10 @@ fn peer_store_path_empty_stale_tmp_save_and_load_round_trip_match_maw_js() {
             added_at: "2026-05-18T00:00:00.000Z".to_owned(),
             last_seen: None,
             last_error: None,
+            nickname: None,
+            pubkey: None,
+            pubkey_first_seen: None,
+            identity: None,
         },
     );
     save_peer_store(&env, &PeerStoreFile { version: 1, peers }).unwrap();
@@ -131,6 +139,10 @@ fn state_path_is_primary_while_legacy_home_peers_are_migrated_on_mutation() {
                 added_at: "2026-05-20T01:00:00.000Z".to_owned(),
                 last_seen: None,
                 last_error: None,
+                nickname: None,
+                pubkey: None,
+                pubkey_first_seen: None,
+                identity: None,
             },
         );
     })
@@ -191,6 +203,10 @@ fn mutate_peer_store_reads_inside_lock_and_tolerates_malformed_existing_contents
                 added_at: "2026-05-18T00:00:00.000Z".to_owned(),
                 last_seen: Some("2026-05-18T01:00:00.000Z".to_owned()),
                 last_error: None,
+                nickname: None,
+                pubkey: None,
+                pubkey_first_seen: None,
+                identity: None,
             },
         );
     })
@@ -214,6 +230,10 @@ fn mutate_peer_store_reads_inside_lock_and_tolerates_malformed_existing_contents
                 added_at: "x".to_owned(),
                 last_seen: None,
                 last_error: None,
+                nickname: None,
+                pubkey: None,
+                pubkey_first_seen: None,
+                identity: None,
             },
         );
     })
@@ -251,6 +271,10 @@ fn read_errors_and_unlocked_parse_errors_recover_as_empty_stores() {
                 added_at: "bad".to_owned(),
                 last_seen: None,
                 last_error: None,
+                nickname: None,
+                pubkey: None,
+                pubkey_first_seen: None,
+                identity: None,
             },
         );
     })
@@ -471,6 +495,10 @@ fn store_from<const N: usize>(peers: [(&str, &str, String, Option<String>); N]) 
                     added_at,
                     last_seen,
                     last_error: None,
+                    nickname: None,
+                    pubkey: None,
+                    pubkey_first_seen: None,
+                    identity: None,
                 },
             )
         })

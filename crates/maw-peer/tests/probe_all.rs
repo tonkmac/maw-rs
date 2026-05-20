@@ -25,6 +25,10 @@ fn peer(
         added_at: "2026-05-17T00:00:00.000Z".to_owned(),
         last_seen: last_seen.map(str::to_owned),
         last_error,
+        nickname: None,
+        pubkey: None,
+        pubkey_first_seen: None,
+        identity: None,
     }
 }
 
