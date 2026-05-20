@@ -125,6 +125,7 @@ dependencies = [
  "maw-split",
  "maw-transport",
  "maw-worktree",
+ "maw-xdg",
  "serde",
  "serde_json",
 ]

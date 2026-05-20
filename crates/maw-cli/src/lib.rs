@@ -38,6 +38,11 @@ use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
     WorktreeWindowResolution,
 };
+use maw_xdg::{
+    ensure_maw_core_paths, is_maw_xdg_enabled, is_valid_instance_name, maw_cache_dir,
+    maw_cache_path, maw_config_dir, maw_config_path, maw_data_dir, maw_data_path,
+    maw_runtime_home_dir, maw_state_dir, maw_state_path, MawCorePaths, MawXdgEnv,
+};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +62,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "--help" | "-h" | "help" => usage_ok(),
         "auth" => run_auth_plan(&argv[1..]),
         "hub" => run_hub_plan(&argv[1..]),
+        "xdg" => run_xdg_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -607,6 +613,222 @@ fn hub_usage_error(message: &str) -> CliOutput {
         stdout: String::new(),
         stderr: format!(
             "{message}\nusage: maw-rs hub validate-workspace [--id <id>] [--hub-url <ws-url>] [--token <token>] [--shared-agent <agent>]... [--plan-json]\n       maw-rs hub load-workspaces --config-dir <dir> [--plan-json]\n"
+        ),
+    }
+}
+
+fn run_xdg_plan(argv: &[String]) -> CliOutput {
+    let action = match parse_xdg_plan_args(argv) {
+        Ok(action) => action,
+        Err(message) => return xdg_usage_error(&message),
+    };
+    match action {
+        XdgPlanAction::Paths { plan_json, env } => {
+            let paths = XdgResolvedPaths::from_env(&env);
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_xdg_paths_json(&paths)
+                } else {
+                    format!("{}\n", paths.runtime_home)
+                },
+                stderr: String::new(),
+            }
+        }
+        XdgPlanAction::CorePaths { plan_json, env } => match ensure_maw_core_paths(&env) {
+            Ok(paths) => CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_xdg_core_paths_json(&paths)
+                } else {
+                    format!("{}\n", paths.runtime_home.display())
+                },
+                stderr: String::new(),
+            },
+            Err(error) => CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("xdg core-paths: {error}\n"),
+            },
+        },
+        XdgPlanAction::ValidateInstance { plan_json, name } => {
+            let valid = is_valid_instance_name(&name);
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    format!(
+                        "{{\"command\":\"xdg\",\"kind\":\"validate-instance\",\"name\":{},\"valid\":{valid}}}\n",
+                        json_string(&name)
+                    )
+                } else {
+                    format!("{valid}\n")
+                },
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+enum XdgPlanAction {
+    Paths { plan_json: bool, env: MawXdgEnv },
+    CorePaths { plan_json: bool, env: MawXdgEnv },
+    ValidateInstance { plan_json: bool, name: String },
+}
+
+struct XdgCliEnvArgs {
+    plan_json: bool,
+    home: String,
+    vars: Vec<(String, String)>,
+}
+
+struct XdgResolvedPaths {
+    xdg_enabled: bool,
+    runtime_home: String,
+    data_dir: String,
+    state_dir: String,
+    cache_dir: String,
+    config_dir: String,
+    data_path: String,
+    state_path: String,
+    cache_path: String,
+    config_path: String,
+}
+
+impl XdgResolvedPaths {
+    fn from_env(env: &MawXdgEnv) -> Self {
+        Self {
+            xdg_enabled: is_maw_xdg_enabled(env),
+            runtime_home: path_string(maw_runtime_home_dir(env)),
+            data_dir: path_string(maw_data_dir(env)),
+            state_dir: path_string(maw_state_dir(env)),
+            cache_dir: path_string(maw_cache_dir(env)),
+            config_dir: path_string(maw_config_dir(env)),
+            data_path: path_string(maw_data_path(env, &["plugins"])),
+            state_path: path_string(maw_state_path(env, &["peers.json"])),
+            cache_path: path_string(maw_cache_path(env, &["registry-cache.json"])),
+            config_path: path_string(maw_config_path(env, &["maw.config.json"])),
+        }
+    }
+}
+
+fn parse_xdg_plan_args(argv: &[String]) -> Result<XdgPlanAction, String> {
+    let Some(kind) = argv.first().map(String::as_str) else {
+        return Err("xdg: expected paths, core-paths, or validate-instance".to_owned());
+    };
+    match kind {
+        "paths" => {
+            let parsed = parse_xdg_env_args(&argv[1..])?;
+            Ok(XdgPlanAction::Paths {
+                plan_json: parsed.plan_json,
+                env: MawXdgEnv::with_vars(parsed.home, parsed.vars),
+            })
+        }
+        "core-paths" => {
+            let parsed = parse_xdg_env_args(&argv[1..])?;
+            Ok(XdgPlanAction::CorePaths {
+                plan_json: parsed.plan_json,
+                env: MawXdgEnv::with_vars(parsed.home, parsed.vars),
+            })
+        }
+        "validate-instance" => parse_xdg_validate_instance_args(&argv[1..]),
+        other => Err(format!("xdg: unknown subcommand {other}")),
+    }
+}
+
+fn parse_xdg_env_args(argv: &[String]) -> Result<XdgCliEnvArgs, String> {
+    let mut plan_json = false;
+    let mut home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
+    let mut vars = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--home" => {
+                home = take_xdg_value(argv, index, "--home")?;
+                index += 1;
+            }
+            "--env" => {
+                let raw = take_xdg_value(argv, index, "--env")?;
+                let Some((key, value)) = raw.split_once('=') else {
+                    return Err("xdg: --env must be KEY=VALUE".to_owned());
+                };
+                vars.push((key.to_owned(), value.to_owned()));
+                index += 1;
+            }
+            other => return Err(format!("xdg: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(XdgCliEnvArgs {
+        plan_json,
+        home,
+        vars,
+    })
+}
+
+fn parse_xdg_validate_instance_args(argv: &[String]) -> Result<XdgPlanAction, String> {
+    let mut plan_json = false;
+    let mut name = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--name" => {
+                name = Some(take_xdg_value(argv, index, "--name")?);
+                index += 1;
+            }
+            other => return Err(format!("xdg validate-instance: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(XdgPlanAction::ValidateInstance {
+        plan_json,
+        name: name.ok_or_else(|| "xdg validate-instance: --name is required".to_owned())?,
+    })
+}
+
+fn take_xdg_value(argv: &[String], index: usize, name: &str) -> Result<String, String> {
+    argv.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("xdg: missing {name} value"))
+}
+
+fn render_xdg_paths_json(paths: &XdgResolvedPaths) -> String {
+    format!(
+        "{{\"command\":\"xdg\",\"kind\":\"paths\",\"xdgEnabled\":{},\"runtimeHome\":{},\"dataDir\":{},\"stateDir\":{},\"cacheDir\":{},\"configDir\":{},\"dataPath\":{},\"statePath\":{},\"cachePath\":{},\"configPath\":{}}}\n",
+        paths.xdg_enabled,
+        json_string(&paths.runtime_home),
+        json_string(&paths.data_dir),
+        json_string(&paths.state_dir),
+        json_string(&paths.cache_dir),
+        json_string(&paths.config_dir),
+        json_string(&paths.data_path),
+        json_string(&paths.state_path),
+        json_string(&paths.cache_path),
+        json_string(&paths.config_path)
+    )
+}
+
+fn render_xdg_core_paths_json(paths: &MawCorePaths) -> String {
+    format!(
+        "{{\"command\":\"xdg\",\"kind\":\"core-paths\",\"runtimeHome\":{},\"configDir\":{},\"fleetDir\":{},\"configFile\":{}}}\n",
+        json_string(&path_string(&paths.runtime_home)),
+        json_string(&path_string(&paths.config_dir)),
+        json_string(&path_string(&paths.fleet_dir)),
+        json_string(&path_string(&paths.config_file))
+    )
+}
+
+fn path_string(path: impl AsRef<std::path::Path>) -> String {
+    path.as_ref().to_string_lossy().into_owned()
+}
+
+fn xdg_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n       maw-rs xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n       maw-rs xdg validate-instance --name <name> [--plan-json]\n"
         ),
     }
 }

@@ -26,6 +26,7 @@ maw-routing = { path = "../maw-routing" }
 maw-split = { path = "../maw-split" }
 maw-transport = { path = "../maw-transport" }
 maw-worktree = { path = "../maw-worktree" }
+maw-xdg = { path = "../maw-xdg" }
 serde_json = "1"
 
 [dev-dependencies]
