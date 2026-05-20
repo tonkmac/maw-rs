@@ -5,6 +5,7 @@
 
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
+use maw_feed::{active_oracles_at, describe_activity, parse_line, FeedEvent};
 use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};
 use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
 use maw_matcher::{
@@ -47,6 +48,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     match command {
         "--help" | "-h" | "help" => usage_ok(),
         "bring" | "b" => run_bring_plan(&argv[1..]),
+        "feed" => run_feed_plan(&argv[1..]),
         "fuzzy" => run_fuzzy_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
         "identity" => run_identity_plan(&argv[1..]),
@@ -63,6 +65,301 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+fn run_feed_plan(argv: &[String]) -> CliOutput {
+    let (plan_json, action) = match parse_feed_plan_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return feed_usage_error(&message),
+    };
+    match action {
+        FeedPlanAction::ParseLine { line } => render_feed_parse_plan(plan_json, &line),
+        FeedPlanAction::Describe { event, message } => {
+            let event = feed_event("oracle-a", 1_000_000, &event, &message);
+            let description = describe_activity(&event);
+            render_feed_description(plan_json, &event, &description)
+        }
+        FeedPlanAction::Active {
+            now,
+            window,
+            events,
+        } => render_feed_active(plan_json, now, window, &events),
+    }
+}
+
+fn parse_feed_plan_args(argv: &[String]) -> Result<(bool, FeedPlanAction), String> {
+    let mut parser = FeedArgParser {
+        plan_json: false,
+        action: None,
+    };
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => parser.plan_json = true,
+            "parse-line" | "--parse-line" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("feed: missing parse-line value".to_owned());
+                };
+                parser.action = Some(FeedPlanAction::ParseLine {
+                    line: value.to_owned(),
+                });
+                index += 1;
+            }
+            "describe" | "--describe" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("feed: missing describe event value".to_owned());
+                };
+                parser.action = Some(FeedPlanAction::Describe {
+                    event: value.to_owned(),
+                    message: String::new(),
+                });
+                index += 1;
+            }
+            "active" | "--active" => {
+                parser.action = Some(FeedPlanAction::Active {
+                    now: 0,
+                    window: 0,
+                    events: Vec::new(),
+                });
+            }
+            "--message" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("feed: missing --message value".to_owned());
+                };
+                parser.set_message(value)?;
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("feed: missing --now value".to_owned());
+                };
+                parser.set_active_number(value, FeedNumberKind::Now)?;
+                index += 1;
+            }
+            "--window" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("feed: missing --window value".to_owned());
+                };
+                parser.set_active_number(value, FeedNumberKind::Window)?;
+                index += 1;
+            }
+            "--event" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("feed: missing --event value".to_owned());
+                };
+                parser.add_active_event(value)?;
+                index += 1;
+            }
+            arg => return Err(format!("feed: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+    parser.finish()
+}
+
+struct FeedArgParser {
+    plan_json: bool,
+    action: Option<FeedPlanAction>,
+}
+
+impl FeedArgParser {
+    fn set_message(&mut self, value: &str) -> Result<(), String> {
+        self.action = match self.action.take() {
+            Some(FeedPlanAction::Describe { event, .. }) => Some(FeedPlanAction::Describe {
+                event,
+                message: value.to_owned(),
+            }),
+            _ => return Err("feed: --message requires describe".to_owned()),
+        };
+        Ok(())
+    }
+
+    fn set_active_number(&mut self, value: &str, kind: FeedNumberKind) -> Result<(), String> {
+        let parsed = value
+            .parse::<i64>()
+            .map_err(|_| format!("feed: {} must be an integer", kind.name()))?;
+        self.action = match self.action.take() {
+            Some(FeedPlanAction::Active {
+                mut now,
+                mut window,
+                events,
+            }) => {
+                match kind {
+                    FeedNumberKind::Now => now = parsed,
+                    FeedNumberKind::Window => window = parsed,
+                }
+                Some(FeedPlanAction::Active {
+                    now,
+                    window,
+                    events,
+                })
+            }
+            _ => return Err(format!("feed: {} requires active", kind.name())),
+        };
+        Ok(())
+    }
+
+    fn add_active_event(&mut self, value: &str) -> Result<(), String> {
+        let event = parse_feed_event_spec(value)?;
+        self.action = match self.action.take() {
+            Some(FeedPlanAction::Active {
+                now,
+                window,
+                mut events,
+            }) => {
+                events.push(event);
+                Some(FeedPlanAction::Active {
+                    now,
+                    window,
+                    events,
+                })
+            }
+            _ => return Err("feed: --event requires active".to_owned()),
+        };
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(bool, FeedPlanAction), String> {
+        self.action.map_or_else(
+            || Err("feed: expected parse-line, describe, or active".to_owned()),
+            |action| Ok((self.plan_json, action)),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FeedNumberKind {
+    Now,
+    Window,
+}
+
+impl FeedNumberKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Now => "--now",
+            Self::Window => "--window",
+        }
+    }
+}
+
+enum FeedPlanAction {
+    ParseLine {
+        line: String,
+    },
+    Describe {
+        event: String,
+        message: String,
+    },
+    Active {
+        now: i64,
+        window: i64,
+        events: Vec<FeedEvent>,
+    },
+}
+
+fn parse_feed_event_spec(value: &str) -> Result<FeedEvent, String> {
+    let mut parts = value.splitn(3, ':');
+    let oracle = parts.next().unwrap_or_default();
+    let Some(ts) = parts.next() else {
+        return Err("feed: --event must be oracle:ts:message".to_owned());
+    };
+    let message = parts.next().unwrap_or_default();
+    let ts = ts
+        .parse::<i64>()
+        .map_err(|_| "feed: --event ts must be an integer".to_owned())?;
+    Ok(feed_event(oracle, ts, "Notification", message))
+}
+
+fn feed_event(oracle: &str, ts: i64, event: &str, message: &str) -> FeedEvent {
+    FeedEvent {
+        timestamp: "2026-05-18 12:00:00".to_owned(),
+        oracle: oracle.to_owned(),
+        host: "m5".to_owned(),
+        event: event.to_owned(),
+        project: "maw-js".to_owned(),
+        session_id: "s1".to_owned(),
+        message: message.to_owned(),
+        ts,
+    }
+}
+
+fn render_feed_parse_plan(plan_json: bool, line: &str) -> CliOutput {
+    let parsed = parse_line(line);
+    CliOutput {
+        code: i32::from(parsed.is_none()),
+        stdout: if plan_json {
+            match parsed {
+                Some(event) => format!(
+                    "{{\"command\":\"feed\",\"kind\":\"parseLine\",\"parsed\":true,\"event\":{}}}\n",
+                    render_feed_event_json(&event)
+                ),
+                None => "{\"command\":\"feed\",\"kind\":\"parseLine\",\"parsed\":false}\n".to_owned(),
+            }
+        } else {
+            parsed.map_or_else(String::new, |event| format!("{}\n", event.message))
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_feed_description(plan_json: bool, event: &FeedEvent, description: &str) -> CliOutput {
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"feed\",\"kind\":\"describe\",\"event\":{},\"description\":{}}}\n",
+                render_feed_event_json(event),
+                json_string(description)
+            )
+        } else {
+            format!("{description}\n")
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_feed_active(plan_json: bool, now: i64, window: i64, events: &[FeedEvent]) -> CliOutput {
+    let active = active_oracles_at(events, now, window);
+    let values: Vec<String> = active.values().map(render_feed_event_json).collect();
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"feed\",\"kind\":\"active\",\"now\":{now},\"window\":{window},\"active\":[{}]}}\n",
+                values.join(",")
+            )
+        } else {
+            format!(
+                "{}\n",
+                active.keys().cloned().collect::<Vec<_>>().join("\n")
+            )
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_feed_event_json(event: &FeedEvent) -> String {
+    format!(
+        "{{\"timestamp\":{},\"oracle\":{},\"host\":{},\"event\":{},\"project\":{},\"sessionId\":{},\"message\":{},\"ts\":{}}}",
+        json_string(&event.timestamp),
+        json_string(&event.oracle),
+        json_string(&event.host),
+        json_string(&event.event),
+        json_string(&event.project),
+        json_string(&event.session_id),
+        json_string(&event.message),
+        event.ts
+    )
+}
+
+fn feed_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs feed parse-line <line> [--plan-json]\n       maw-rs feed describe <event> [--message <message>] [--plan-json]\n       maw-rs feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n"
+        ),
     }
 }
 
@@ -1760,7 +2057,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
