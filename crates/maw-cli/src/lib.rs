@@ -4694,6 +4694,10 @@ fn peer_probe_handshake_constants_usage() -> &'static str {
 }
 
 fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
+    if matches!(argv.first().map(String::as_str), Some("constants")) {
+        return run_peer_sources_constants_plan(&argv[1..]);
+    }
+
     let mut plan_json = false;
     let mut mode = PeerSourceMode::Both;
     let mut config = PeerConfig::default();
@@ -4792,6 +4796,36 @@ fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
     }
 }
 
+fn run_peer_sources_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            other => {
+                return peer_sources_constants_usage_error(&format!(
+                    "peer-sources constants: unknown argument {other}"
+                ));
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_peer_sources_constants_json()
+        } else {
+            "peer-sources modes=config,scout,both configShapes=peer-url,named-peer discoveryStates=ok,error,hint discoveredShape=node|host|oracle|locator[,locator]\n".to_owned()
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_peer_sources_constants_json() -> String {
+    r#"{"command":"peer-sources","action":"constants","modes":["config","scout","both"],"configShapes":["peer-url","named-peer"],"discoveryStates":["ok","error","hint"],"discoveredShape":"node|host|oracle|locator[,locator]"}
+"#
+    .to_owned()
+}
+
 fn peer_sources_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
@@ -4800,6 +4834,23 @@ fn peer_sources_usage_error(message: &str) -> CliOutput {
             "{message}\nusage: maw-rs peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n"
         ),
     }
+}
+
+fn peer_sources_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}
+{}
+",
+            peer_sources_constants_usage()
+        ),
+    }
+}
+
+fn peer_sources_constants_usage() -> &'static str {
+    "usage: maw-rs peer-sources constants [--plan-json]"
 }
 
 fn parse_discovery_row(value: &str) -> Result<DiscoveryRow, String> {
@@ -10043,7 +10094,8 @@ fn usage_text() -> String {
   peer-probe constants [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
-  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]
+  peer-sources constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
