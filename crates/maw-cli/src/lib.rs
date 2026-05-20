@@ -8,10 +8,10 @@ use maw_auth::{
     hash_consent_pin, is_valid_pair_code_shape, normalize_pair_code, pair_api_accept_plan,
     pair_api_auto_plan, pair_api_generate_plan, pair_api_probe_plan, pair_api_status_plan,
     pretty_pair_code, redact_pair_code, reject_consent_plan, request_consent_plan,
-    sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3, verify_auto_pair_proof,
+    sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3, trust_key, verify_auto_pair_proof,
     verify_consent_pin, verify_request, ApprovedBy, AutoPairAddOutcome, AutoPairIdentity,
     AutoPairInput, ConsentAction, ConsentApprovalResult, ConsentRequestArgs, ConsentRequestResult,
-    ConsentStore, FromVerifyDecision, Headers, PairAcceptInput, PairApiAcceptResult,
+    ConsentStatus, ConsentStore, FromVerifyDecision, Headers, PairAcceptInput, PairApiAcceptResult,
     PairApiAutoResult, PairApiConfig, PairApiGenerateResult, PairApiProbeResult,
     PairApiStatusResult, PairCodeStore, PeerPendingRequest, PeerPostResult, PendingRequest,
     RecentHelloStore, TrustEntry, VerifyRequestArgs,
@@ -122,6 +122,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "consent-pin" => run_consent_pin_plan(&argv[1..]),
         "consent-request" => run_consent_request_plan(&argv[1..]),
         "consent-approval" => run_consent_approval_plan(&argv[1..]),
+        "consent-store" => run_consent_store_plan(&argv[1..]),
         "pair-code" => run_pair_code_plan(&argv[1..]),
         "pair-api" => run_pair_api_plan(&argv[1..]),
         "pair-api-auto" => run_pair_api_auto_plan(&argv[1..]),
@@ -4928,6 +4929,308 @@ fn consent_approval_usage() -> &'static str {
     "usage: maw-rs consent-approval <approve|reject> --request-id <id> --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --pin <pin> --created-at <ms> --now <ms> [--seed-pin <pin>] [--plan-json]"
 }
 
+#[allow(clippy::too_many_lines)]
+fn run_consent_store_plan(argv: &[String]) -> CliOutput {
+    let Some(mode) = argv.first().map(String::as_str) else {
+        return consent_store_usage_error("consent-store: expected trust or pending");
+    };
+    if mode != "trust" && mode != "pending" {
+        return consent_store_usage_error("consent-store: expected trust or pending");
+    }
+
+    let mut store = ConsentStore::default();
+    let mut plan_json = false;
+    let mut check = None::<(String, String, ConsentAction)>;
+    let mut key = None::<(String, String, ConsentAction)>;
+    let mut set_status = None::<(String, ConsentStatus)>;
+
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--entry" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_store_usage_error("consent-store: missing --entry value");
+                };
+                match parse_consent_store_trust_entry(value) {
+                    Ok(entry) => store.record_trust(entry),
+                    Err(message) => return consent_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--request" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_store_usage_error("consent-store: missing --request value");
+                };
+                match parse_consent_store_pending_request(value) {
+                    Ok(request) => store.write_pending(request),
+                    Err(message) => return consent_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--check" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_store_usage_error("consent-store: missing --check value");
+                };
+                match parse_consent_store_key(value) {
+                    Ok(parsed) => check = Some(parsed),
+                    Err(message) => return consent_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--key" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_store_usage_error("consent-store: missing --key value");
+                };
+                match parse_consent_store_key(value) {
+                    Ok(parsed) => key = Some(parsed),
+                    Err(message) => return consent_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--set-status" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_store_usage_error("consent-store: missing --set-status value");
+                };
+                match parse_consent_store_status_update(value) {
+                    Ok(parsed) => set_status = Some(parsed),
+                    Err(message) => return consent_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return consent_store_usage_error(&format!("consent-store: unknown argument {arg}"))
+            }
+        }
+        index += 1;
+    }
+
+    if mode == "trust" {
+        let trusted = check
+            .as_ref()
+            .map(|(from, to, action)| store.is_trusted(from, to, *action));
+        let trust_key_value = key
+            .as_ref()
+            .map(|(from, to, action)| trust_key(from, to, *action));
+        let entries = store.list_trust();
+        return CliOutput {
+            code: 0,
+            stdout: if plan_json {
+                render_consent_store_trust_plan_json(trusted, trust_key_value.as_deref(), &entries)
+            } else {
+                render_consent_store_trust_plan_text(trusted, trust_key_value.as_deref())
+            },
+            stderr: String::new(),
+        };
+    }
+
+    let updated = set_status
+        .as_ref()
+        .map(|(id, status)| store.update_status(id, *status));
+    let entries = store.list_pending();
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_consent_store_pending_plan_json(updated, &entries)
+        } else {
+            render_consent_store_pending_plan_text(updated)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_consent_store_trust_entry(value: &str) -> Result<TrustEntry, String> {
+    let fields = parse_consent_store_fields(value)?;
+    let from = required_consent_store_field(&fields, "from")?;
+    let to = required_consent_store_field(&fields, "to")?;
+    let action = parse_consent_store_action(&required_consent_store_field(&fields, "action")?)?;
+    let approved_at = required_consent_store_field(&fields, "approved_at")?;
+    let approved_by = parse_approved_by(&required_consent_store_field(&fields, "approved_by")?)?;
+    let request_id = fields.get("request_id").cloned();
+    Ok(TrustEntry {
+        from,
+        to,
+        action,
+        approved_at,
+        approved_by,
+        request_id,
+    })
+}
+
+fn parse_consent_store_pending_request(value: &str) -> Result<PendingRequest, String> {
+    let fields = parse_consent_store_fields(value)?;
+    let id = required_consent_store_field(&fields, "id")?;
+    let from = required_consent_store_field(&fields, "from")?;
+    let to = required_consent_store_field(&fields, "to")?;
+    let action = parse_consent_store_action(&required_consent_store_field(&fields, "action")?)?;
+    let summary = required_consent_store_field(&fields, "summary")?;
+    let pin_hash = required_consent_store_field(&fields, "pin_hash")?;
+    let created_at = required_consent_store_field(&fields, "created_at")?;
+    let expires_at = required_consent_store_field(&fields, "expires_at")?;
+    let status = parse_consent_status(&required_consent_store_field(&fields, "status")?)?;
+    Ok(PendingRequest {
+        id,
+        from,
+        to,
+        action,
+        summary,
+        pin_hash,
+        created_at,
+        expires_at,
+        status,
+    })
+}
+
+fn parse_consent_store_fields(value: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut fields = BTreeMap::new();
+    for part in value.split(',') {
+        let Some((key, field_value)) = part.split_once('=') else {
+            return Err("consent-store: expected key=value fields".to_owned());
+        };
+        if key.is_empty() {
+            return Err("consent-store: expected non-empty field name".to_owned());
+        }
+        fields.insert(key.to_owned(), field_value.to_owned());
+    }
+    Ok(fields)
+}
+
+fn required_consent_store_field(
+    fields: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<String, String> {
+    fields
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("consent-store: missing {name}"))
+}
+
+fn parse_consent_store_key(value: &str) -> Result<(String, String, ConsentAction), String> {
+    let mut parts = value.split(':');
+    let from = parts.next().filter(|part| !part.is_empty());
+    let to = parts.next().filter(|part| !part.is_empty());
+    let action = parts.next().filter(|part| !part.is_empty());
+    if parts.next().is_some() || from.is_none() || to.is_none() || action.is_none() {
+        return Err("consent-store: key must use from:to:action".to_owned());
+    }
+    Ok((
+        from.expect("checked").to_owned(),
+        to.expect("checked").to_owned(),
+        parse_consent_store_action(action.expect("checked"))?,
+    ))
+}
+
+fn parse_consent_store_status_update(value: &str) -> Result<(String, ConsentStatus), String> {
+    let Some((id, status)) = value.split_once(':') else {
+        return Err("consent-store: --set-status must use id:status".to_owned());
+    };
+    if id.is_empty() {
+        return Err("consent-store: --set-status missing id".to_owned());
+    }
+    Ok((id.to_owned(), parse_consent_status(status)?))
+}
+
+fn parse_consent_store_action(value: &str) -> Result<ConsentAction, String> {
+    parse_consent_action(value).map_err(|_| "consent-store: invalid action".to_owned())
+}
+
+fn parse_approved_by(value: &str) -> Result<ApprovedBy, String> {
+    match value {
+        "human" => Ok(ApprovedBy::Human),
+        "auto" => Ok(ApprovedBy::Auto),
+        _ => Err("consent-store: invalid approved_by".to_owned()),
+    }
+}
+
+fn parse_consent_status(value: &str) -> Result<ConsentStatus, String> {
+    match value {
+        "pending" => Ok(ConsentStatus::Pending),
+        "approved" => Ok(ConsentStatus::Approved),
+        "rejected" => Ok(ConsentStatus::Rejected),
+        "expired" => Ok(ConsentStatus::Expired),
+        _ => Err("consent-store: invalid status".to_owned()),
+    }
+}
+
+fn render_consent_store_trust_plan_json(
+    trusted: Option<bool>,
+    trust_key_value: Option<&str>,
+    entries: &[TrustEntry],
+) -> String {
+    let trusted = trusted.map_or_else(|| "null".to_owned(), |value| value.to_string());
+    format!(
+        "{{\"command\":\"consent-store\",\"mode\":\"trust\",\"trusted\":{trusted},\"trustKey\":{},\"entries\":{}}}\n",
+        json_optional_string(trust_key_value),
+        render_trust_entries_json(entries)
+    )
+}
+
+fn render_consent_store_pending_plan_json(
+    updated: Option<bool>,
+    entries: &[PendingRequest],
+) -> String {
+    let updated = updated.map_or_else(|| "null".to_owned(), |value| value.to_string());
+    format!(
+        "{{\"command\":\"consent-store\",\"mode\":\"pending\",\"updated\":{updated},\"entries\":{}}}\n",
+        render_pending_requests_json(entries)
+    )
+}
+
+fn render_trust_entries_json(entries: &[TrustEntry]) -> String {
+    let mut output = String::from("[");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&render_trust_entry_json(Some(entry)));
+    }
+    output.push(']');
+    output
+}
+
+fn render_pending_requests_json(entries: &[PendingRequest]) -> String {
+    let mut output = String::from("[");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&render_pending_request_json(Some(entry)));
+    }
+    output.push(']');
+    output
+}
+
+fn render_consent_store_trust_plan_text(
+    trusted: Option<bool>,
+    trust_key_value: Option<&str>,
+) -> String {
+    format!(
+        "consent-store trust trusted={} trustKey={}\n",
+        trusted.map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        trust_key_value.unwrap_or("-")
+    )
+}
+
+fn render_consent_store_pending_plan_text(updated: Option<bool>) -> String {
+    format!(
+        "consent-store pending updated={}\n",
+        updated.map_or_else(|| "-".to_owned(), |value| value.to_string())
+    )
+}
+
+fn consent_store_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", consent_store_usage()),
+    }
+}
+
+fn consent_store_usage() -> &'static str {
+    "usage: maw-rs consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]"
+}
+
 fn run_pair_code_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
     let mut code = None::<String>;
@@ -7291,7 +7594,7 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
