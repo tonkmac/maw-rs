@@ -260,6 +260,32 @@ pub struct PairApiProbeResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairAcceptInput {
+    pub node: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApiAcceptResult {
+    pub status: u16,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub node: Option<String>,
+    pub url: Option<String>,
+    pub federation_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApiStatusResult {
+    pub status: u16,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub consumed: Option<bool>,
+    pub remote_node: Option<String>,
+    pub remote_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupResult {
     Live(PairEntry),
     NotFound,
@@ -270,6 +296,7 @@ pub enum LookupResult {
 #[derive(Debug, Clone, Default)]
 pub struct PairCodeStore {
     entries: BTreeMap<String, PairEntry>,
+    accepted: BTreeMap<String, PairAcceptInput>,
 }
 
 impl PairCodeStore {
@@ -601,6 +628,68 @@ pub fn pair_api_probe_plan(
         LookupResult::NotFound => pair_api_probe_error(404, "not_found"),
         LookupResult::Expired => pair_api_probe_error(410, "expired"),
         LookupResult::Consumed => pair_api_probe_error(410, "consumed"),
+    }
+}
+
+pub fn pair_api_accept_plan(
+    store: &mut PairCodeStore,
+    config: &PairApiConfig,
+    code: &str,
+    input: Option<PairAcceptInput>,
+    now_ms: u64,
+) -> PairApiAcceptResult {
+    if !is_valid_pair_code_shape(code) {
+        return pair_api_accept_error(400, "invalid_shape");
+    }
+    let Some(input) = input.filter(|input| !input.node.is_empty() && input.url.is_some()) else {
+        return pair_api_accept_error(400, "bad_request");
+    };
+    match store.consume_at(code, now_ms) {
+        LookupResult::Live(_) => {
+            store.accepted.insert(normalize_pair_code(code), input);
+            PairApiAcceptResult {
+                status: 200,
+                ok: true,
+                error: None,
+                node: Some(config.node.clone()),
+                url: Some(config.base_url.clone()),
+                federation_token: Some(config.federation_token.clone()),
+            }
+        }
+        LookupResult::NotFound => pair_api_accept_error(404, "not_found"),
+        LookupResult::Expired => pair_api_accept_error(410, "expired"),
+        LookupResult::Consumed => pair_api_accept_error(410, "consumed"),
+    }
+}
+
+#[must_use]
+pub fn pair_api_status_plan(store: &PairCodeStore, code: &str, now_ms: u64) -> PairApiStatusResult {
+    if !is_valid_pair_code_shape(code) {
+        return pair_api_status_error(400, "invalid_shape");
+    }
+    let normalized = normalize_pair_code(code);
+    match store.lookup_at(&normalized, now_ms) {
+        LookupResult::Live(_) => PairApiStatusResult {
+            status: 200,
+            ok: true,
+            error: None,
+            consumed: Some(false),
+            remote_node: None,
+            remote_url: None,
+        },
+        LookupResult::Consumed => {
+            let accepted = store.accepted.get(&normalized);
+            PairApiStatusResult {
+                status: 200,
+                ok: true,
+                error: None,
+                consumed: Some(true),
+                remote_node: accepted.map(|input| input.node.clone()),
+                remote_url: accepted.and_then(|input| input.url.clone()),
+            }
+        }
+        LookupResult::NotFound => pair_api_status_error(404, "not_found"),
+        LookupResult::Expired => pair_api_status_error(410, "expired"),
     }
 }
 
@@ -996,6 +1085,28 @@ fn pair_api_probe_error(status: u16, error: &str) -> PairApiProbeResult {
         ok: false,
         error: Some(error.to_owned()),
         node: None,
+    }
+}
+
+fn pair_api_accept_error(status: u16, error: &str) -> PairApiAcceptResult {
+    PairApiAcceptResult {
+        status,
+        ok: false,
+        error: Some(error.to_owned()),
+        node: None,
+        url: None,
+        federation_token: None,
+    }
+}
+
+fn pair_api_status_error(status: u16, error: &str) -> PairApiStatusResult {
+    PairApiStatusResult {
+        status,
+        ok: false,
+        error: Some(error.to_owned()),
+        consumed: None,
+        remote_node: None,
+        remote_url: None,
     }
 }
 

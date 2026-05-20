@@ -682,3 +682,107 @@ fn pair_api_generate_and_probe_plans_match_maw_js_status_contract() {
     assert!(live.ok);
     assert_eq!(live.node.as_deref(), Some("node-a"));
 }
+
+// Ported from maw-js `test/pair-api-default.test.ts` pair POST/status cases
+// and `src/api/pair.ts` consumed-code behavior.
+#[test]
+fn pair_api_accept_and_status_plans_match_maw_js_consumed_contract() {
+    use maw_auth::{
+        pair_api_accept_plan, pair_api_status_plan, PairAcceptInput, PairApiConfig, PairCodeStore,
+    };
+
+    let config = PairApiConfig {
+        node: "node-a".to_owned(),
+        oracle: "oracle-a".to_owned(),
+        port: 4567,
+        base_url: "http://localhost:4567".to_owned(),
+        federation_token: "ab".repeat(32),
+        pubkey: "p".repeat(64),
+    };
+    let mut store = PairCodeStore::default();
+
+    let invalid = pair_api_accept_plan(&mut store, &config, "bad", None, 1_000_000);
+    assert_eq!(invalid.status, 400);
+    assert_eq!(invalid.error.as_deref(), Some("invalid_shape"));
+
+    let bad = pair_api_accept_plan(
+        &mut store,
+        &config,
+        "ABC234",
+        Some(PairAcceptInput {
+            node: "remote".to_owned(),
+            url: None,
+        }),
+        1_000_000,
+    );
+    assert_eq!(bad.status, 400);
+    assert_eq!(bad.error.as_deref(), Some("bad_request"));
+
+    let missing = pair_api_accept_plan(
+        &mut store,
+        &config,
+        "ABC234",
+        Some(PairAcceptInput {
+            node: "remote".to_owned(),
+            url: Some("http://remote".to_owned()),
+        }),
+        1_000_000,
+    );
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.error.as_deref(), Some("not_found"));
+
+    let _ = store.register_at("DEF456", 1, 0);
+    let expired = pair_api_accept_plan(
+        &mut store,
+        &config,
+        "DEF456",
+        Some(PairAcceptInput {
+            node: "remote".to_owned(),
+            url: Some("http://remote".to_owned()),
+        }),
+        1_000_000,
+    );
+    assert_eq!(expired.status, 410);
+    assert_eq!(expired.error.as_deref(), Some("expired"));
+
+    let _ = store.register_at("ABC234", 1_000_000, 1_000_000);
+    let accepted = pair_api_accept_plan(
+        &mut store,
+        &config,
+        "ABC234",
+        Some(PairAcceptInput {
+            node: "remote".to_owned(),
+            url: Some("http://remote".to_owned()),
+        }),
+        1_000_000,
+    );
+    assert_eq!(accepted.status, 200);
+    assert!(accepted.ok);
+    assert_eq!(accepted.node.as_deref(), Some("node-a"));
+    assert_eq!(accepted.url.as_deref(), Some("http://localhost:4567"));
+    assert_eq!(
+        accepted.federation_token.as_deref(),
+        Some("abababababababababababababababababababababababababababababababab")
+    );
+
+    let consumed = pair_api_status_plan(&store, "ABC-234", 1_000_000);
+    assert_eq!(consumed.status, 200);
+    assert!(consumed.ok);
+    assert_eq!(consumed.consumed, Some(true));
+    assert_eq!(consumed.remote_node.as_deref(), Some("remote"));
+    assert_eq!(consumed.remote_url.as_deref(), Some("http://remote"));
+
+    let not_found = pair_api_status_plan(&store, "ZZZ999", 1_000_000);
+    assert_eq!(not_found.status, 404);
+    assert_eq!(not_found.error.as_deref(), Some("not_found"));
+
+    let _ = store.register_at("GHJ789", 1, 0);
+    let expired_status = pair_api_status_plan(&store, "GHJ789", 1_000_000);
+    assert_eq!(expired_status.status, 410);
+    assert_eq!(expired_status.error.as_deref(), Some("expired"));
+
+    let _ = store.register_at("JKL234", 1_000_000, 1_000_000);
+    let pending = pair_api_status_plan(&store, "JKL234", 1_000_000);
+    assert_eq!(pending.status, 200);
+    assert_eq!(pending.consumed, Some(false));
+}
