@@ -111,6 +111,10 @@ name = "maw-feed"
 version = "0.1.0"
 
 [[package]]
+name = "maw-fuzzy"
+version = "0.1.0"
+
+[[package]]
 name = "maw-hub"
 version = "0.1.0"
 dependencies = [
