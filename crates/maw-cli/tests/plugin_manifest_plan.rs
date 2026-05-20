@@ -193,3 +193,119 @@ fn plugin_manifest_plan_rejects_manifest_validation_errors() {
 fn write_manifest(dir: &Path, manifest: &serde_json::Value) {
     write(dir.join("plugin.json"), manifest.to_string()).expect("write manifest");
 }
+
+#[test]
+fn plugin_manifest_discover_plan_cli_matches_missing_roots_contract() {
+    let root = make_temp_dir("discover-missing");
+    let output = json_output(&run_cli(&[
+        "plugin-manifest".to_owned(),
+        "discover".to_owned(),
+        "--scan-dir".to_owned(),
+        root.join("missing-root").to_string_lossy().into_owned(),
+        "--runtime-version".to_owned(),
+        "1.0.0".to_owned(),
+        "--plan-json".to_owned(),
+    ]));
+
+    assert_eq!(output["command"], "plugin-manifest");
+    assert_eq!(output["kind"], "discover");
+    assert_eq!(output["plugins"], json!([]));
+    assert_eq!(output["warnings"], json!([]));
+
+    remove_dir_all(root).expect("cleanup discover missing");
+}
+
+#[test]
+fn plugin_manifest_discover_plan_cli_matches_registry_gates_and_sorting() {
+    let root = make_temp_dir("discover-gates");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&plugins_dir).expect("plugins");
+
+    write_entry_plugin(
+        &plugins_dir,
+        "registry-bad-sdk",
+        serde_json::Map::from_iter([("sdk".to_owned(), json!(">=999.0.0"))]),
+    );
+    write_entry_plugin(
+        &plugins_dir,
+        "registry-legacy-ok",
+        serde_json::Map::from_iter([("weight".to_owned(), json!(50))]),
+    );
+    write_entry_plugin(
+        &plugins_dir,
+        "registry-disabled-ok",
+        serde_json::Map::from_iter([("weight".to_owned(), json!(70))]),
+    );
+    write(
+        plugins_dir.join(".overrides.json"),
+        br#"{"registry-disabled-ok":1}"#,
+    )
+    .expect("overrides");
+
+    let output = json_output(&run_cli(&[
+        "plugin-manifest".to_owned(),
+        "discover".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.to_string_lossy().into_owned(),
+        "--disabled".to_owned(),
+        "registry-disabled-ok".to_owned(),
+        "--runtime-version".to_owned(),
+        "1.0.0".to_owned(),
+        "--plan-json".to_owned(),
+    ]));
+
+    assert_eq!(
+        output["plugins"][0]["manifest"]["name"],
+        "registry-disabled-ok"
+    );
+    assert_eq!(output["plugins"][0]["manifest"]["weight"], 1);
+    assert_eq!(output["plugins"][0]["disabled"], true);
+    assert_eq!(
+        output["plugins"][1]["manifest"]["name"],
+        "registry-legacy-ok"
+    );
+    let warning_text = output["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .map(|warning| warning.as_str().expect("warning text"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(warning_text.contains("requires maw SDK"), "{warning_text}");
+    assert!(
+        warning_text.contains("legacy plugin") || warning_text.contains("legacy plugins"),
+        "{warning_text}"
+    );
+
+    remove_dir_all(root).expect("cleanup discover gates");
+}
+
+fn write_entry_plugin(
+    root: &Path,
+    name: &str,
+    manifest: serde_json::Map<String, serde_json::Value>,
+) {
+    let dir = root.join(name);
+    create_dir_all(&dir).expect("plugin dir");
+    write(
+        dir.join("index.ts"),
+        format!(
+            "export default async function {}() {{}}\n",
+            name.replace('-', "_")
+        ),
+    )
+    .expect("entry");
+    let mut full_manifest = serde_json::Map::from_iter([
+        ("name".to_owned(), json!(name)),
+        ("version".to_owned(), json!("1.0.0")),
+        ("sdk".to_owned(), json!("*")),
+        ("target".to_owned(), json!("js")),
+        ("entry".to_owned(), json!("index.ts")),
+    ]);
+    full_manifest.extend(manifest);
+    write(
+        dir.join("plugin.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(full_manifest)).expect("json"),
+    )
+    .expect("manifest");
+}

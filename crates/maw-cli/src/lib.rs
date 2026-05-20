@@ -24,7 +24,10 @@ use maw_peer::{
     resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
     PeerSourceMode, PeerSourceResult,
 };
-use maw_plugin_manifest::{load_manifest_from_dir, parse_manifest, LoadedPlugin, PluginManifest};
+use maw_plugin_manifest::{
+    discover_packages, load_manifest_from_dir, parse_manifest, DiscoverPackagesOptions,
+    LoadedPlugin, PluginManifest,
+};
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
 };
@@ -1050,6 +1053,25 @@ fn run_plugin_manifest_plan(argv: &[String]) -> CliOutput {
             },
             Err(message) => plugin_manifest_usage_error(&message),
         },
+        PluginManifestAction::Discover { plan_json, options } => {
+            let report = discover_packages(&options);
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_plugin_discover_json(&options, &report.plugins, &report.warnings)
+                } else {
+                    let mut names = report
+                        .plugins
+                        .iter()
+                        .map(|plugin| plugin.manifest.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    names.push('\n');
+                    names
+                },
+                stderr: String::new(),
+            }
+        }
     }
 }
 
@@ -1063,6 +1085,10 @@ enum PluginManifestAction {
         plan_json: bool,
         dir: std::path::PathBuf,
     },
+    Discover {
+        plan_json: bool,
+        options: DiscoverPackagesOptions,
+    },
 }
 
 fn parse_plugin_manifest_args(argv: &[String]) -> Result<PluginManifestAction, String> {
@@ -1072,6 +1098,7 @@ fn parse_plugin_manifest_args(argv: &[String]) -> Result<PluginManifestAction, S
     match kind {
         "parse" => parse_plugin_manifest_parse_args(&argv[1..]),
         "load" => parse_plugin_manifest_load_args(&argv[1..]),
+        "discover" => parse_plugin_manifest_discover_args(&argv[1..]),
         other => Err(format!("plugin-manifest: unknown subcommand {other}")),
     }
 }
@@ -1122,6 +1149,51 @@ fn parse_plugin_manifest_load_args(argv: &[String]) -> Result<PluginManifestActi
     Ok(PluginManifestAction::Load { plan_json, dir })
 }
 
+fn parse_plugin_manifest_discover_args(argv: &[String]) -> Result<PluginManifestAction, String> {
+    let mut plan_json = false;
+    let mut scan_dirs = Vec::new();
+    let mut disabled_plugins = Vec::new();
+    let mut runtime_version = "1.0.0".to_owned();
+    let mut use_cache = false;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--scan-dir" => {
+                scan_dirs.push(take_plugin_manifest_path(argv, index, "--scan-dir")?);
+                index += 1;
+            }
+            "--disabled" => {
+                disabled_plugins.push(take_plugin_manifest_value(argv, index, "--disabled")?);
+                index += 1;
+            }
+            "--runtime-version" => {
+                runtime_version = take_plugin_manifest_value(argv, index, "--runtime-version")?;
+                index += 1;
+            }
+            "--use-cache" => use_cache = true,
+            other => {
+                return Err(format!(
+                    "plugin-manifest discover: unknown argument {other}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    if scan_dirs.is_empty() {
+        return Err("plugin-manifest discover: --scan-dir is required".to_owned());
+    }
+    Ok(PluginManifestAction::Discover {
+        plan_json,
+        options: DiscoverPackagesOptions {
+            scan_dirs,
+            disabled_plugins,
+            runtime_version,
+            use_cache,
+        },
+    })
+}
+
 fn take_plugin_manifest_path(
     argv: &[String],
     index: usize,
@@ -1143,9 +1215,34 @@ fn plugin_manifest_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n"
+            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n       maw-rs plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n"
         ),
     }
+}
+
+fn render_plugin_discover_json(
+    options: &DiscoverPackagesOptions,
+    plugins: &[LoadedPlugin],
+    warnings: &[String],
+) -> String {
+    let scan_dirs = options
+        .scan_dirs
+        .iter()
+        .map(path_string)
+        .collect::<Vec<_>>();
+    let plugin_json = plugins
+        .iter()
+        .map(render_loaded_plugin_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"command\":\"plugin-manifest\",\"kind\":\"discover\",\"scanDirs\":{},\"runtimeVersion\":{},\"disabledPlugins\":{},\"useCache\":{},\"plugins\":[{plugin_json}],\"warnings\":{}}}\n",
+        json_string_array(&scan_dirs),
+        json_string(&options.runtime_version),
+        json_string_array(&options.disabled_plugins),
+        options.use_cache,
+        json_string_array(warnings)
+    )
 }
 
 fn render_loaded_plugin_json(plugin: &LoadedPlugin) -> String {
@@ -3343,7 +3440,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
