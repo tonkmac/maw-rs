@@ -9,6 +9,10 @@ use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
     ResolveOptions, ResolveResult,
 };
+use maw_routing::{
+    resolve_target as resolve_route_target, MawConfig as RouteConfig, NamedPeer as RouteNamedPeer,
+    ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
+};
 use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
     WorktreeWindowResolution,
@@ -35,11 +39,229 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "normalize" => run_normalize_plan(&argv[1..]),
         "calver" => run_calver_plan(&argv[1..]),
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
+        "route" => run_route_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_route_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut query = None;
+    let mut config = RouteConfig::default();
+    let mut sessions: Vec<RouteSession> = Vec::new();
+    let mut current_session: Option<RouteSession> = None;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--query" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --query value");
+                };
+                query = Some(value.to_owned());
+                index += 1;
+            }
+            "--node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --node value");
+                };
+                config.node = Some(value.to_owned());
+                index += 1;
+            }
+            "--named-peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --named-peer value");
+                };
+                match parse_key_value(value, "route: --named-peer must use <name=url>") {
+                    Ok((name, url)) => config.named_peers.push(RouteNamedPeer { name, url }),
+                    Err(message) => return route_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --peer value");
+                };
+                config.peers.push(value.to_owned());
+                index += 1;
+            }
+            "--agent" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --agent value");
+                };
+                match parse_key_value(value, "route: --agent must use <agent=node>") {
+                    Ok((agent, node)) => {
+                        config.agents.insert(agent, node);
+                    }
+                    Err(message) => return route_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--session" => {
+                if let Some(session) = current_session.take() {
+                    sessions.push(session);
+                }
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --session value");
+                };
+                current_session = Some(RouteSession {
+                    name: value.to_owned(),
+                    windows: Vec::new(),
+                    source: None,
+                });
+                index += 1;
+            }
+            "--source" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --source value");
+                };
+                let Some(session) = &mut current_session else {
+                    return route_usage_error("route: --source must follow a --session");
+                };
+                session.source = Some(value.to_owned());
+                index += 1;
+            }
+            "--window" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return route_usage_error("route: missing --window value");
+                };
+                let Some(session) = &mut current_session else {
+                    return route_usage_error("route: --window must follow a --session");
+                };
+                match parse_route_window(value) {
+                    Ok(window) => session.windows.push(window),
+                    Err(message) => return route_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => return route_usage_error(&format!("route: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+    if let Some(session) = current_session.take() {
+        sessions.push(session);
+    }
+
+    let Some(query) = query else {
+        return route_usage_error("route: expected --query <target>");
+    };
+    let result = resolve_route_target(&query, &config, &sessions);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_route_plan_json(&query, &result)
+        } else {
+            render_route_plan_text(&query, &result)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn route_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n"
+        ),
+    }
+}
+
+fn parse_key_value(value: &str, message: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Err(message.to_owned());
+    };
+    if key.is_empty() || value.is_empty() {
+        return Err(message.to_owned());
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+fn parse_route_window(value: &str) -> Result<RouteWindow, String> {
+    let mut parts = value.splitn(3, ':');
+    let index = parts
+        .next()
+        .ok_or_else(|| "route: missing window index".to_owned())?
+        .parse::<u32>()
+        .map_err(|_| "route: invalid window index".to_owned())?;
+    let Some(name) = parts.next() else {
+        return Err("route: window must use <index:name:active>".to_owned());
+    };
+    let active = match parts.next() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return Err("route: window active must be true or false".to_owned()),
+    };
+    Ok(RouteWindow {
+        index,
+        name: name.to_owned(),
+        active,
+    })
+}
+
+fn render_route_plan_json(query: &str, result: &RouteResult) -> String {
+    let mut fields = vec![
+        "\"command\":\"route\"".to_owned(),
+        format!("\"query\":{}", json_string(query)),
+    ];
+    match result {
+        RouteResult::Local { target } => {
+            fields.push("\"type\":\"local\"".to_owned());
+            fields.push(format!("\"target\":{}", json_string(target)));
+        }
+        RouteResult::Peer {
+            peer_url,
+            target,
+            node,
+        } => {
+            fields.push("\"type\":\"peer\"".to_owned());
+            fields.push(format!("\"peerUrl\":{}", json_string(peer_url)));
+            fields.push(format!("\"target\":{}", json_string(target)));
+            fields.push(format!("\"node\":{}", json_string(node)));
+        }
+        RouteResult::SelfNode { target } => {
+            fields.push("\"type\":\"self-node\"".to_owned());
+            fields.push(format!("\"target\":{}", json_string(target)));
+        }
+        RouteResult::Error {
+            reason,
+            detail,
+            hint,
+        } => {
+            fields.push("\"type\":\"error\"".to_owned());
+            fields.push(format!("\"reason\":{}", json_string(reason)));
+            fields.push(format!("\"detail\":{}", json_string(detail)));
+            if let Some(hint) = hint {
+                fields.push(format!("\"hint\":{}", json_string(hint)));
+            }
+        }
+    }
+    format!("{{{}}}\n", fields.join(","))
+}
+
+fn render_route_plan_text(query: &str, result: &RouteResult) -> String {
+    match result {
+        RouteResult::Local { target } => format!("route {query}: local {target}\n"),
+        RouteResult::Peer {
+            peer_url,
+            target,
+            node,
+        } => format!("route {query}: peer {node} {target} via {peer_url}\n"),
+        RouteResult::SelfNode { target } => format!("route {query}: self-node {target}\n"),
+        RouteResult::Error {
+            reason,
+            detail,
+            hint,
+        } => hint.as_ref().map_or_else(
+            || format!("route {query}: error {reason} {detail}\n"),
+            |hint| format!("route {query}: error {reason} {detail} hint={hint}\n"),
+        ),
     }
 }
 
@@ -512,7 +734,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n"
         .to_owned()
 }
 
