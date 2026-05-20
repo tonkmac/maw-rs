@@ -12,6 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 maw-bring = { path = "../maw-bring" }
+maw-matcher = { path = "../maw-matcher" }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

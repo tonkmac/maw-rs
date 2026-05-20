@@ -4,6 +4,9 @@
 //! be tested against maw-js parser contracts before host IO is wired.
 
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
+use maw_matcher::{
+    resolve_by_name, resolve_session_target, resolve_worktree_target, ResolveOptions, ResolveResult,
+};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,12 +25,125 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     match command {
         "--help" | "-h" | "help" => usage_ok(),
         "bring" | "b" => run_bring_plan(&argv[1..]),
+        "resolve" => run_resolve_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_resolve_plan(argv: &[String]) -> CliOutput {
+    let plan_json = argv.iter().any(|arg| arg == "--plan-json");
+    let mut mode = "by-name".to_owned();
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => {}
+            "--mode" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return resolve_usage_error("resolve: missing --mode value");
+                };
+                mode.clone_from(value);
+                index += 1;
+            }
+            arg => positionals.push(arg.to_owned()),
+        }
+        index += 1;
+    }
+
+    if positionals.len() < 2 {
+        return resolve_usage_error("resolve: expected <target> and at least one item");
+    }
+    let target = &positionals[0];
+    let items = &positionals[1..];
+    let result = match mode.as_str() {
+        "by-name" | "byName" => resolve_by_name(target, items, ResolveOptions::default()),
+        "session" => resolve_session_target(target, items),
+        "worktree" => resolve_worktree_target(target, items),
+        _ => return resolve_usage_error("resolve: unknown --mode"),
+    };
+    let stdout = if plan_json {
+        render_resolve_plan_json(&mode, target, result)
+    } else {
+        render_resolve_plan_text(&mode, target, result)
+    };
+    CliOutput {
+        code: 0,
+        stdout,
+        stderr: String::new(),
+    }
+}
+
+fn resolve_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\nusage: maw-rs resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n"),
+    }
+}
+
+fn render_resolve_plan_json(mode: &str, target: &str, result: ResolveResult<String>) -> String {
+    let mut fields = vec![
+        "\"command\":\"resolve\"".to_owned(),
+        format!("\"mode\":{}", json_string(mode)),
+        format!("\"target\":{}", json_string(target)),
+    ];
+    match result {
+        ResolveResult::Exact { matched } => {
+            fields.push("\"kind\":\"exact\"".to_owned());
+            fields.push(format!("\"match\":{}", json_string(&matched)));
+        }
+        ResolveResult::Fuzzy { matched } => {
+            fields.push("\"kind\":\"fuzzy\"".to_owned());
+            fields.push(format!("\"match\":{}", json_string(&matched)));
+        }
+        ResolveResult::Ambiguous { candidates } => {
+            fields.push("\"kind\":\"ambiguous\"".to_owned());
+            fields.push(format!("\"candidates\":{}", json_string_array(&candidates)));
+        }
+        ResolveResult::None { hints } => {
+            fields.push("\"kind\":\"none\"".to_owned());
+            if let Some(hints) = hints {
+                fields.push(format!("\"hints\":{}", json_string_array(&hints)));
+            }
+        }
+    }
+    format!("{{{}}}\n", fields.join(","))
+}
+
+fn render_resolve_plan_text(mode: &str, target: &str, result: ResolveResult<String>) -> String {
+    match result {
+        ResolveResult::Exact { matched } => {
+            format!("resolve {mode} {target}: exact {matched}\n")
+        }
+        ResolveResult::Fuzzy { matched } => {
+            format!("resolve {mode} {target}: fuzzy {matched}\n")
+        }
+        ResolveResult::Ambiguous { candidates } => {
+            format!(
+                "resolve {mode} {target}: ambiguous {}\n",
+                candidates.join(", ")
+            )
+        }
+        ResolveResult::None { hints } => hints.map_or_else(
+            || format!("resolve {mode} {target}: none\n"),
+            |hints| format!("resolve {mode} {target}: none hints={}\n", hints.join(", ")),
+        ),
+    }
+}
+
+fn json_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn usage_ok() -> CliOutput {
@@ -39,7 +155,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n"
         .to_owned()
 }
 
