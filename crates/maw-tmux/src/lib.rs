@@ -114,6 +114,14 @@ pub struct PaneTags {
     pub meta: BTreeMap<String, String>,
 }
 
+/// Minimal pane shape used by `maw tmux ls` annotation logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxLsPaneRef {
+    pub id: String,
+    pub target: String,
+    pub command: Option<String>,
+}
+
 /// Error returned by an injected tmux runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxError {
@@ -1021,6 +1029,179 @@ fn prompt_has_input(line: &str) -> bool {
     false
 }
 
+/// Parse `tmux list-sessions -F '#{session_name}\t#{session_created}'` style epoch rows.
+#[must_use]
+pub fn parse_session_epoch_list(raw: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((name, epoch_raw)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(epoch) = epoch_raw.parse::<u64>() else {
+            continue;
+        };
+        if !name.is_empty() && epoch > 0 {
+            out.insert(name.to_owned(), epoch);
+        }
+    }
+    out
+}
+
+/// Parse tmux session creation rows.
+#[must_use]
+pub fn parse_session_created_list(raw: &str) -> BTreeMap<String, u64> {
+    parse_session_epoch_list(raw)
+}
+
+/// Parse tmux session activity rows.
+#[must_use]
+pub fn parse_session_activity_list(raw: &str) -> BTreeMap<String, u64> {
+    parse_session_epoch_list(raw)
+}
+
+/// Parse `maw ls --active` duration values. Bare numbers are minutes.
+#[must_use]
+pub fn parse_active_duration_seconds(raw: Option<&str>) -> Option<u64> {
+    let trimmed = raw?.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let last = trimmed.chars().last()?;
+    let (digits, unit) = match last {
+        's' | 'm' | 'h' | 'd' => (&trimmed[..trimmed.len() - 1], last),
+        _ => (trimmed.as_str(), 'm'),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.parse::<u64>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        _ => return None,
+    };
+    value.checked_mul(multiplier)
+}
+
+/// Return the valid duration argument supplied to a flag such as `--active`.
+#[must_use]
+pub fn active_duration_arg(argv: &[String], flag: &str) -> Option<String> {
+    for (index, arg) in argv.iter().enumerate() {
+        if arg == flag {
+            let next = argv.get(index + 1)?;
+            return (!next.starts_with('-') && parse_active_duration_seconds(Some(next)).is_some())
+                .then(|| next.clone());
+        }
+        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+            if parse_active_duration_seconds(Some(value)).is_some() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Format an epoch second as a deterministic UTC timestamp.
+#[must_use]
+pub fn format_session_created(epoch_seconds: Option<u64>) -> String {
+    let Some(epoch_seconds) = epoch_seconds.filter(|epoch| *epoch > 0) else {
+        return "—".to_owned();
+    };
+    let days = epoch_seconds / 86_400;
+    let Ok(days) = i64::try_from(days) else {
+        return "—".to_owned();
+    };
+    let seconds_of_day = epoch_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Return unique matching oracle repo slugs, preserving input order.
+#[must_use]
+pub fn similar_oracle_candidates_from_repos(target: &str, repos: &[String]) -> Vec<String> {
+    let query = target.to_lowercase();
+    let mut out = Vec::new();
+    for repo in repos {
+        let name = repo_name_from_path(repo);
+        if !name.ends_with("-oracle") || !name.to_lowercase().contains(&query) {
+            continue;
+        }
+        let slug = repo_slug_from_path(repo);
+        if !out.iter().any(|existing| existing == &slug) {
+            out.push(slug);
+        }
+    }
+    out
+}
+
+fn repo_name_from_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn repo_slug_from_path(path: &str) -> String {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() >= 2 {
+        parts[parts.len() - 2..].join("/")
+    } else {
+        repo_name_from_path(path).to_owned()
+    }
+}
+
+/// Annotate a pane for `maw tmux ls`: team > fleet > view > orphan > empty.
+#[must_use]
+pub fn annotate_pane(
+    pane: &TmuxLsPaneRef,
+    fleet_sessions: &BTreeSet<String>,
+    team_by_pane: &BTreeMap<String, String>,
+) -> String {
+    let session = pane
+        .target
+        .split_once(':')
+        .map_or(pane.target.as_str(), |(session, _)| session);
+    if let Some(team) = team_by_pane.get(&pane.id) {
+        return format!("team: {team}");
+    }
+    if fleet_sessions.contains(session) {
+        return format!("fleet: {}", strip_numeric_prefix(session));
+    }
+    if session == "maw-view" || session.ends_with("-view") {
+        return format!("view: {session}");
+    }
+    if pane
+        .command
+        .as_deref()
+        .is_some_and(|command| command.contains("claude"))
+    {
+        return "orphan".to_owned();
+    }
+    String::new()
+}
+
 /// Normalize pane metadata keys to tmux `@custom` option names.
 #[must_use]
 pub fn normalize_pane_tag_key(raw_key: &str) -> String {
@@ -1472,6 +1653,155 @@ mod tests {
             client.runner.calls[5].1,
             vec!["-t", "%10", "-l", "hello | world"]
         );
+    }
+
+    #[test]
+    fn tmux_ls_recent_pure_helpers_match_maw_js_tests() {
+        let raw =
+            "old-session\t100\nnew-session\t300\nmid-session\t200\nzero\t0\nbad\tnope\nmissing\n";
+        assert_eq!(
+            parse_session_created_list(raw),
+            BTreeMap::from([
+                ("mid-session".to_owned(), 200),
+                ("new-session".to_owned(), 300),
+                ("old-session".to_owned(), 100),
+            ])
+        );
+        assert_eq!(format_session_created(None), "—");
+        assert_eq!(format_session_created(Some(0)), "—");
+        assert_eq!(format_session_created(Some(300)), "1970-01-01 00:05:00");
+        assert_eq!(parse_active_duration_seconds(Some("30m")), Some(1800));
+        assert_eq!(parse_active_duration_seconds(Some("1h")), Some(3600));
+        assert_eq!(parse_active_duration_seconds(Some("2d")), Some(172_800));
+        assert_eq!(parse_active_duration_seconds(Some("45")), Some(2700));
+        assert_eq!(parse_active_duration_seconds(Some("0m")), None);
+        assert_eq!(
+            active_duration_arg(&["--active".to_owned(), "1h".to_owned()], "--active"),
+            Some("1h".to_owned())
+        );
+        assert_eq!(
+            active_duration_arg(&["--active=2d".to_owned()], "--active"),
+            Some("2d".to_owned())
+        );
+        assert_eq!(
+            active_duration_arg(
+                &["--active".to_owned(), "session-filter".to_owned()],
+                "--active"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn annotate_pane_matches_maw_js_precedence() {
+        let fleet = BTreeSet::from([
+            "101-mawjs".to_owned(),
+            "112-fusion".to_owned(),
+            "114-mawjs-no2".to_owned(),
+        ]);
+        let teams = BTreeMap::from([("%300".to_owned(), "scout @ iter-triage".to_owned())]);
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%100".to_owned(),
+                    target: "101-mawjs:0.0".to_owned(),
+                    command: Some("claude".to_owned())
+                },
+                &fleet,
+                &BTreeMap::new(),
+            ),
+            "fleet: mawjs"
+        );
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%101".to_owned(),
+                    target: "114-mawjs-no2:0.0".to_owned(),
+                    command: Some("claude".to_owned())
+                },
+                &fleet,
+                &BTreeMap::new(),
+            ),
+            "fleet: mawjs-no2"
+        );
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%200".to_owned(),
+                    target: "maw-view:0.0".to_owned(),
+                    command: Some("claude".to_owned())
+                },
+                &fleet,
+                &BTreeMap::new(),
+            ),
+            "view: maw-view"
+        );
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%201".to_owned(),
+                    target: "mawjs-view:0.0".to_owned(),
+                    command: Some("claude".to_owned())
+                },
+                &fleet,
+                &BTreeMap::new(),
+            ),
+            "view: mawjs-view"
+        );
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%300".to_owned(),
+                    target: "101-mawjs:0.1".to_owned(),
+                    command: Some("bun".to_owned())
+                },
+                &fleet,
+                &teams,
+            ),
+            "team: scout @ iter-triage"
+        );
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%600".to_owned(),
+                    target: "view-foo:0.0".to_owned(),
+                    command: Some("claude".to_owned())
+                },
+                &fleet,
+                &BTreeMap::new(),
+            ),
+            "orphan"
+        );
+        assert_eq!(
+            annotate_pane(
+                &TmuxLsPaneRef {
+                    id: "%700".to_owned(),
+                    target: "any:0.0".to_owned(),
+                    command: Some("bash".to_owned())
+                },
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn similar_oracle_candidates_preserve_org_slug_ambiguity() {
+        let repos = vec![
+            "/opt/Code/github.com/laris-co/pulse-oracle".to_owned(),
+            "/opt/Code/github.com/Soul-Brews-Studio/pulse-oracle".to_owned(),
+            "/opt/Code/github.com/Soul-Brews-Studio/pulse-oracle".to_owned(),
+            "/opt/Code/github.com/Soul-Brews-Studio/other".to_owned(),
+        ];
+        assert_eq!(
+            similar_oracle_candidates_from_repos("pulse", &repos),
+            vec![
+                "laris-co/pulse-oracle".to_owned(),
+                "Soul-Brews-Studio/pulse-oracle".to_owned(),
+            ]
+        );
+        assert!(similar_oracle_candidates_from_repos("x", &[]).is_empty());
     }
 
     #[test]
