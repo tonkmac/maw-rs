@@ -4,6 +4,7 @@
 //! `test/plugin-manifest-validate-edges.test.ts`.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -856,12 +857,27 @@ pub struct PluginManifest {
     pub artifact: Option<PluginArtifact>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedPlugin {
+    pub manifest: PluginManifest,
+    pub dir: PathBuf,
+    pub wasm_path: PathBuf,
+    pub entry_path: Option<PathBuf>,
+    pub kind: LoadedPluginKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadedPluginKind {
+    Ts,
+    Wasm,
+}
+
 /// Parse and validate a `plugin.json` text.
 ///
 /// # Errors
 ///
 /// Returns maw-js-compatible validation messages for malformed manifests.
-pub fn parse_manifest(json_text: &str, dir: &std::path::Path) -> Result<PluginManifest, String> {
+pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, String> {
     let raw: Value =
         serde_json::from_str(json_text).map_err(|_| "plugin.json: invalid JSON".to_owned())?;
     let object = parse_manifest_object(&raw)?;
@@ -913,6 +929,58 @@ pub fn parse_manifest(json_text: &str, dir: &std::path::Path) -> Result<PluginMa
         dependencies: parse_dependencies(&raw)?,
         artifact: parse_artifact(&raw)?,
     })
+}
+
+/// Load and validate `plugin.json` from a plugin directory.
+///
+/// # Errors
+///
+/// Returns filesystem read errors or maw-js-compatible manifest validation messages when
+/// `plugin.json` exists but cannot be loaded.
+pub fn load_manifest_from_dir(dir: &Path) -> Result<Option<LoadedPlugin>, String> {
+    let manifest_path = dir.join("plugin.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let json_text = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("plugin.json: failed to read: {error}"))?;
+    let manifest = parse_manifest(&json_text, dir)?;
+    let has_entry = manifest.entry.is_some();
+    let has_artifact_js = manifest
+        .artifact
+        .as_ref()
+        .is_some_and(|artifact| !artifact.path.is_empty());
+    let effective_entry = manifest.entry.as_ref().or_else(|| {
+        if has_artifact_js {
+            manifest.artifact.as_ref().map(|artifact| &artifact.path)
+        } else {
+            None
+        }
+    });
+
+    Ok(Some(LoadedPlugin {
+        wasm_path: manifest
+            .wasm
+            .as_ref()
+            .map_or_else(PathBuf::new, |wasm| resolve_dir_path(dir, wasm)),
+        entry_path: effective_entry.map(|entry| resolve_dir_path(dir, entry)),
+        kind: if has_entry || has_artifact_js {
+            LoadedPluginKind::Ts
+        } else {
+            LoadedPluginKind::Wasm
+        },
+        dir: dir.to_path_buf(),
+        manifest,
+    }))
+}
+
+fn resolve_dir_path(dir: &Path, path: &str) -> PathBuf {
+    let base = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| PathBuf::from(".").join(dir), |cwd| cwd.join(dir))
+    };
+    base.join(path)
 }
 
 fn parse_manifest_object(raw: &Value) -> Result<&Map<String, Value>, String> {
@@ -976,7 +1044,7 @@ fn parse_manifest_sdk(object: &Map<String, Value>) -> Result<String, String> {
 fn parse_declared_manifest_file(
     object: &Map<String, Value>,
     key: &str,
-    dir: &std::path::Path,
+    dir: &Path,
 ) -> Result<Option<String>, String> {
     let Some(path) = object
         .get(key)
