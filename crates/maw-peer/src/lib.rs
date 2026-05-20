@@ -1102,6 +1102,205 @@ impl From<PeerPubkeyMismatchError> for TofuApplyError {
     }
 }
 
+/// Deterministic input for maw-js `cmdAdd` peer-cache behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAddPlan {
+    pub alias: String,
+    pub url: String,
+    pub node: Option<String>,
+    pub now: String,
+    pub peers: BTreeMap<String, PeerRecord>,
+    pub probe: ProbePeerResult,
+}
+
+/// Deterministic result for maw-js `cmdAdd`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAddResult {
+    pub alias: String,
+    pub overwrote: bool,
+    pub peer: PeerRecord,
+    pub probe_error: Option<ProbeLastError>,
+    pub pubkey_mismatch: Option<PeerPubkeyMismatchError>,
+    pub peers_after: BTreeMap<String, PeerRecord>,
+}
+
+/// Port of maw-js `cmdAdd` cache/TOFU behavior over deterministic inputs.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible alias or URL validation failures.
+pub fn cmd_peer_add_from_plan(plan: &PeerAddPlan) -> Result<PeerAddResult, String> {
+    if let Some(message) = validate_peer_alias(&plan.alias) {
+        return Err(message);
+    }
+    if let Some(message) = validate_peer_url(&plan.url) {
+        return Err(message);
+    }
+
+    let existing = plan.peers.get(&plan.alias);
+    let tofu_decision = evaluate_peer_identity(&plan.alias, existing, plan.probe.pubkey.as_deref());
+    if tofu_decision.kind == TofuDecisionKind::Mismatch {
+        let peer = existing.cloned().unwrap_or_else(|| PeerRecord {
+            url: plan.url.clone(),
+            node: plan.node.clone().or_else(|| plan.probe.node.clone()),
+            added_at: plan.now.clone(),
+            last_seen: None,
+            last_error: plan.probe.error.clone(),
+            nickname: plan.probe.nickname.clone(),
+            pubkey: None,
+            pubkey_first_seen: None,
+            identity: plan.probe.identity.clone(),
+        });
+        return Ok(PeerAddResult {
+            alias: plan.alias.clone(),
+            overwrote: existing.is_some(),
+            peer,
+            probe_error: plan.probe.error.clone(),
+            pubkey_mismatch: Some(PeerPubkeyMismatchError::new(
+                plan.alias.clone(),
+                tofu_decision.cached.unwrap_or_default(),
+                tofu_decision.observed.unwrap_or_default(),
+            )),
+            peers_after: plan.peers.clone(),
+        });
+    }
+
+    let mut peer = PeerRecord {
+        url: plan.url.clone(),
+        node: plan.node.clone().or_else(|| plan.probe.node.clone()),
+        added_at: plan.now.clone(),
+        last_seen: plan.probe.error.is_none().then(|| plan.now.clone()),
+        last_error: plan.probe.error.clone(),
+        nickname: plan.probe.nickname.clone(),
+        pubkey: None,
+        pubkey_first_seen: None,
+        identity: plan.probe.identity.clone(),
+    };
+
+    if let Some(existing) = existing {
+        if existing
+            .pubkey
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            peer.pubkey.clone_from(&existing.pubkey);
+            peer.pubkey_first_seen
+                .clone_from(&existing.pubkey_first_seen);
+        } else if tofu_decision.kind == TofuDecisionKind::TofuBootstrap {
+            peer.pubkey.clone_from(&tofu_decision.observed);
+            peer.pubkey_first_seen = Some(plan.now.clone());
+        }
+        if peer.identity.is_none() {
+            peer.identity.clone_from(&existing.identity);
+        }
+    } else if tofu_decision.kind == TofuDecisionKind::TofuBootstrap {
+        peer.pubkey.clone_from(&tofu_decision.observed);
+        peer.pubkey_first_seen = Some(plan.now.clone());
+    }
+
+    let overwrote = plan.peers.contains_key(&plan.alias);
+    let mut peers_after = plan.peers.clone();
+    peers_after.insert(plan.alias.clone(), peer.clone());
+
+    Ok(PeerAddResult {
+        alias: plan.alias.clone(),
+        overwrote,
+        peer,
+        probe_error: plan.probe.error.clone(),
+        pubkey_mismatch: None,
+        peers_after,
+    })
+}
+
+/// Deterministic input for maw-js `cmdProbe` peer-cache behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerProbePlan {
+    pub alias: String,
+    pub now: String,
+    pub peers: BTreeMap<String, PeerRecord>,
+    pub probe: ProbePeerResult,
+    pub remove_before_mutate: bool,
+}
+
+/// Deterministic result for maw-js `cmdProbe`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerProbeResult {
+    pub alias: String,
+    pub url: String,
+    pub node: Option<String>,
+    pub ok: bool,
+    pub error: Option<ProbeLastError>,
+    pub pubkey_mismatch: Option<PeerPubkeyMismatchError>,
+    pub peers_after: BTreeMap<String, PeerRecord>,
+}
+
+/// Port of maw-js `cmdProbe` cache/TOFU behavior over deterministic inputs.
+///
+/// # Errors
+///
+/// Returns when the alias is not present in the input peer store.
+pub fn cmd_peer_probe_from_plan(plan: &PeerProbePlan) -> Result<PeerProbeResult, String> {
+    let Some(existing) = plan.peers.get(&plan.alias) else {
+        return Err(format!("peer \"{}\" not found", plan.alias));
+    };
+
+    let tofu_decision =
+        evaluate_peer_identity(&plan.alias, Some(existing), plan.probe.pubkey.as_deref());
+    if tofu_decision.kind == TofuDecisionKind::Mismatch {
+        return Ok(PeerProbeResult {
+            alias: plan.alias.clone(),
+            url: existing.url.clone(),
+            node: plan.probe.node.clone().or_else(|| existing.node.clone()),
+            ok: false,
+            error: plan.probe.error.clone(),
+            pubkey_mismatch: Some(PeerPubkeyMismatchError::new(
+                plan.alias.clone(),
+                tofu_decision.cached.unwrap_or_default(),
+                tofu_decision.observed.unwrap_or_default(),
+            )),
+            peers_after: plan.peers.clone(),
+        });
+    }
+
+    let mut peers_after = plan.peers.clone();
+    if plan.remove_before_mutate {
+        peers_after.remove(&plan.alias);
+    }
+    if let Some(peer) = peers_after.get_mut(&plan.alias) {
+        if let Some(error) = &plan.probe.error {
+            peer.last_error = Some(error.clone());
+        } else {
+            peer.last_error = None;
+            peer.last_seen = Some(plan.now.clone());
+            if let Some(node) = &plan.probe.node {
+                peer.node = Some(node.clone());
+            }
+            if let Some(nickname) = &plan.probe.nickname {
+                peer.nickname = Some(nickname.clone());
+            }
+            if let Some(identity) = &plan.probe.identity {
+                peer.identity = Some(identity.clone());
+            }
+        }
+        if tofu_decision.kind == TofuDecisionKind::TofuBootstrap
+            && peer.pubkey.as_deref().is_none_or(str::is_empty)
+        {
+            peer.pubkey.clone_from(&tofu_decision.observed);
+            peer.pubkey_first_seen = Some(plan.now.clone());
+        }
+    }
+
+    Ok(PeerProbeResult {
+        alias: plan.alias.clone(),
+        url: existing.url.clone(),
+        node: plan.probe.node.clone().or_else(|| existing.node.clone()),
+        ok: plan.probe.error.is_none(),
+        error: plan.probe.error.clone(),
+        pubkey_mismatch: None,
+        peers_after,
+    })
+}
+
 fn read_peer_store_unlocked(path: &Path) -> PeerStoreFile {
     if !path.exists() {
         return empty_peer_store();
