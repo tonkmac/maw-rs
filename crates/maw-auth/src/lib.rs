@@ -348,6 +348,16 @@ pub fn generate_pair_code_from_bytes(bytes: &[u8]) -> String {
 }
 
 #[must_use]
+pub fn hash_consent_pin(pin: &str) -> String {
+    hex_lower(&Sha256::digest(normalize_pair_code(pin).as_bytes()))
+}
+
+#[must_use]
+pub fn verify_consent_pin(pin: &str, expected_hash: &str) -> bool {
+    is_valid_pair_code_shape(pin) && hash_consent_pin(pin) == expected_hash
+}
+
+#[must_use]
 pub fn build_from_sign_payload(
     from: &str,
     timestamp: i64,

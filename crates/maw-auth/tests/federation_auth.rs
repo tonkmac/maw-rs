@@ -336,3 +336,25 @@ fn pair_code_store_register_lookup_and_consume_match_maw_js_ttl_contract() {
         LookupResult::Consumed
     );
 }
+
+// Ported from maw-js `src/core/consent/pin.ts` and
+// `test/core/consent/consent.test.ts`.
+#[test]
+fn consent_pin_hash_and_verify_match_maw_js_normalized_shape_contract() {
+    use maw_auth::{hash_consent_pin, verify_consent_pin};
+
+    let h1 = hash_consent_pin("ABC-DEF");
+    let h2 = hash_consent_pin("abcdef");
+    let h3 = hash_consent_pin("ABCDEF");
+    assert_eq!(h1, h2);
+    assert_eq!(h2, h3);
+    assert_eq!(h1.len(), 64);
+    assert!(h1.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+    assert!(verify_consent_pin("ABC-DEF", &h1));
+    assert!(verify_consent_pin("abcdef", &h1));
+    assert!(!verify_consent_pin("BBBBBB", &h1));
+    assert!(!verify_consent_pin("ABCDE", &h1));
+    assert!(!verify_consent_pin("ABCDEFG", &h1));
+    assert!(!verify_consent_pin("ABCDE0", &h1));
+}
