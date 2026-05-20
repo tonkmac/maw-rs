@@ -16,6 +16,7 @@ maw-calver = { path = "../maw-calver" }
 maw-matcher = { path = "../maw-matcher" }
 maw-peer = { path = "../maw-peer" }
 maw-routing = { path = "../maw-routing" }
+maw-split = { path = "../maw-split" }
 maw-worktree = { path = "../maw-worktree" }
 
 [dev-dependencies]

@@ -17,6 +17,7 @@ use maw_routing::{
     resolve_target as resolve_route_target, MawConfig as RouteConfig, NamedPeer as RouteNamedPeer,
     ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
 };
+use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
 use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
     WorktreeWindowResolution,
@@ -45,12 +46,102 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
         "route" => run_route_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
+        "split-policy" => run_split_policy_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_split_policy_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut pane_current_command = None;
+    let mut requested_policy = None;
+    let mut no_attach = false;
+    let mut force_split = false;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--pane-current-command" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return split_policy_usage_error(
+                        "split-policy: missing --pane-current-command value",
+                    );
+                };
+                pane_current_command = Some(value.to_owned());
+                index += 1;
+            }
+            "--requested-policy" | "--claude-pane-policy" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return split_policy_usage_error(
+                        "split-policy: missing --requested-policy value",
+                    );
+                };
+                requested_policy = Some(value.to_owned());
+                index += 1;
+            }
+            "--no-attach" => no_attach = true,
+            "--force-split" => force_split = true,
+            arg => {
+                return split_policy_usage_error(&format!("split-policy: unknown argument {arg}"))
+            }
+        }
+        index += 1;
+    }
+
+    let input = SplitPolicyInput {
+        pane_current_command,
+        no_attach,
+        requested_policy,
+        force_split,
+    };
+
+    match decide_split_policy(&input) {
+        Ok(decision) => CliOutput {
+            code: 0,
+            stdout: if plan_json {
+                render_split_policy_plan_json(decision)
+            } else {
+                render_split_policy_plan_text(decision)
+            },
+            stderr: String::new(),
+        },
+        Err(error) => CliOutput {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!("split-policy: {error}\n"),
+        },
+    }
+}
+
+fn split_policy_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n"
+        ),
+    }
+}
+
+fn render_split_policy_plan_json(decision: SplitPolicyDecision) -> String {
+    format!(
+        "{{\"command\":\"split-policy\",\"action\":{},\"reason\":{}}}\n",
+        json_string(decision.action.as_str()),
+        json_string(decision.reason.as_str())
+    )
+}
+
+fn render_split_policy_plan_text(decision: SplitPolicyDecision) -> String {
+    format!(
+        "split-policy action={} reason={}\n",
+        decision.action.as_str(),
+        decision.reason.as_str()
+    )
 }
 
 fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
@@ -926,7 +1017,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n"
         .to_owned()
 }
 

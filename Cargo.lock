@@ -115,6 +115,7 @@ dependencies = [
  "maw-matcher",
  "maw-peer",
  "maw-routing",
+ "maw-split",
  "maw-worktree",
  "serde",
  "serde_json",
