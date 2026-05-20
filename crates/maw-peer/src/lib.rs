@@ -3,7 +3,15 @@
 //! This crate does not perform network discovery. Callers pass already-fetched
 //! scout discovery data, keeping the fixture-tested policy deterministic.
 
-use std::{collections::BTreeMap, fmt::Write};
+use std::{
+    collections::BTreeMap,
+    fmt::Write,
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+use maw_xdg::{maw_state_path, MawXdgEnv};
+use serde::{Deserialize, Serialize};
 
 /// Peer source mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,15 +249,23 @@ mod tests {
 }
 
 /// Structured peer probe failure code, ported from maw-js `probe.ts`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeErrorCode {
+    #[serde(rename = "DNS")]
     Dns,
+    #[serde(rename = "REFUSED")]
     Refused,
+    #[serde(rename = "TIMEOUT")]
     Timeout,
+    #[serde(rename = "HTTP_4XX")]
     Http4xx,
+    #[serde(rename = "HTTP_5XX")]
     Http5xx,
+    #[serde(rename = "TLS")]
     Tls,
+    #[serde(rename = "BAD_BODY")]
     BadBody,
+    #[serde(rename = "UNKNOWN")]
     Unknown,
 }
 
@@ -279,7 +295,7 @@ pub enum ProbeFailureInput {
     NonObject,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeLastError {
     pub code: ProbeErrorCode,
     pub message: String,
@@ -600,13 +616,213 @@ fn probe_failure(error: ProbeLastError) -> ProbePeerResult {
 }
 
 /// Peer store record subset used by maw-js `probe-all`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub url: String,
+    #[serde(default)]
     pub node: Option<String>,
+    #[serde(rename = "addedAt")]
     pub added_at: String,
+    #[serde(default, rename = "lastSeen")]
     pub last_seen: Option<String>,
+    #[serde(default, rename = "lastError")]
     pub last_error: Option<ProbeLastError>,
+}
+
+/// Peer store file shape, ported from maw-js peers `store.ts` schema v1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreFile {
+    pub version: u8,
+    #[serde(default)]
+    pub peers: BTreeMap<String, PeerRecord>,
+}
+
+impl Default for PeerStoreFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            peers: BTreeMap::new(),
+        }
+    }
+}
+
+/// Deterministic peer-store environment for maw-js path resolution parity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerStoreEnv {
+    xdg: MawXdgEnv,
+}
+
+impl PeerStoreEnv {
+    #[must_use]
+    pub fn new(home_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            xdg: MawXdgEnv::new(home_dir),
+        }
+    }
+
+    #[must_use]
+    pub fn with_vars(
+        home_dir: impl Into<PathBuf>,
+        vars: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        Self {
+            xdg: MawXdgEnv::with_vars(home_dir, vars),
+        }
+    }
+
+    fn var(&self, name: &str) -> Option<&str> {
+        self.xdg.var(name)
+    }
+
+    fn home_dir(&self) -> &Path {
+        self.xdg.home_dir()
+    }
+}
+
+#[must_use]
+pub fn empty_peer_store() -> PeerStoreFile {
+    PeerStoreFile::default()
+}
+
+/// Resolve the active `peers.json` path.
+#[must_use]
+pub fn peer_store_path(env: &PeerStoreEnv) -> PathBuf {
+    env.var("PEERS_FILE")
+        .map_or_else(|| maw_state_path(&env.xdg, &["peers.json"]), PathBuf::from)
+}
+
+fn legacy_peer_store_path(env: &PeerStoreEnv) -> Option<PathBuf> {
+    if env.var("PEERS_FILE").is_some() || env.var("MAW_HOME").is_some() {
+        return None;
+    }
+    let legacy = env.home_dir().join(".maw").join("peers.json");
+    (legacy != peer_store_path(env)).then_some(legacy)
+}
+
+fn readable_peer_store_path(env: &PeerStoreEnv) -> PathBuf {
+    let primary = peer_store_path(env);
+    if primary.exists() {
+        return primary;
+    }
+    legacy_peer_store_path(env)
+        .filter(|path| path.exists())
+        .unwrap_or(primary)
+}
+
+/// Load peers with stale tmp cleanup and corruption quarantine.
+#[must_use]
+pub fn load_peer_store(env: &PeerStoreEnv) -> PeerStoreFile {
+    clear_stale_peer_store_tmp(env);
+    let path = readable_peer_store_path(env);
+    if !path.exists() {
+        return empty_peer_store();
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return empty_peer_store();
+    };
+    match parse_peer_store(&raw) {
+        Ok(store) => store,
+        Err(error) => {
+            let aside = corrupt_peer_store_path(&path);
+            let _ = fs::rename(&path, aside);
+            eprintln!(
+                "\u{1b}[33m⚠\u{1b}[0m peers store at {} failed to parse ({error}); moved aside",
+                path.display()
+            );
+            empty_peer_store()
+        }
+    }
+}
+
+/// Save peers via temp-file then rename, mirroring maw-js writeAtomic.
+///
+/// # Errors
+///
+/// Returns directory creation, JSON serialization, write, or rename failures.
+pub fn save_peer_store(env: &PeerStoreEnv, data: &PeerStoreFile) -> io::Result<()> {
+    let path = peer_store_path(env);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_peer_store_atomic(&path, data)
+}
+
+/// Read-modify-write peers, re-reading current contents before mutation.
+///
+/// # Errors
+///
+/// Returns directory creation, JSON serialization, write, or rename failures.
+pub fn mutate_peer_store(
+    env: &PeerStoreEnv,
+    mutate: impl FnOnce(&mut PeerStoreFile),
+) -> io::Result<PeerStoreFile> {
+    let path = peer_store_path(env);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let read_path = if path.exists() {
+        path.clone()
+    } else {
+        readable_peer_store_path(env)
+    };
+    let mut store = read_peer_store_unlocked(&read_path);
+    mutate(&mut store);
+    write_peer_store_atomic(&path, &store)?;
+    Ok(store)
+}
+
+/// Best-effort stale `.tmp` cleanup for primary and legacy peer stores.
+pub fn clear_stale_peer_store_tmp(env: &PeerStoreEnv) {
+    for path in [Some(peer_store_path(env)), legacy_peer_store_path(env)]
+        .into_iter()
+        .flatten()
+    {
+        let _ = fs::remove_file(tmp_peer_store_path(&path));
+    }
+}
+
+fn read_peer_store_unlocked(path: &Path) -> PeerStoreFile {
+    if !path.exists() {
+        return empty_peer_store();
+    }
+    let Ok(raw) = fs::read_to_string(path) else {
+        return empty_peer_store();
+    };
+    parse_peer_store(&raw).unwrap_or_else(|_| empty_peer_store())
+}
+
+fn parse_peer_store(raw: &str) -> Result<PeerStoreFile, String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|err| err.to_string())?;
+    let peers = match value.get("peers") {
+        Some(peers) if peers.is_object() => peers.clone(),
+        Some(_) => {
+            return Err("invalid store shape (expected { peers: { ... } } object)".to_owned());
+        }
+        None => serde_json::json!({}),
+    };
+    if !peers.is_object() {
+        return Err("invalid store shape (expected { peers: { ... } } object)".to_owned());
+    }
+    serde_json::from_value(serde_json::json!({ "version": 1, "peers": peers }))
+        .map_err(|err| err.to_string())
+}
+
+fn write_peer_store_atomic(path: &Path, data: &PeerStoreFile) -> io::Result<()> {
+    let tmp = tmp_peer_store_path(path);
+    let json = serde_json::to_string_pretty(data).map_err(io::Error::other)?;
+    fs::write(&tmp, format!("{json}\n"))?;
+    fs::rename(tmp, path)
+}
+
+fn tmp_peer_store_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tmp", path.display()))
+}
+
+fn corrupt_peer_store_path(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    PathBuf::from(format!("{}.corrupt-{stamp}", path.display()))
 }
 
 /// Deterministic input for maw-js `cmdProbeAll`.
