@@ -107,6 +107,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "maw-cli"
+version = "0.1.0"
+dependencies = [
+ "maw-bring",
+]
+
+[[package]]
 name = "maw-feed"
 version = "0.1.0"
 

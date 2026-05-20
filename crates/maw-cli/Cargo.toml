@@ -1,0 +1,17 @@
+[package]
+name = "maw-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "maw-rs"
+path = "src/main.rs"
+
+[dependencies]
+maw-bring = { path = "../maw-bring" }
+
+[lints]
+workspace = true

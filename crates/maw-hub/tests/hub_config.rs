@@ -5,8 +5,11 @@ use maw_hub::{
 use serde_json::json;
 use std::{
     fs,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn invalid(reason: &str) -> WorkspaceConfigValidation {
     WorkspaceConfigValidation::Invalid {
@@ -19,7 +22,11 @@ fn temp_config_dir() -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("maw-rs-hub-config-test-{unique}"))
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "maw-rs-hub-config-test-{}-{unique}-{counter}",
+        std::process::id()
+    ))
 }
 
 #[test]
