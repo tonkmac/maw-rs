@@ -2,7 +2,8 @@
 //! `src/commands/shared/plugin-create-scaffold.ts`.
 //!
 //! This crate ports the deterministic validation/manifest helpers plus the
-//! template tree-copy and Rust scaffold contracts from `test/plugin-create.test.ts`.
+//! template tree-copy plus Rust/AssemblyScript scaffold contracts from
+//! `test/plugin-create.test.ts`.
 
 use std::{fs, io, path::Path};
 
@@ -68,6 +69,50 @@ pub fn scaffold_rust(
     Ok(())
 }
 
+/// Scaffold an `AssemblyScript` WASM plugin from a template directory.
+///
+/// Mirrors maw-js `scaffoldAs`: validates the template exists, copies the
+/// template tree, rewrites package.json name when present, writes a README,
+/// and emits `plugin.json`.
+///
+/// # Errors
+///
+/// Returns filesystem errors from template lookup, tree copy, reading/writing
+/// `package.json`, README, or `plugin.json`, plus invalid package JSON.
+pub fn scaffold_as(
+    name: &str,
+    dest: impl AsRef<Path>,
+    template_dir: impl AsRef<Path>,
+) -> io::Result<()> {
+    let dest = dest.as_ref();
+    let template_dir = template_dir.as_ref();
+    if !template_dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "AssemblyScript template not found at {}\n  The AS SDK is still being built — try again after the next maw update,\n  or check: https://github.com/Soul-Brews-Studio/maw-js",
+                template_dir.display()
+            ),
+        ));
+    }
+
+    copy_tree(template_dir, dest)?;
+
+    let package_path = dest.join("package.json");
+    if package_path.exists() {
+        let package = fs::read_to_string(&package_path)?;
+        let package = rewrite_package_json_name(&package, name)?;
+        fs::write(&package_path, package)?;
+    }
+
+    fs::write(dest.join("README.md"), as_readme(name, dest))?;
+    fs::write(
+        dest.join("plugin.json"),
+        build_manifest_json(name, PluginLanguage::AssemblyScript),
+    )?;
+    Ok(())
+}
+
 /// Validate a plugin scaffold name.
 ///
 /// Returns `None` for valid names and the maw-js error text for invalid names.
@@ -127,6 +172,56 @@ pub fn build_manifest_json(name: &str, lang: PluginLanguage) -> String {
         Err(error) => format!(r#"{{"error":"manifest serialization failed: {error}"}}"#),
     };
     format!("{text}\n")
+}
+
+fn rewrite_package_json_name(package: &str, name: &str) -> io::Result<String> {
+    let mut value: Value = serde_json::from_str(package).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("package.json: invalid JSON: {error}"),
+        )
+    })?;
+    match &mut value {
+        Value::Object(object) => {
+            object.insert("name".to_owned(), Value::String(name.to_owned()));
+            serde_json::to_string_pretty(&value)
+                .map(|text| format!("{text}\n"))
+                .map_err(|error| {
+                    io::Error::other(format!("package.json serialization failed: {error}"))
+                })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "package.json: must be a JSON object",
+        )),
+    }
+}
+
+fn as_readme(name: &str, dest: &Path) -> String {
+    format!(
+        r#"# {name}
+
+A maw WASM command plugin (AssemblyScript).
+
+## Build
+
+```bash
+cd "{}"
+npm install
+npm run build
+```
+
+Output: `build/{name}.wasm`
+
+## Install
+
+```bash
+maw plugin install "{}"
+```
+"#,
+        dest.display(),
+        dest.display()
+    )
 }
 
 fn rewrite_rust_cargo_toml(cargo: &str, name: &str, sdk_path: &str) -> String {
