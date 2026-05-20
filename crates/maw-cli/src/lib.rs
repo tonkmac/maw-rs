@@ -5,6 +5,7 @@
 
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
+use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};
 use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
 use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
@@ -46,6 +47,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     match command {
         "--help" | "-h" | "help" => usage_ok(),
         "bring" | "b" => run_bring_plan(&argv[1..]),
+        "fuzzy" => run_fuzzy_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
         "identity" => run_identity_plan(&argv[1..]),
         "normalize" => run_normalize_plan(&argv[1..]),
@@ -61,6 +63,205 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+fn run_fuzzy_plan(argv: &[String]) -> CliOutput {
+    let (plan_json, action) = match parse_fuzzy_plan_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return fuzzy_usage_error(&message),
+    };
+
+    match action {
+        FuzzyPlanAction::Distance { left, right } => {
+            render_fuzzy_distance(plan_json, &left, &right)
+        }
+        FuzzyPlanAction::Match {
+            input,
+            candidates,
+            max_results,
+            max_distance,
+        } => render_fuzzy_match(plan_json, &input, &candidates, max_results, max_distance),
+    }
+}
+
+fn parse_fuzzy_plan_args(argv: &[String]) -> Result<(bool, FuzzyPlanAction), String> {
+    let mut plan_json = false;
+    let mut action = None;
+    let mut max_results = 3;
+    let mut max_distance = 3;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "distance" | "--distance" => {
+                let Some(left) = argv.get(index + 1) else {
+                    return Err("fuzzy: missing distance left value".to_owned());
+                };
+                let Some(right) = argv.get(index + 2) else {
+                    return Err("fuzzy: missing distance right value".to_owned());
+                };
+                action = Some(FuzzyPlanAction::Distance {
+                    left: left.to_owned(),
+                    right: right.to_owned(),
+                });
+                index += 2;
+            }
+            "match" | "--match" => {
+                let Some(input) = argv.get(index + 1) else {
+                    return Err("fuzzy: missing match input".to_owned());
+                };
+                action = Some(FuzzyPlanAction::Match {
+                    input: input.to_owned(),
+                    candidates: Vec::new(),
+                    max_results,
+                    max_distance,
+                });
+                index += 1;
+            }
+            "--candidate" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("fuzzy: missing --candidate value".to_owned());
+                };
+                action = append_fuzzy_candidate(action, value)?;
+                index += 1;
+            }
+            "--max-results" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("fuzzy: missing --max-results value".to_owned());
+                };
+                max_results = parse_usize_arg(value, "fuzzy: --max-results")?;
+                action = update_fuzzy_limits(action, max_results, max_distance);
+                index += 1;
+            }
+            "--max-distance" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("fuzzy: missing --max-distance value".to_owned());
+                };
+                max_distance = parse_usize_arg(value, "fuzzy: --max-distance")?;
+                action = update_fuzzy_limits(action, max_results, max_distance);
+                index += 1;
+            }
+            arg => return Err(format!("fuzzy: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    action.map_or_else(
+        || Err("fuzzy: expected distance or match".to_owned()),
+        |action| Ok((plan_json, action)),
+    )
+}
+
+fn append_fuzzy_candidate(
+    action: Option<FuzzyPlanAction>,
+    value: &str,
+) -> Result<Option<FuzzyPlanAction>, String> {
+    match action {
+        Some(FuzzyPlanAction::Match {
+            input,
+            mut candidates,
+            max_results,
+            max_distance,
+        }) => {
+            candidates.push(value.to_owned());
+            Ok(Some(FuzzyPlanAction::Match {
+                input,
+                candidates,
+                max_results,
+                max_distance,
+            }))
+        }
+        _ => Err("fuzzy: --candidate requires match".to_owned()),
+    }
+}
+
+fn update_fuzzy_limits(
+    action: Option<FuzzyPlanAction>,
+    max_results: usize,
+    max_distance: usize,
+) -> Option<FuzzyPlanAction> {
+    match action {
+        Some(FuzzyPlanAction::Match {
+            input, candidates, ..
+        }) => Some(FuzzyPlanAction::Match {
+            input,
+            candidates,
+            max_results,
+            max_distance,
+        }),
+        action => action,
+    }
+}
+
+fn parse_usize_arg(value: &str, name: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be a non-negative integer"))
+}
+
+fn render_fuzzy_distance(plan_json: bool, left: &str, right: &str) -> CliOutput {
+    let distance = fuzzy_distance(left, right);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"fuzzy\",\"kind\":\"distance\",\"left\":{},\"right\":{},\"distance\":{distance}}}\n",
+                json_string(left),
+                json_string(right)
+            )
+        } else {
+            format!("{distance}\n")
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_fuzzy_match(
+    plan_json: bool,
+    input: &str,
+    candidates: &[String],
+    max_results: usize,
+    max_distance: usize,
+) -> CliOutput {
+    let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let matches = fuzzy_match(input, &candidate_refs, max_results, max_distance);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"fuzzy\",\"kind\":\"match\",\"input\":{},\"candidates\":{},\"maxResults\":{max_results},\"maxDistance\":{max_distance},\"matches\":{}}}\n",
+                json_string(input),
+                json_string_array(candidates),
+                json_string_array(&matches)
+            )
+        } else {
+            format!("{}\n", matches.join("\n"))
+        },
+        stderr: String::new(),
+    }
+}
+
+enum FuzzyPlanAction {
+    Distance {
+        left: String,
+        right: String,
+    },
+    Match {
+        input: String,
+        candidates: Vec<String>,
+        max_results: usize,
+        max_distance: usize,
+    },
+}
+
+fn fuzzy_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs fuzzy distance <left> <right> [--plan-json]\n       maw-rs fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n"
+        ),
     }
 }
 
@@ -1559,7 +1760,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
