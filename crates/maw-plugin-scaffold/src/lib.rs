@@ -65,6 +65,20 @@ pub fn cmd_plugin_create(
     as_template_dir: impl AsRef<Path>,
     sdk_path: &str,
 ) -> Result<(), PluginCreateError> {
+    cmd_plugin_create_inner(
+        request,
+        rust_template_dir.as_ref(),
+        as_template_dir.as_ref(),
+        sdk_path,
+    )
+}
+
+fn cmd_plugin_create_inner(
+    request: &PluginCreateRequest,
+    rust_template_dir: &Path,
+    as_template_dir: &Path,
+    sdk_path: &str,
+) -> Result<(), PluginCreateError> {
     if !request.rust && !request.assembly_script {
         return Err(PluginCreateError::MissingType);
     }
@@ -119,8 +133,15 @@ pub fn scaffold_rust(
     template_dir: impl AsRef<Path>,
     sdk_path: &str,
 ) -> io::Result<()> {
-    let dest = dest.as_ref();
-    let template_dir = template_dir.as_ref();
+    scaffold_rust_inner(name, dest.as_ref(), template_dir.as_ref(), sdk_path)
+}
+
+fn scaffold_rust_inner(
+    name: &str,
+    dest: &Path,
+    template_dir: &Path,
+    sdk_path: &str,
+) -> io::Result<()> {
     if !template_dir.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -158,8 +179,10 @@ pub fn scaffold_as(
     dest: impl AsRef<Path>,
     template_dir: impl AsRef<Path>,
 ) -> io::Result<()> {
-    let dest = dest.as_ref();
-    let template_dir = template_dir.as_ref();
+    scaffold_as_inner(name, dest.as_ref(), template_dir.as_ref())
+}
+
+fn scaffold_as_inner(name: &str, dest: &Path, template_dir: &Path) -> io::Result<()> {
     if !template_dir.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -350,23 +373,44 @@ See the SDK at `{sdk_path}` for available host functions:
     )
 }
 
+#[derive(Debug)]
+struct TreeEntry {
+    file_name: std::ffi::OsString,
+    source_path: std::path::PathBuf,
+    is_dir: bool,
+}
+
 fn copy_tree_inner(src: &Path, dest: &Path) -> io::Result<()> {
     fs::create_dir_all(dest)?;
-    for entry in fs::read_dir(src)? {
+    copy_tree_entries(fs::read_dir(src)?.map(read_tree_entry), dest)
+}
+
+fn copy_tree_entries(
+    entries: impl IntoIterator<Item = io::Result<TreeEntry>>,
+    dest: &Path,
+) -> io::Result<()> {
+    for entry in entries {
         let entry = entry?;
-        let file_name = entry.file_name();
-        if should_skip_entry(&file_name) {
+        if should_skip_entry(&entry.file_name) {
             continue;
         }
-        let source_path = entry.path();
-        let dest_path = dest.join(file_name);
-        if entry.file_type()?.is_dir() {
-            copy_tree_inner(&source_path, &dest_path)?;
+        let dest_path = dest.join(entry.file_name);
+        if entry.is_dir {
+            copy_tree_inner(&entry.source_path, &dest_path)?;
         } else {
-            fs::copy(&source_path, &dest_path)?;
+            fs::copy(&entry.source_path, &dest_path)?;
         }
     }
     Ok(())
+}
+
+fn read_tree_entry(entry: io::Result<fs::DirEntry>) -> io::Result<TreeEntry> {
+    let entry = entry?;
+    Ok(TreeEntry {
+        is_dir: entry.file_type()?.is_dir(),
+        file_name: entry.file_name(),
+        source_path: entry.path(),
+    })
 }
 
 fn should_skip_entry(name: &std::ffi::OsStr) -> bool {
@@ -527,5 +571,20 @@ mod tests {
         let _ = fs::remove_dir_all(rust_dest);
         let _ = fs::remove_dir_all(as_template);
         let _ = fs::remove_dir_all(as_dest);
+    }
+
+    #[test]
+    fn copy_tree_private_entry_errors_are_covered() {
+        assert_eq!(
+            read_tree_entry(Err(io::ErrorKind::Other.into()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+        let root = temp_dir("copy-entry-error");
+        fs::create_dir_all(&root).expect("root");
+        let err = copy_tree_entries([Err(io::ErrorKind::Interrupted.into())], &root).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        let _ = fs::remove_dir_all(root);
     }
 }

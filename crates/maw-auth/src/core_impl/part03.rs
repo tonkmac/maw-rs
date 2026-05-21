@@ -9,8 +9,7 @@ pub fn verify_hmac_sig(secret: &str, payload: &str, signature_hex: &str) -> bool
         return false;
     }
     let expected = hmac_sha256_hex(secret, payload);
-    expected.len() == signature_hex.len()
-        && constant_time_eq(expected.as_bytes(), signature_hex.as_bytes())
+    constant_time_eq(expected.as_bytes(), signature_hex.as_bytes())
 }
 
 #[must_use]
@@ -406,13 +405,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::{
         consent_status_str, constant_time_eq, parse_iso_millis, parse_second_millis,
-        timestamp_seconds, verify_auto_pair_proof, verify_hmac_sig, AutoPairIdentity,
+        sign_hmac_sig, timestamp_seconds, verify_auto_pair_proof, verify_hmac_sig, AutoPairIdentity,
         ConsentStatus,
     };
 
     #[test]
     fn private_helpers_cover_unreachable_public_edges() {
         assert_eq!(consent_status_str(ConsentStatus::Pending), "pending");
+        assert_eq!(consent_status_str(ConsentStatus::Approved), "approved");
+        assert_eq!(consent_status_str(ConsentStatus::Rejected), "rejected");
+        assert_eq!(consent_status_str(ConsentStatus::Expired), "expired");
         assert!(!constant_time_eq(b"short", b"longer"));
         assert_eq!(
             super::iso_from_unix_millis(-62_167_219_200_001),
@@ -435,6 +437,16 @@ mod tests {
             "token",
             "",
         ));
+        let hmac = sign_hmac_sig("s", "p");
+        assert!(verify_hmac_sig("s", "p", &hmac));
+        let identity = AutoPairIdentity {
+            oracle: "o".to_owned(),
+            node: "n".to_owned(),
+            url: "u".to_owned(),
+            pubkey: "p".to_owned(),
+        };
+        let proof = super::sign_auto_pair_proof(&identity, "token");
+        assert!(verify_auto_pair_proof(&identity, "token", &proof));
         assert!(!verify_auto_pair_proof(
             &AutoPairIdentity {
                 oracle: "o".to_owned(),

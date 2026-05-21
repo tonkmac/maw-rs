@@ -81,4 +81,5 @@ fn auth_public_helpers_cover_map_conversion_status_names_and_validation_rejectio
         "refuse-malformed"
     );
     assert!(!verify_hmac_sig(TOKEN, "payload", ""));
+    assert!(!verify_hmac_sig(TOKEN, "payload", "00"));
 }

@@ -285,4 +285,16 @@ mod tests {
         assert_eq!(parsed.opts.session, None);
         assert_eq!(parsed.opts.split_target, None);
     }
+
+    #[test]
+    fn bring_args_report_missing_oracle_inside_lib_instantiation() {
+        let err = parse_bring_args(&["--pick".to_owned()]).expect_err("oracle is required");
+
+        assert_eq!(err.message, "bring: missing oracle name");
+        assert_eq!(err.usage, bring_usage_lines());
+        assert_eq!(
+            translate_bring_to_flag(&["--to".to_owned(), "work:agent".to_owned()]),
+            ["--session", "work", "--split-target", "work:agent"]
+        );
+    }
 }

@@ -84,6 +84,35 @@ fn probe_peer_plan_uses_legacy_name_and_default_oracle_identity() {
 }
 
 #[test]
+fn probe_peer_plan_treats_blank_identity_fields_like_maw_js() {
+    let result = probe_peer_from_plan(&ProbePeerPlan {
+        url: "http://127.0.0.1:3456".to_owned(),
+        now: at(),
+        dns_error: None,
+        info: ProbeInfoOutcome::Body(ProbeInfoBody {
+            maw: ProbeMawHandshake::LegacyTrue,
+            node: Some("node-from-info".to_owned()),
+            name: None,
+            nickname: None,
+        }),
+        identity: Some(ProbeRemoteIdentity::Body {
+            pubkey: Some(String::new()),
+            oracle: Some(String::new()),
+            node: Some("identity-node".to_owned()),
+        }),
+    });
+
+    assert_eq!(result.pubkey, None);
+    assert_eq!(
+        result.identity,
+        Some(PeerIdentity {
+            oracle: "mawjs".to_owned(),
+            node: "identity-node".to_owned(),
+        })
+    );
+}
+
+#[test]
 fn probe_peer_plan_keeps_info_success_when_identity_is_absent_or_malformed() {
     let base = ProbePeerPlan {
         url: "http://127.0.0.1:3456".to_owned(),
