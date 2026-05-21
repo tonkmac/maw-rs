@@ -30,6 +30,17 @@ fn temp_config_dir() -> std::path::PathBuf {
 }
 
 #[test]
+fn workspace_config_validation_accessors_report_ok_and_reason() {
+    let ok = WorkspaceConfigValidation::Ok;
+    assert!(ok.ok());
+    assert_eq!(ok.reason(), None);
+
+    let invalid = invalid("missing/empty id");
+    assert!(!invalid.ok());
+    assert_eq!(invalid.reason(), Some("missing/empty id"));
+}
+
+#[test]
 fn validates_workspace_config_with_maw_js_reasons() {
     assert_eq!(
         validate_workspace_config(&serde_json::Value::Null),

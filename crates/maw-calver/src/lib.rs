@@ -105,9 +105,7 @@ pub fn is_valid_calendar_date(base: &str) -> bool {
     if !(1..=12).contains(&month) {
         return false;
     }
-    let Ok(month_index) = usize::try_from(month) else {
-        return false;
-    };
+    let month_index = usize::try_from(month).unwrap_or_default();
     (1..=DAYS_IN_MONTH[month_index]).contains(&day)
 }
 
