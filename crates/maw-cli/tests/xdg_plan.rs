@@ -120,6 +120,25 @@ fn xdg_core_paths_plan_cli_creates_fleet_dir_like_maw_js_import() {
 }
 
 #[test]
+fn xdg_paths_default_home_falls_back_to_tmp_when_home_env_is_missing() {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let original_home = std::env::var_os("HOME");
+    std::env::remove_var("HOME");
+
+    let output = json(&run_cli(&[
+        "xdg".to_owned(),
+        "paths".to_owned(),
+        "--plan-json".to_owned(),
+    ]));
+    assert_eq!(output["runtimeHome"], "/tmp/.maw");
+
+    if let Some(home) = original_home {
+        std::env::set_var("HOME", home);
+    }
+}
+
+#[test]
 fn xdg_instance_name_plan_cli_matches_maw_js_regex() {
     for name in ["dev", "prod", "node-1", "a", "inst_2", "a1b2c3"] {
         let output = json(&run_cli(&[
