@@ -88,3 +88,20 @@ fn bring_alias_rejects_missing_oracle_with_usage() {
     );
     assert!(error.usage.join("\n").contains("usage: maw bring"));
 }
+
+#[test]
+fn bring_alias_parses_to_before_oracle() {
+    assert_eq!(
+        parse_bring_args(&args(&["--to", "50-mawjs:dev", "neo"])),
+        Ok(ParsedBringArgs {
+            oracle: "neo".to_owned(),
+            opts: BringAliasOptions {
+                split: true,
+                engine: None,
+                pick: false,
+                session: Some("50-mawjs".to_owned()),
+                split_target: Some("50-mawjs:dev".to_owned()),
+            },
+        })
+    );
+}

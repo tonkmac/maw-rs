@@ -389,4 +389,49 @@ mod tests {
             ResolveResult::None { hints: None }
         );
     }
+    #[test]
+    fn matcher_edge_branches_cover_empty_str_alias_and_ambiguous_windows() {
+        assert_eq!("literal".name(), "literal");
+        let borrowed: &str = "borrowed";
+        assert_eq!(borrowed.name(), "borrowed");
+
+        assert_eq!(
+            resolve_numeric_fleet_stem_prefix("", &[session("20-homekeeper")]),
+            ResolveResult::None { hints: None }
+        );
+        assert_eq!(
+            resolve_numeric_fleet_stem_prefix("home", &[session("homekeeper")]),
+            ResolveResult::None { hints: None }
+        );
+        assert_eq!(
+            resolve_numeric_fleet_stem_prefix("homekeeper", &[session("20-homekeeper")]),
+            ResolveResult::None { hints: None }
+        );
+
+        assert_eq!(
+            resolve_fleet_window_session_target("", &[session("20-homekeeper")]),
+            ResolveResult::None { hints: None }
+        );
+
+        let ambiguous = vec![
+            Session {
+                name: "a".to_owned(),
+                windows: vec![FleetWindow {
+                    name: Some("shared-oracle".to_owned()),
+                    repo: None,
+                }],
+            },
+            Session {
+                name: "b".to_owned(),
+                windows: vec![FleetWindow {
+                    name: None,
+                    repo: Some("org/shared-oracle".to_owned()),
+                }],
+            },
+        ];
+        assert!(matches!(
+            resolve_fleet_window_session_target("shared", &ambiguous),
+            ResolveResult::Ambiguous { candidates } if candidates.len() == 2
+        ));
+    }
 }
