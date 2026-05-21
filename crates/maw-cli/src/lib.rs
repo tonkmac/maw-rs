@@ -4694,6 +4694,10 @@ fn render_transport_send_plan_text(result: &TransportResult, sent: &[String]) ->
 }
 
 fn run_split_policy_plan(argv: &[String]) -> CliOutput {
+    if matches!(argv.first().map(String::as_str), Some("constants")) {
+        return run_split_policy_constants_plan(&argv[1..]);
+    }
+
     let mut plan_json = false;
     let mut pane_current_command = None;
     let mut requested_policy = None;
@@ -4756,13 +4760,51 @@ fn run_split_policy_plan(argv: &[String]) -> CliOutput {
     }
 }
 
+fn run_split_policy_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            other => {
+                return split_policy_constants_usage_error(&format!(
+                    "split-policy constants: unknown argument {other}"
+                ))
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_split_policy_constants_json()
+        } else {
+            "split-policy constants actions=split,background-tab,link-window,refuse\n".to_owned()
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_split_policy_constants_json() -> String {
+    r#"{"command":"split-policy","kind":"constants","actions":["split","background-tab","link-window","refuse"],"reasons":["not-attaching","force-split","not-claude","claude-policy"],"defaultClaudePolicy":"background-tab","policyFlags":["--requested-policy","--claude-pane-policy"],"precedence":["no-attach","force-split","not-claude","claude-policy"],"claudeLikeCommands":["claude","version-like semver command"]}
+"#
+    .to_owned()
+}
+
 fn split_policy_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n"
+            "{message}\nusage: maw-rs split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n       maw-rs split-policy constants [--plan-json]\n"
         ),
+    }
+}
+
+fn split_policy_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\nusage: maw-rs split-policy constants [--plan-json]\n"),
     }
 }
 
@@ -10639,7 +10681,7 @@ fn usage_text() -> String {
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]
-  peer-sources constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n  transport constants [--plan-json]\n"
+  peer-sources constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  split-policy constants [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n  transport constants [--plan-json]\n"
         .to_owned()
 }
 
