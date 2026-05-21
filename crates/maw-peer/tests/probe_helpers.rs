@@ -55,6 +55,46 @@ fn probe_classifier_matches_maw_js_error_buckets() {
 }
 
 #[test]
+fn probe_codes_hints_and_hosts_cover_all_maw_js_buckets() {
+    use maw_peer::{probe_hint, safe_probe_host};
+
+    for (code, name, exit, hint_part) in [
+        (ProbeErrorCode::Dns, "DNS", 3, "Host does not resolve"),
+        (ProbeErrorCode::Refused, "REFUSED", 4, "port is closed"),
+        (ProbeErrorCode::Timeout, "TIMEOUT", 5, "within 2s"),
+        (ProbeErrorCode::Http4xx, "HTTP_4XX", 6, "client error"),
+        (ProbeErrorCode::Http5xx, "HTTP_5XX", 6, "server error"),
+        (ProbeErrorCode::Tls, "TLS", 2, "TLS handshake"),
+        (ProbeErrorCode::BadBody, "BAD_BODY", 2, "body shape"),
+        (ProbeErrorCode::Unknown, "UNKNOWN", 2, "unclassified"),
+    ] {
+        assert_eq!(code.as_str(), name);
+        assert_eq!(probe_exit_code(code), exit);
+        assert!(probe_hint(code).contains(hint_part), "{code:?}");
+    }
+
+    assert_eq!(
+        classify_probe_error(&ProbeFailureInput::Code(
+            "UND_ERR_CONNECT_TIMEOUT".to_owned()
+        )),
+        ProbeErrorCode::Timeout
+    );
+    assert_eq!(
+        classify_probe_error(&ProbeFailureInput::Name("TimeoutError".to_owned())),
+        ProbeErrorCode::Timeout
+    );
+    assert_eq!(
+        classify_probe_error(&ProbeFailureInput::Http {
+            status: 204,
+            ok: true
+        }),
+        ProbeErrorCode::Unknown
+    );
+
+    assert_eq!(safe_probe_host("http://"), "http://");
+}
+
+#[test]
 fn probe_handshake_validation_matches_maw_js_shapes() {
     assert!(is_valid_maw_handshake(&ProbeMawHandshake::LegacyTrue));
     assert!(is_valid_maw_handshake(&ProbeMawHandshake::SchemaObject(

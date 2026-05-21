@@ -5,7 +5,7 @@ use maw_peer::{
 };
 use std::{
     collections::BTreeMap,
-    fs,
+    fs, io,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -204,6 +204,18 @@ fn apply_tofu_decision_bootstraps_once_preserves_race_safe_pins_and_throws_misma
     assert_eq!(err.cached, "cached-pubkey-abcdefghijklmnop");
     assert_eq!(err.observed, "observed-pubkey-qrstuvwxyz");
     assert!(err.to_string().contains("maw peers forget mallory"));
+}
+
+#[test]
+fn tofu_apply_error_display_preserves_mismatch_and_io_messages() {
+    let mismatch = TofuApplyError::from(maw_peer::PeerPubkeyMismatchError::new(
+        "mallory",
+        "cached-pubkey-abcdefghijklmnop",
+        "observed-pubkey-qrstuvwxyz",
+    ));
+    assert!(mismatch.to_string().contains("pubkey changed"));
+    let io_error = TofuApplyError::from(io::Error::other("disk full"));
+    assert_eq!(io_error.to_string(), "disk full");
 }
 
 #[test]

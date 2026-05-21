@@ -1064,23 +1064,6 @@ fn signed_input(headers: &Headers) -> SignedInput {
     }
 }
 
-fn bootstrap_decision(cached: Option<&str>, signed: &SignedInput) -> Option<FromVerifyDecision> {
-    match (cached, signed.signed) {
-        (None, false) => Some(FromVerifyDecision::AcceptLegacy {
-            reason: "no-cache-no-sig".to_owned(),
-        }),
-        (None, true) => Some(FromVerifyDecision::AcceptTofuRecord {
-            reason: "no-cache-signed".to_owned(),
-            from: signed.from.clone(),
-        }),
-        (Some(_), false) => Some(FromVerifyDecision::RefuseUnsigned {
-            reason: "cache-no-sig".to_owned(),
-            from: (!signed.from.is_empty()).then_some(signed.from.clone()),
-        }),
-        (Some(_), true) => None,
-    }
-}
-
 fn signed_at_seconds(signed: &SignedInput) -> Option<i64> {
     if signed.has_v3_sig {
         parse_unix_seconds(&signed.v3_timestamp)
@@ -1096,15 +1079,25 @@ pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
         .cached_pubkey
         .as_deref()
         .filter(|value| !value.is_empty());
-    if let Some(decision) = bootstrap_decision(cached, &signed) {
-        return decision;
-    }
 
-    if signed.from.is_empty() {
-        return malformed("missing-from");
-    }
-    if signed.v3_sig.is_empty() && signed.legacy_sig.is_empty() {
-        return malformed("missing-signature");
+    let Some(cached) = cached else {
+        return if signed.signed {
+            FromVerifyDecision::AcceptTofuRecord {
+                reason: "no-cache-signed".to_owned(),
+                from: signed.from.clone(),
+            }
+        } else {
+            FromVerifyDecision::AcceptLegacy {
+                reason: "no-cache-no-sig".to_owned(),
+            }
+        };
+    };
+
+    if !signed.signed {
+        return FromVerifyDecision::RefuseUnsigned {
+            reason: "cache-no-sig".to_owned(),
+            from: (!signed.from.is_empty()).then_some(signed.from.clone()),
+        };
     }
 
     let Some(signed_at_sec) = signed_at_seconds(&signed) else {
@@ -1145,9 +1138,6 @@ pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
         &signed.v3_sig
     } else {
         &signed.legacy_sig
-    };
-    let Some(cached) = cached else {
-        return malformed("missing-cache");
     };
     if !verify_hmac_sig(cached, &payload, signature) {
         return FromVerifyDecision::RefuseMismatch {
@@ -1286,11 +1276,11 @@ fn parse_iso_millis(iso: &str) -> Option<i64> {
     let (date, time) = iso.split_once('T')?;
     let time = time.strip_suffix('Z').unwrap_or(time);
     let mut date_parts = date.split('-');
-    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let year = date_parts.next().unwrap_or_default().parse::<i32>().ok()?;
     let month = date_parts.next()?.parse::<u32>().ok()?;
     let day = date_parts.next()?.parse::<u32>().ok()?;
     let mut time_parts = time.split(':');
-    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let hour = time_parts.next().unwrap_or_default().parse::<u32>().ok()?;
     let minute = time_parts.next()?.parse::<u32>().ok()?;
     let sec_part = time_parts.next()?;
     let (second, millis) = parse_second_millis(sec_part)?;
@@ -1310,7 +1300,7 @@ fn parse_second_millis(sec_part: &str) -> Option<(u32, u16)> {
     let mut value = 0_u16;
     let mut count = 0_u8;
     for ch in fraction.chars().take(3) {
-        let digit = u16::try_from(ch.to_digit(10)?).ok()?;
+        let digit = u16::try_from(ch.to_digit(10)?).expect("decimal digit fits u16");
         value = (value * 10) + digit;
         count += 1;
     }
@@ -1334,13 +1324,13 @@ fn timestamp_seconds(
     if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let max_day = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
-        2 => 28,
-        _ => return None,
+    let leap_feb = if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+        29
+    } else {
+        28
     };
+    let month_lengths = [31, leap_feb, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let max_day = month_lengths[usize::try_from(month - 1).expect("validated month fits usize")];
     if day == 0 || day > max_day {
         return None;
     }
@@ -1384,4 +1374,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= left ^ right;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{consent_status_str, constant_time_eq, ConsentStatus};
+
+    #[test]
+    fn private_helpers_cover_unreachable_public_edges() {
+        assert_eq!(consent_status_str(ConsentStatus::Pending), "pending");
+        assert!(!constant_time_eq(b"short", b"longer"));
+        assert_eq!(
+            super::iso_from_unix_millis(-62_167_219_200_001),
+            "-001-12-31T23:59:59.999Z"
+        );
+    }
 }

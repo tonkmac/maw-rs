@@ -10,6 +10,28 @@ use std::{
 };
 
 #[test]
+fn plugin_create_error_display_matches_command_messages() {
+    let dest = PathBuf::from("plugins/existing");
+    assert!(PluginCreateError::MissingType
+        .to_string()
+        .contains("Specify either --rust or --as"));
+    assert_eq!(
+        PluginCreateError::ConflictingTypes.to_string(),
+        "  Specify --rust or --as, not both"
+    );
+    assert!(PluginCreateError::MissingName
+        .to_string()
+        .contains("maw plugin create"));
+    assert_eq!(
+        PluginCreateError::Scaffold("template exploded".to_owned()).to_string(),
+        "✗ template exploded"
+    );
+    assert!(PluginCreateError::DestinationExists(dest)
+        .to_string()
+        .contains("plugins/existing"));
+}
+
+#[test]
 fn validate_plugin_name_accepts_simple_lowercase_name() {
     assert_eq!(validate_plugin_name("hello"), None);
 }
@@ -259,6 +281,46 @@ fn scaffold_as_writes_readme_at_destination() {
 }
 
 #[test]
+fn scaffold_as_allows_template_without_package_json() {
+    let root = unique_temp_dir("scaffold-as-no-package");
+    let template = root.join("template");
+    fs::create_dir_all(template.join("assembly")).expect("create assembly dir");
+    fs::write(
+        template.join("assembly").join("index.ts"),
+        "export function handle(): i32 { return 0; }\n",
+    )
+    .expect("write assembly source");
+    let dest = root.join("my-as-plugin");
+
+    scaffold_as("my-as-plugin", &dest, &template)
+        .expect("scaffold as succeeds without package json");
+
+    assert!(dest.join("plugin.json").exists());
+    assert!(!dest.join("package.json").exists());
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn scaffold_as_rejects_invalid_package_json_shapes() {
+    let root = unique_temp_dir("scaffold-as-invalid-package");
+    let template = root.join("template");
+    make_as_template(&template);
+    fs::write(template.join("package.json"), "not json").expect("write invalid json");
+
+    let err = scaffold_as("my-as-plugin", root.join("bad-json"), &template)
+        .expect_err("invalid package json should fail");
+    assert!(err.to_string().contains("package.json: invalid JSON"));
+
+    fs::write(template.join("package.json"), "[]").expect("write non-object json");
+    let err = scaffold_as("my-as-plugin", root.join("non-object"), &template)
+        .expect_err("non-object package json should fail");
+    assert!(err
+        .to_string()
+        .contains("package.json: must be a JSON object"));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn scaffold_as_throws_if_template_directory_does_not_exist() {
     let root = unique_temp_dir("scaffold-as-missing");
     let err = scaffold_as(
@@ -381,6 +443,67 @@ fn cmd_plugin_create_rejects_missing_or_invalid_name() {
         .expect_err("invalid name should fail");
     assert!(matches!(err, PluginCreateError::InvalidName(_)));
     assert!(err.to_string().contains("Invalid plugin name"));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cmd_plugin_create_dispatches_rust_and_assemblyscript_scaffolds() {
+    let root = unique_temp_dir("cmd-plugin-dispatch");
+    let rust_template = root.join("rust-template");
+    let as_template = root.join("as-template");
+    make_rust_template(&rust_template, "../../maw-plugin-sdk");
+    make_as_template(&as_template);
+
+    let rust_dest = root.join("rust-plugin");
+    cmd_plugin_create(
+        &PluginCreateRequest {
+            name: Some("rust-plugin".to_owned()),
+            rust: true,
+            assembly_script: false,
+            dest: rust_dest.clone(),
+        },
+        &rust_template,
+        &as_template,
+        "/fake/sdk",
+    )
+    .expect("rust dispatch succeeds");
+    assert!(rust_dest.join("Cargo.toml").exists());
+
+    let as_dest = root.join("as-plugin");
+    cmd_plugin_create(
+        &PluginCreateRequest {
+            name: Some("as-plugin".to_owned()),
+            rust: false,
+            assembly_script: true,
+            dest: as_dest.clone(),
+        },
+        &rust_template,
+        &as_template,
+        "/fake/sdk",
+    )
+    .expect("as dispatch succeeds");
+    assert!(as_dest.join("package.json").exists());
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cmd_plugin_create_wraps_scaffold_errors() {
+    let root = unique_temp_dir("cmd-plugin-scaffold-error");
+    let err = cmd_plugin_create(
+        &PluginCreateRequest {
+            name: Some("my-plugin".to_owned()),
+            rust: true,
+            assembly_script: false,
+            dest: root.join("my-plugin"),
+        },
+        root.join("missing-rust-template"),
+        root.join("missing-as-template"),
+        "/fake/sdk",
+    )
+    .expect_err("missing template should be wrapped");
+
+    assert!(matches!(err, PluginCreateError::Scaffold(_)));
+    assert!(err.to_string().contains("Rust template not found"));
     fs::remove_dir_all(root).ok();
 }
 

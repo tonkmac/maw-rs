@@ -31,6 +31,8 @@ fn peer_impl_validation_matches_maw_js_alias_and_url_contract() {
         .unwrap()
         .contains("^[a-z0-9][a-z0-9_-]{0,31}$"));
     assert!(validate_peer_alias("_bad").is_some());
+    assert!(validate_peer_alias("").is_some());
+    assert!(validate_peer_alias("bad!").is_some());
     assert!(validate_peer_alias(&"a".repeat(33)).is_some());
 
     assert_eq!(validate_peer_url("http://127.0.0.1:1"), None);
@@ -39,6 +41,12 @@ fn peer_impl_validation_matches_maw_js_alias_and_url_contract() {
         .unwrap()
         .contains("must be http:// or https://"));
     assert!(validate_peer_url("not a url")
+        .unwrap()
+        .contains("invalid URL"));
+    assert!(validate_peer_url("http://")
+        .unwrap()
+        .contains("invalid URL"));
+    assert!(validate_peer_url("https://bad host")
         .unwrap()
         .contains("invalid URL"));
 }

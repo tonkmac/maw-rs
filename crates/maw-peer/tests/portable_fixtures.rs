@@ -1,6 +1,6 @@
 use maw_peer::{
-    resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
-    PeerSourceKind, PeerSourceMode,
+    parse_peer_source_mode, resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig,
+    PeerConfig, PeerSourceKind, PeerSourceMode,
 };
 use serde::Deserialize;
 
@@ -117,6 +117,74 @@ fn source_name(source: PeerSourceKind) -> &'static str {
         PeerSourceKind::Config => "config",
         PeerSourceKind::Scout => "scout",
     }
+}
+
+#[test]
+fn peer_source_helpers_cover_mode_names_and_unavailable_scout_edges() {
+    assert_eq!(PeerSourceMode::Config.as_str(), "config");
+    assert_eq!(PeerSourceMode::Scout.as_str(), "scout");
+    assert_eq!(PeerSourceMode::Both.as_str(), "both");
+    assert_eq!(PeerSourceKind::Config.as_str(), "config");
+    assert_eq!(PeerSourceKind::Scout.as_str(), "scout");
+
+    assert_eq!(
+        parse_peer_source_mode(None, PeerSourceMode::Both),
+        Some(PeerSourceMode::Both)
+    );
+    assert_eq!(
+        parse_peer_source_mode(Some(""), PeerSourceMode::Config),
+        Some(PeerSourceMode::Config)
+    );
+    assert_eq!(
+        parse_peer_source_mode(Some("config"), PeerSourceMode::Both),
+        Some(PeerSourceMode::Config)
+    );
+    assert_eq!(
+        parse_peer_source_mode(Some("scout"), PeerSourceMode::Both),
+        Some(PeerSourceMode::Scout)
+    );
+    assert_eq!(
+        parse_peer_source_mode(Some("both"), PeerSourceMode::Config),
+        Some(PeerSourceMode::Both)
+    );
+    assert_eq!(
+        parse_peer_source_mode(Some("invalid"), PeerSourceMode::Both),
+        None
+    );
+
+    let missing = resolve_peer_sources(&PeerConfig::default(), PeerSourceMode::Scout, None);
+    assert_eq!(missing.fetch_calls, 1);
+    assert!(missing.peers.is_empty());
+    assert_eq!(
+        missing.warnings,
+        vec!["scout unavailable (missing_discoveries)".to_owned()]
+    );
+
+    let no_hint = resolve_peer_sources(
+        &PeerConfig::default(),
+        PeerSourceMode::Both,
+        Some(&DiscoveryResult::Err {
+            error: "offline".to_owned(),
+            hint: None,
+        }),
+    );
+    assert_eq!(no_hint.warnings, vec!["scout unavailable (offline)"]);
+
+    let host_fallback = resolve_peer_sources(
+        &PeerConfig::default(),
+        PeerSourceMode::Scout,
+        Some(&DiscoveryResult::Ok {
+            peers: vec![DiscoveryRow {
+                node: None,
+                oracle: Some("oracle".to_owned()),
+                host: Some("host.local".to_owned()),
+                locators: vec!["tcp://ignored".to_owned(), "HTTPS://host.local".to_owned()],
+            }],
+        }),
+    );
+    assert_eq!(host_fallback.peers[0].name.as_deref(), Some("host.local"));
+    assert_eq!(host_fallback.peers[0].url, "HTTPS://host.local");
+    assert_eq!(host_fallback.peers[0].oracle.as_deref(), Some("oracle"));
 }
 
 #[test]

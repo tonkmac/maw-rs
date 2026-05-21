@@ -930,3 +930,183 @@ fn error(
         hint: hint.map(Into::into),
     }
 }
+
+#[cfg(test)]
+mod coverage_gap_tests {
+    use super::*;
+
+    fn window(index: u32, name: &str) -> Window {
+        Window {
+            index,
+            name: name.to_owned(),
+            active: index == 0,
+        }
+    }
+
+    fn session(name: &str, windows: Vec<Window>) -> Session {
+        Session {
+            name: name.to_owned(),
+            windows,
+            source: None,
+        }
+    }
+
+    fn config_with_node(node: &str) -> MawConfig {
+        MawConfig {
+            node: Some(node.to_owned()),
+            ..MawConfig::default()
+        }
+    }
+
+    #[test]
+    fn sync_apply_skips_conflicts_and_stale_without_force_or_prune() {
+        let diff = SyncDiff {
+            add: Vec::new(),
+            conflict: vec![SyncConflict {
+                oracle: "mawjs".to_owned(),
+                current: "mba".to_owned(),
+                proposed: "white".to_owned(),
+                from_peer: "white".to_owned(),
+            }],
+            stale: vec![StaleRoute {
+                oracle: "old".to_owned(),
+                peer_node: "white".to_owned(),
+            }],
+            unreachable: Vec::new(),
+        };
+        let current = HashMap::from([
+            ("mawjs".to_owned(), "mba".to_owned()),
+            ("old".to_owned(), "white".to_owned()),
+        ]);
+
+        let result = apply_sync_diff(&current, &diff, SyncApplyOptions::default());
+
+        assert_eq!(result.agents, current);
+        assert!(result.applied.is_empty());
+    }
+
+    #[test]
+    fn invalid_node_agent_query_reports_empty_side() {
+        assert_eq!(
+            resolve_target(":ghost", &config_with_node("white"), &[]),
+            ResolveResult::Error {
+                reason: "empty_node_or_agent".to_owned(),
+                detail: "invalid format: ':ghost'".to_owned(),
+                hint: Some("use node:agent format (e.g. mba:homekeeper)".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn self_node_alias_returns_self_node_target() {
+        let sessions = vec![session("pulse", vec![window(3, "pulse")])];
+
+        assert_eq!(
+            resolve_target("white:pulse", &config_with_node("white"), &sessions),
+            ResolveResult::SelfNode {
+                target: "pulse:3".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn exact_unnumbered_session_breaks_alias_tie() {
+        let sessions = vec![
+            session("47-mawjs", vec![window(0, "mawjs")]),
+            session("mawjs-oracle", vec![window(2, "mawjs")]),
+        ];
+
+        assert_eq!(
+            resolve_target("mawjs", &MawConfig::default(), &sessions),
+            ResolveResult::Local {
+                target: "47-mawjs:0".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn blank_alias_and_numeric_prefixed_candidates_are_defensive() {
+        assert!(resolve_session_alias_window_target("   ", &[], RouteType::Local).is_none());
+        assert_eq!(
+            fleet_window_candidate_names("47-mawjs-oracle"),
+            vec!["47-mawjs-oracle", "47-mawjs", "mawjs-oracle", "mawjs"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn find_window_supports_colon_first_window_and_numeric_fallbacks() {
+        let sessions = vec![session("dev", vec![window(5, "main")])];
+
+        assert_eq!(find_window(&sessions, "dev:"), Some("dev:5".to_owned()));
+        assert_eq!(find_window(&sessions, "dev:4"), Some("dev:4".to_owned()));
+        assert_eq!(
+            find_window(&sessions, "dev:4.2"),
+            Some("dev:4.2".to_owned())
+        );
+    }
+
+    #[test]
+    fn find_window_refuses_ambiguous_exact_session_or_window_matches() {
+        let duplicate_sessions = vec![
+            session("47-mawjs", vec![window(0, "left")]),
+            session("99-mawjs", vec![window(1, "right")]),
+        ];
+        assert_eq!(find_window(&duplicate_sessions, "mawjs"), None);
+
+        let duplicate_windows = vec![
+            session("alpha", vec![window(0, "oracle")]),
+            session("bravo", vec![window(0, "oracle")]),
+        ];
+        assert_eq!(find_window(&duplicate_windows, "oracle"), None);
+    }
+
+    #[test]
+    fn find_window_uses_unique_substring_window_or_session_match() {
+        let window_match = vec![session("alpha", vec![window(9, "mawjs-codex")])];
+        assert_eq!(
+            find_window(&window_match, "codex"),
+            Some("alpha:9".to_owned())
+        );
+
+        let session_match = vec![session("mawjs-session", vec![window(4, "main")])];
+        assert_eq!(
+            find_window(&session_match, "session"),
+            Some("mawjs-session:4".to_owned())
+        );
+
+        let ambiguous = vec![
+            session("alpha", vec![window(0, "mawjs-left")]),
+            session("bravo-mawjs", vec![window(1, "main")]),
+        ];
+        assert_eq!(find_window(&ambiguous, "mawjs"), None);
+    }
+
+    #[test]
+    fn find_window_direct_paths_cover_unique_exact_and_strict_fallbacks() {
+        let sessions = vec![session("alpha", vec![window(7, "main")])];
+        assert_eq!(find_window(&sessions, "alpha"), Some("alpha:7".to_owned()));
+        assert_eq!(
+            find_window(&sessions, "alpha:9"),
+            Some("alpha:9".to_owned())
+        );
+        assert_eq!(
+            match_session(&sessions, "alp", false).map(|session| session.name.as_str()),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn helper_functions_cover_non_matching_edges() {
+        assert_eq!(match_session(&[], "", true), None);
+        assert_eq!(split_pane_suffix("main."), ("main.", String::new()));
+        assert_eq!(split_pane_suffix("main.x"), ("main.x", String::new()));
+        assert!(!numeric_window_or_pane(""));
+        assert!(!numeric_window_or_pane("1."));
+        assert!(!numeric_window_or_pane("x.1"));
+        assert_eq!(strip_numeric_fleet_prefix("mawjs"), "mawjs");
+        assert_eq!(strip_numeric_fleet_prefix("dev-mawjs"), "dev-mawjs");
+    }
+}

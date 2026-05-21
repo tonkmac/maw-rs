@@ -224,31 +224,6 @@ fn format_scout_warning(error: &str, hint: Option<&str>) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parser_applies_fallback_and_rejects_unknown() {
-        assert_eq!(
-            parse_peer_source_mode(None, PeerSourceMode::Both),
-            Some(PeerSourceMode::Both)
-        );
-        assert_eq!(
-            parse_peer_source_mode(Some(""), PeerSourceMode::Config),
-            Some(PeerSourceMode::Config)
-        );
-        assert_eq!(
-            parse_peer_source_mode(Some("scout"), PeerSourceMode::Both),
-            Some(PeerSourceMode::Scout)
-        );
-        assert_eq!(
-            parse_peer_source_mode(Some("invalid"), PeerSourceMode::Both),
-            None
-        );
-    }
-}
-
 /// Structured peer probe failure code, ported from maw-js `probe.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeErrorCode {
@@ -1377,9 +1352,6 @@ fn parse_peer_store(raw: &str) -> Result<PeerStoreFile, String> {
         }
         None => serde_json::json!({}),
     };
-    if !peers.is_object() {
-        return Err("invalid store shape (expected { peers: { ... } } object)".to_owned());
-    }
     serde_json::from_value(serde_json::json!({ "version": 1, "peers": peers }))
         .map_err(|err| err.to_string())
 }

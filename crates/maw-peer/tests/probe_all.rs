@@ -174,6 +174,41 @@ fn probe_all_does_not_mutate_empty_store() {
 }
 
 #[test]
+fn probe_all_missing_probe_result_counts_as_unknown_success_and_all_ok_format_has_no_failure_suffix(
+) {
+    let result = probe_all_from_plan(&ProbeAllPlan {
+        timeout_ms: 2000,
+        now: "2026-05-18T12:00:00.000Z".to_owned(),
+        peers: vec![(
+            "solo".to_owned(),
+            peer("http://solo.local", Some("cached-node"), None, None),
+        )],
+        probe_results: vec![],
+        removed_before_mutate: vec![],
+    });
+
+    assert_eq!(result.ok_count, 1);
+    assert_eq!(result.fail_count, 0);
+    assert_eq!(result.worst_exit_code, 0);
+    assert_eq!(result.rows[0].node.as_deref(), Some("cached-node"));
+    assert_eq!(
+        result.rows[0].last_seen.as_deref(),
+        Some("2026-05-18T12:00:00.000Z")
+    );
+    assert_eq!(
+        result
+            .peers_after
+            .get("solo")
+            .and_then(|peer| peer.last_seen.as_deref()),
+        Some("2026-05-18T12:00:00.000Z")
+    );
+
+    let output = format_probe_all(&result);
+    assert!(output.contains("1/1 ok"), "{output}");
+    assert!(!output.contains("failed"), "{output}");
+}
+
+#[test]
 fn probe_all_skips_peers_removed_between_load_and_mutate() {
     let refused = error(ProbeErrorCode::Refused, "closed port");
     let result = probe_all_from_plan(&ProbeAllPlan {

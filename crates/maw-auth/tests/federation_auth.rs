@@ -94,6 +94,16 @@ fn hashing_and_signing_helpers_cover_v1_v2_v3_and_validation_branches() {
             .get("X-Maw-Auth-Version"),
         Some("v3")
     );
+    let get_default = sign_request_v3(PEER_KEY, FROM, "", "/api/send", NOW, None)
+        .expect("empty method defaults to GET");
+    assert_eq!(
+        get_default.signature,
+        direct_hmac(
+            PEER_KEY,
+            &build_from_sign_payload(FROM, NOW, "GET", "/api/send", "")
+        )
+    );
+    assert!(sign_headers_v3_at("", FROM, "POST", "/api/send", None, NOW).is_err());
     assert_eq!(
         resolve_from_address(&FromAddressConfig {
             oracle: None,
@@ -499,6 +509,27 @@ fn consent_request_plan_mirrors_pending_and_models_peer_post_failures() {
             .expect("pending")
             .summary,
         "hello"
+    );
+
+    let peer_ok = request_consent_plan(
+        &mut store,
+        ConsentRequestArgs {
+            from: "neo".to_owned(),
+            to: "mawjs".to_owned(),
+            action: ConsentAction::Hey,
+            summary: "peer ok".to_owned(),
+            peer_url: Some("http://peer:3456/".to_owned()),
+            request_id: "req-peer-ok".to_owned(),
+            pin: "ABCDEF".to_owned(),
+            now_ms: 1_767_312_000_000,
+            peer_post: PeerPostResult::Ok,
+        },
+    );
+    assert!(peer_ok.ok);
+    assert_eq!(peer_ok.peer_method.as_deref(), Some("POST"));
+    assert_eq!(
+        peer_ok.peer_url.as_deref(),
+        Some("http://peer:3456/api/consent/request")
     );
 
     let mut store = ConsentStore::default();
@@ -915,4 +946,239 @@ fn pair_api_auto_plan_returns_signed_identity_and_peer_add_plan() {
         success.proof.as_deref(),
         Some("95e63fc871ab14ce17c14e0046cd41b9dd305c086f1ed325fd2c5e62e6ee849f")
     );
+}
+
+#[test]
+fn additional_auth_edge_cases_cover_refuse_consumed_and_parse_errors() {
+    use maw_auth::{
+        pair_api_accept_plan, pair_api_probe_plan, pair_api_status_plan, verify_hmac_sig,
+        PairAcceptInput, PairApiConfig, PairCodeStore,
+    };
+
+    let unsigned = verify_req(Headers::new([("x-maw-from", FROM)]), b"", Some(PEER_KEY));
+    assert_eq!(unsigned.kind(), "refuse-unsigned");
+    assert!(is_refuse_decision(&unsigned));
+
+    let invalid_legacy = verify_req(
+        Headers::new([
+            ("x-maw-from", FROM),
+            ("x-maw-signature", &"0".repeat(64)),
+            ("x-maw-signed-at", "not-an-iso-date"),
+        ]),
+        b"",
+        Some(PEER_KEY),
+    );
+    assert_eq!(
+        invalid_legacy,
+        FromVerifyDecision::RefuseMalformed {
+            reason: "invalid-signed-at".to_owned()
+        }
+    );
+
+    assert!(!verify_hmac_sig(TOKEN, "payload", "00"));
+
+    let config = PairApiConfig {
+        node: "node-a".to_owned(),
+        oracle: "oracle-a".to_owned(),
+        port: 4567,
+        base_url: "http://localhost:4567".to_owned(),
+        federation_token: "token-a".to_owned(),
+        pubkey: "p".repeat(64),
+    };
+    let mut store = PairCodeStore::default();
+    let _ = store.register_at("ABC234", 60_000, 1_000);
+    let accepted = pair_api_accept_plan(
+        &mut store,
+        &config,
+        "ABC234",
+        Some(PairAcceptInput {
+            node: "remote".to_owned(),
+            url: Some("http://remote".to_owned()),
+        }),
+        1_000,
+    );
+    assert!(accepted.ok);
+
+    let consumed_probe = pair_api_probe_plan(&store, &config, "ABC234", 1_001);
+    assert_eq!(consumed_probe.status, 410);
+    assert_eq!(consumed_probe.error.as_deref(), Some("consumed"));
+
+    let consumed_accept = pair_api_accept_plan(
+        &mut store,
+        &config,
+        "ABC234",
+        Some(PairAcceptInput {
+            node: "remote".to_owned(),
+            url: Some("http://remote".to_owned()),
+        }),
+        1_001,
+    );
+    assert_eq!(consumed_accept.status, 410);
+    assert_eq!(consumed_accept.error.as_deref(), Some("consumed"));
+
+    let invalid_status = pair_api_status_plan(&store, "bad", 1_001);
+    assert_eq!(invalid_status.status, 400);
+    assert_eq!(invalid_status.error.as_deref(), Some("invalid_shape"));
+}
+
+fn pending_with_expires_at(expires_at: &str) -> maw_auth::PendingRequest {
+    maw_auth::PendingRequest {
+        id: "edge".to_owned(),
+        from: "neo".to_owned(),
+        to: "mawjs".to_owned(),
+        action: maw_auth::ConsentAction::Hey,
+        summary: "edge".to_owned(),
+        pin_hash: "hash".to_owned(),
+        created_at: "2026-01-02T00:00:00.000Z".to_owned(),
+        expires_at: expires_at.to_owned(),
+        status: maw_auth::ConsentStatus::Pending,
+    }
+}
+
+#[test]
+fn consent_reject_errors_keep_statuses_precise() {
+    use maw_auth::{
+        approve_consent_plan, reject_consent_plan, request_consent_plan, ConsentAction,
+        ConsentRequestArgs, ConsentStore, PeerPostResult,
+    };
+
+    let mut store = ConsentStore::default();
+    assert_eq!(
+        reject_consent_plan(&mut store, "missing").error.as_deref(),
+        Some("request not found: missing")
+    );
+
+    request_consent_plan(
+        &mut store,
+        ConsentRequestArgs {
+            from: "neo".to_owned(),
+            to: "mawjs".to_owned(),
+            action: ConsentAction::Hey,
+            summary: "reject me".to_owned(),
+            peer_url: None,
+            request_id: "req-reject".to_owned(),
+            pin: "ABCDEF".to_owned(),
+            now_ms: 1_767_312_000_000,
+            peer_post: PeerPostResult::Skipped,
+        },
+    );
+    assert!(reject_consent_plan(&mut store, "req-reject").ok);
+    assert_eq!(
+        reject_consent_plan(&mut store, "req-reject")
+            .error
+            .as_deref(),
+        Some("request is rejected, cannot reject")
+    );
+
+    let mut expired_store = ConsentStore::default();
+    request_consent_plan(
+        &mut expired_store,
+        ConsentRequestArgs {
+            from: "neo".to_owned(),
+            to: "mawjs".to_owned(),
+            action: ConsentAction::Hey,
+            summary: "expire me".to_owned(),
+            peer_url: None,
+            request_id: "req-expired".to_owned(),
+            pin: "ABCDEF".to_owned(),
+            now_ms: 1_767_312_000_000,
+            peer_post: PeerPostResult::Skipped,
+        },
+    );
+    assert_eq!(
+        approve_consent_plan(
+            &mut expired_store,
+            "req-expired",
+            "ABCDEF",
+            1_767_312_601_000
+        )
+        .error
+        .as_deref(),
+        Some("request is expired, cannot approve")
+    );
+}
+
+#[test]
+fn consent_expiry_parses_iso_fraction_and_calendar_edges() {
+    use maw_auth::{apply_consent_expiry, ConsentStatus};
+
+    for (expires_at, now_ms) in [
+        ("2026-01-02T00:01:00Z", 1_767_312_061_000),
+        ("2026-01-02T00:01:00.1Z", 1_767_312_060_101),
+        ("2026-01-02T00:01:00.12Z", 1_767_312_060_121),
+        ("2024-02-29T00:00:00Z", 1_709_164_801_000),
+        ("2023-02-28T23:59:59Z", 1_677_628_800_000),
+        ("1969-12-31T23:59:59Z", 0),
+        ("0000-01-01T00:00:00Z", 1),
+    ] {
+        assert_eq!(
+            apply_consent_expiry(&pending_with_expires_at(expires_at), now_ms).status,
+            ConsentStatus::Expired,
+            "timestamp {expires_at} should expire"
+        );
+    }
+}
+
+#[test]
+fn consent_expiry_ignores_invalid_iso_shapes() {
+    use maw_auth::{apply_consent_expiry, ConsentStatus};
+
+    for invalid in [
+        "2026-01-02-extraT00:01:00Z",
+        "2026-13-02T00:01:00Z",
+        "2026-01-32T00:01:00Z",
+        "2026-01-02T24:01:00Z",
+        "2026-01-02T00:01:00.aZ",
+        "",
+        "not-a-date",
+        "nopeT00:01:00Z",
+        "2026-nope-02T00:01:00Z",
+        "2026-01-nopeT00:01:00Z",
+        "2026-01-02Tbad:01:00Z",
+        "2026-01-02T00:bad:00Z",
+        "2026-01-02T00:01Z",
+        "2026T00:01:00Z",
+        "2026-01T00:01:00Z",
+        "2026-01-02T",
+        "2026-01-02T00",
+        "2026-01-02T00:01:nopeZ",
+    ] {
+        assert_eq!(
+            apply_consent_expiry(&pending_with_expires_at(invalid), i64::MAX).status,
+            ConsentStatus::Pending,
+            "invalid timestamp {invalid} must not expire"
+        );
+    }
+}
+
+#[test]
+fn auth_public_helpers_cover_map_conversion_status_names_and_validation_rejections() {
+    use maw_auth::{trust_key, ConsentAction};
+
+    let headers = Headers::new([("X-Test", "one")]);
+    let as_map = headers.to_btree_map();
+    assert_eq!(as_map.get("x-test").map(String::as_str), Some("one"));
+
+    assert_eq!(
+        trust_key("a", "b", ConsentAction::PluginInstall),
+        "a→b:plugin-install"
+    );
+    assert_eq!(
+        verify_req(Headers::new([] as [(&str, &str); 0]), b"", None).kind(),
+        "accept-legacy"
+    );
+    assert_eq!(
+        verify_req(
+            Headers::new([
+                ("x-maw-from", FROM),
+                ("x-maw-signature", &"0".repeat(64)),
+                ("x-maw-signed-at", "not-an-iso-date"),
+            ]),
+            b"",
+            Some(PEER_KEY),
+        )
+        .kind(),
+        "refuse-malformed"
+    );
+    assert!(!verify_hmac_sig(TOKEN, "payload", ""));
 }

@@ -218,6 +218,55 @@ fn invoke_plugin_wasm_reads_bytes_and_hands_off_to_runtime() {
     remove_dir_all(root).expect("cleanup");
 }
 
+#[test]
+fn invoke_plugin_help_renders_peer_and_all_hook_keys() {
+    let root = make_temp_dir("help-all-hooks");
+    let entry = root.join("index.ts");
+    write(&entry, b"export default () => ({ ok: true });\n").expect("entry");
+    let mut plugin = make_plugin(&root, LoadedPluginKind::Ts);
+    plugin.entry_path = Some(entry);
+    plugin.manifest.name = "fullhelp".to_owned();
+    plugin.manifest.transport = Some(PluginTransport { peer: Some(true) });
+    plugin.manifest.hooks = Some(PluginHooks {
+        gate: Some(vec!["cmd:before".to_owned()]),
+        filter: Some(vec!["message".to_owned()]),
+        on: Some(vec!["message:send".to_owned()]),
+        late: Some(vec!["after".to_owned()]),
+        wake: Some(maw_plugin_manifest::PluginLifecycleHook {
+            script: None,
+            handler: None,
+            ensures: None,
+            policy: None,
+        }),
+        sleep: Some(maw_plugin_manifest::PluginLifecycleHook {
+            script: None,
+            handler: None,
+            ensures: None,
+            policy: None,
+        }),
+        serve: Some(maw_plugin_manifest::PluginLifecycleHook {
+            script: None,
+            handler: None,
+            ensures: None,
+            policy: None,
+        }),
+    });
+
+    let result = invoke_plugin(&plugin, &cli(&["--help"]), &mut FakeRuntime::default());
+
+    assert!(result.ok);
+    let output = result.output.expect("output");
+    assert!(output.contains("peer: maw hey plugin:fullhelp"));
+    assert!(output.contains("hooks: gate, filter, on, late, wake, sleep, serve"));
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn loaded_plugin_kind_as_str_covers_wasm_variant() {
+    assert_eq!(LoadedPluginKind::Ts.as_str(), "ts");
+    assert_eq!(LoadedPluginKind::Wasm.as_str(), "wasm");
+}
+
 fn make_plugin(dir: &Path, kind: LoadedPluginKind) -> LoadedPlugin {
     LoadedPlugin {
         manifest: PluginManifest {

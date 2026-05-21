@@ -7,8 +7,69 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_plugin_manifest::{
     invoke_plugin, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin, LoadedPluginKind,
-    MvpWasmInvokeRuntime, PluginManifest,
+    MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest,
 };
+
+#[test]
+fn invoke_source_and_mvp_ts_runtime_report_metadata_contracts() {
+    assert_eq!(InvokeSource::Cli.as_str(), "cli");
+    assert_eq!(InvokeSource::Api.as_str(), "api");
+    assert_eq!(InvokeSource::Peer.as_str(), "peer");
+
+    let root = make_temp_dir("ts-runtime-default");
+    let plugin = LoadedPlugin {
+        kind: LoadedPluginKind::Ts,
+        entry_path: Some(root.join("index.ts")),
+        ..write_wasm_plugin(&root, "ts-runtime-default", WASM_HANDLE_ZERO)
+    };
+    let result = MvpWasmInvokeRuntime.invoke_ts(
+        &plugin,
+        &InvokeContext {
+            source: InvokeSource::Api,
+            args: vec!["one".to_owned()],
+        },
+    );
+
+    assert_eq!(
+        result,
+        InvokeResult::error("TS plugin runtime is not available")
+    );
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn mvp_wasm_runtime_treats_out_of_bounds_or_empty_outputs_as_ok() {
+    let root = make_temp_dir("empty-output");
+    let empty = write_wasm_plugin(&root, "empty", WASM_EMPTY_OUTPUT_PTR);
+    let out_of_bounds = write_wasm_plugin(&root, "oob", WASM_OUT_OF_BOUNDS_PTR);
+
+    assert_eq!(
+        invoke_plugin(&empty, &cli(), &mut MvpWasmInvokeRuntime),
+        InvokeResult::ok()
+    );
+    assert_eq!(
+        invoke_plugin(&out_of_bounds, &cli(), &mut MvpWasmInvokeRuntime),
+        InvokeResult::ok()
+    );
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn mvp_wasm_runtime_rejects_truncated_sections_and_overlong_leb() {
+    let root = make_temp_dir("parse-errors");
+    let truncated = write_wasm_plugin(&root, "truncated", WASM_TRUNCATED_SECTION);
+    let overlong = write_wasm_plugin(&root, "overlong", WASM_OVERLONG_SECTION_LEB);
+
+    assert_error_contains(
+        &invoke_plugin(&truncated, &cli(), &mut MvpWasmInvokeRuntime),
+        "wasm compile error",
+    );
+    assert_error_contains(
+        &invoke_plugin(&overlong, &cli(), &mut MvpWasmInvokeRuntime),
+        "wasm compile error",
+    );
+    remove_dir_all(root).expect("cleanup");
+}
 
 #[test]
 fn mvp_wasm_runtime_rejects_malformed_wasm_like_maw_js() {
@@ -197,4 +258,26 @@ const WASM_BAD_INSTANTIATE: &[u8] = &[
 
 const WASM_BAD_COMPILE: [u8; 12] = [
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+];
+
+const WASM_EMPTY_OUTPUT_PTR: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+    0x7f, 0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x13, 0x02, 0x06, 0x6d, 0x65,
+    0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x06, 0x68, 0x61, 0x6e, 0x64, 0x6c, 0x65, 0x00, 0x00, 0x0a,
+    0x08, 0x01, 0x06, 0x00, 0x41, 0xe8, 0xfb, 0x03, 0x0b,
+];
+
+const WASM_OUT_OF_BOUNDS_PTR: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+    0x7f, 0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x13, 0x02, 0x06, 0x6d, 0x65,
+    0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x06, 0x68, 0x61, 0x6e, 0x64, 0x6c, 0x65, 0x00, 0x00, 0x0a,
+    0x08, 0x01, 0x06, 0x00, 0x41, 0x80, 0x80, 0x04, 0x0b,
+];
+
+const WASM_TRUNCATED_SECTION: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x10, 0x01,
+];
+
+const WASM_OVERLONG_SECTION_LEB: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
 ];

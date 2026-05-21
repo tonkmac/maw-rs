@@ -261,4 +261,23 @@ fn probe_peer_plan_classifies_fetch_failures_with_context() {
             .map(|err| err.message.as_str()),
         Some("fetch http://127.0.0.1:3456/info failed")
     );
+
+    let timeout_name = probe_peer_from_plan(&ProbePeerPlan {
+        url: "http://127.0.0.1:3456".to_owned(),
+        now: at(),
+        dns_error: None,
+        info: ProbeInfoOutcome::FetchName {
+            name: "TimeoutError".to_owned(),
+            message: "operation timed out".to_owned(),
+        },
+        identity: None,
+    });
+    assert_eq!(
+        timeout_name.error.as_ref().map(|err| err.code),
+        Some(ProbeErrorCode::Timeout)
+    );
+    assert_eq!(
+        timeout_name.error.as_ref().map(|err| err.message.as_str()),
+        Some("operation timed out")
+    );
 }

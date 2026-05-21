@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_plugin_manifest::{
     discover_packages, discover_packages_with_profile, hash_file, reset_discover_cache, satisfies,
-    DiscoverPackagesOptions, PluginNameAndTier, PluginTier,
+    scan_dirs, DiscoverPackagesOptions, PluginNameAndTier, PluginTier,
 };
 use serde_json::{json, Map, Value};
 
@@ -37,6 +37,46 @@ fn semver_satisfies_matches_maw_js_registry_helper_shapes() {
     assert!(satisfies("1.2.3", "<=1.2.3"));
     assert!(!satisfies("1.2.3", "<1.2.3"));
     assert!(!satisfies("not-semver", "*"));
+}
+
+#[test]
+fn scan_dirs_prefers_explicit_plugins_dir_then_maw_home_then_home() {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let original_plugins = std::env::var_os("MAW_PLUGINS_DIR");
+    let original_maw_home = std::env::var_os("MAW_HOME");
+    let original_home = std::env::var_os("HOME");
+
+    std::env::set_var("MAW_PLUGINS_DIR", "/tmp/maw-explicit-plugins");
+    std::env::remove_var("MAW_HOME");
+    std::env::set_var("HOME", "/tmp/maw-home-ignored");
+    assert_eq!(
+        scan_dirs(),
+        vec![PathBuf::from("/tmp/maw-explicit-plugins")]
+    );
+
+    std::env::remove_var("MAW_PLUGINS_DIR");
+    std::env::set_var("MAW_HOME", "/tmp/maw-home");
+    assert_eq!(scan_dirs(), vec![PathBuf::from("/tmp/maw-home/plugins")]);
+
+    std::env::remove_var("MAW_HOME");
+    std::env::set_var("HOME", "/tmp/real-home");
+    assert_eq!(
+        scan_dirs(),
+        vec![PathBuf::from("/tmp/real-home/.maw/plugins")]
+    );
+
+    restore_env("MAW_PLUGINS_DIR", original_plugins);
+    restore_env("MAW_HOME", original_maw_home);
+    restore_env("HOME", original_home);
+}
+
+#[test]
+fn semver_satisfies_rejects_bad_ranges_and_zero_major_caret_edges() {
+    assert!(!satisfies("1.2.3", "not-a-range"));
+    assert!(!satisfies("1.2.3", "1.2.3.4"));
+    assert!(!satisfies("0.0.4", "^0.0.3"));
+    assert!(satisfies("0.0.3", "^0.0.3"));
 }
 
 #[test]
@@ -284,6 +324,14 @@ fn discover_packages_applies_profile_filter_after_defaulting_missing_tiers_to_co
     assert_eq!(names(&report), vec!["registry-profile-legacy"]);
 
     remove_dir_all(root).expect("cleanup");
+}
+
+fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+    if let Some(value) = value {
+        std::env::set_var(key, value);
+    } else {
+        std::env::remove_var(key);
+    }
 }
 
 fn names(report: &maw_plugin_manifest::DiscoverPackagesReport) -> Vec<&str> {
