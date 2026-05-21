@@ -467,5 +467,6 @@ mod tests {
             Some("name is required")
         );
         assert!(validate_plugin_name("1bad").is_some());
+        assert!(!is_valid_plugin_name(""));
     }
 }

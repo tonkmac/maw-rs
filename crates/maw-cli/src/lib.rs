@@ -6008,13 +6008,12 @@ fn parse_federation_health_remote(
     value: &str,
 ) -> Result<(String, PeerFederationStatusResult), String> {
     let parts: Vec<&str> = value.split('|').collect();
-    let Some(url) = parts.first() else {
+    if parts.len() < 2 {
         return Err("federation-health: --remote must use <url|kind|...>".to_owned());
-    };
-    let Some(kind) = parts.get(1) else {
-        return Err("federation-health: --remote must use <url|kind|...>".to_owned());
-    };
-    let status = match *kind {
+    }
+    let url = parts[0];
+    let kind = parts[1];
+    let status = match kind {
         "missing-peers" if parts.len() == 2 => PeerFederationStatusResult::MissingPeers,
         "http" if parts.len() == 3 => PeerFederationStatusResult::HttpStatus(
             parts[2]
@@ -6037,7 +6036,7 @@ fn parse_federation_health_remote(
             )
         }
     };
-    Ok(((*url).to_owned(), status))
+    Ok((url.to_owned(), status))
 }
 
 fn parse_reachable(value: &str, prefix: &str) -> Result<bool, String> {
@@ -7977,11 +7976,12 @@ fn run_pair_code_plan(argv: &[String]) -> CliOutput {
     if code.is_some() && bytes.is_some() {
         return pair_code_usage_error("pair-code: expected exactly one of --code or --bytes");
     }
-    let raw_code = match (code, bytes) {
-        (Some(code), None) => code,
-        (None, Some(bytes)) => generate_pair_code_from_bytes(&bytes),
-        (None, None) => return pair_code_usage_error("pair-code: expected --code or --bytes"),
-        (Some(_), Some(_)) => unreachable!("validated above"),
+    let raw_code = if let Some(code) = code {
+        code
+    } else if let Some(bytes) = bytes {
+        generate_pair_code_from_bytes(&bytes)
+    } else {
+        return pair_code_usage_error("pair-code: expected --code or --bytes");
     };
     let normalized = normalize_pair_code(&raw_code);
     let pretty = pretty_pair_code(&normalized);
@@ -8179,16 +8179,15 @@ fn run_pair_code_store_plan(argv: &[String]) -> CliOutput {
     }
 
     let normalized = normalize_pair_code(&code);
-    let result = match mode {
-        "register" => {
-            let Some(ttl_ms) = ttl_ms else {
-                return pair_code_store_usage_error("pair-code-store: missing --ttl-ms value");
-            };
-            PairCodeStorePlanResult::Register(store.register_at(&code, ttl_ms, now_ms))
-        }
-        "lookup" => PairCodeStorePlanResult::Lookup(store.lookup_at(&code, now_ms)),
-        "consume" => PairCodeStorePlanResult::Lookup(store.consume_at(&code, now_ms)),
-        _ => unreachable!(),
+    let result = if mode == "register" {
+        let Some(ttl_ms) = ttl_ms else {
+            return pair_code_store_usage_error("pair-code-store: missing --ttl-ms value");
+        };
+        PairCodeStorePlanResult::Register(store.register_at(&code, ttl_ms, now_ms))
+    } else if mode == "lookup" {
+        PairCodeStorePlanResult::Lookup(store.lookup_at(&code, now_ms))
+    } else {
+        PairCodeStorePlanResult::Lookup(store.consume_at(&code, now_ms))
     };
 
     CliOutput {

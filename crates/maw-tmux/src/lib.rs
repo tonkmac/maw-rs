@@ -1585,9 +1585,7 @@ pub fn is_claude_like_pane(pane_current_command: Option<&str>) -> bool {
 
 fn is_three_part_numeric_version(value: &str) -> bool {
     let mut parts = value.split('.');
-    let Some(first) = parts.next() else {
-        return false;
-    };
+    let first = parts.next().unwrap_or_default();
     let Some(second) = parts.next() else {
         return false;
     };
@@ -2115,10 +2113,7 @@ pub fn format_session_created(epoch_seconds: Option<u64>) -> String {
     let Some(epoch_seconds) = epoch_seconds.filter(|epoch| *epoch > 0) else {
         return "—".to_owned();
     };
-    let days = epoch_seconds / 86_400;
-    let Ok(days) = i64::try_from(days) else {
-        return "—".to_owned();
-    };
+    let days = i64::try_from(epoch_seconds / 86_400).unwrap_or(i64::MAX);
     let seconds_of_day = epoch_seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
     let hour = seconds_of_day / 3_600;
@@ -4892,6 +4887,10 @@ mod coverage_gap_tests {
         );
         assert_eq!(
             active_duration_arg(&["--active".to_owned(), "--bad".to_owned()], "--active"),
+            None
+        );
+        assert_eq!(
+            active_duration_arg(&["--active=bad".to_owned()], "--active"),
             None
         );
     }

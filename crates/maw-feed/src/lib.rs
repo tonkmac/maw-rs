@@ -257,6 +257,11 @@ mod tests {
     }
 
     #[test]
+    fn days_in_month_rejects_zero_month() {
+        assert_eq!(days_in_month(2026, 0), None);
+    }
+
+    #[test]
     fn activity_descriptions_cover_empty_and_unknown_messages() {
         let event = FeedEvent {
             timestamp: "2026-05-21 00:00:00".to_owned(),

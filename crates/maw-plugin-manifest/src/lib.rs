@@ -2188,9 +2188,7 @@ fn is_semver_range(value: &str) -> bool {
 
 fn split_once_optional(value: &str, separator: char) -> (&str, bool) {
     let mut parts = value.split(separator);
-    let Some(first) = parts.next() else {
-        return (value, false);
-    };
+    let first = parts.next().unwrap_or(value);
     if parts.next().is_some_and(str::is_empty) {
         return (first, false);
     }
@@ -2202,9 +2200,7 @@ fn split_once_optional(value: &str, separator: char) -> (&str, bool) {
 
 fn is_semver_core(core: &str) -> bool {
     let mut parts = core.split('.');
-    let Some(major) = parts.next() else {
-        return false;
-    };
+    let major = parts.next().unwrap_or_default();
     let Some(minor) = parts.next() else {
         return false;
     };
@@ -2279,6 +2275,12 @@ mod tests {
         let empty = serde_json::json!({"module": {"exports": [], "path": "./mod.js"}});
         assert_eq!(
             parse_module(&empty).expect_err("empty exports"),
+            "plugin.json: module.exports must be a non-empty array of strings"
+        );
+
+        let non_string = serde_json::json!({"module": {"exports": ["ok", 1], "path": "./mod.js"}});
+        assert_eq!(
+            parse_module(&non_string).expect_err("non-string exports"),
             "plugin.json: module.exports must be a non-empty array of strings"
         );
     }
@@ -2375,6 +2377,23 @@ mod tests {
             ("1.2.3", false)
         );
         assert!(!is_semver_core("1..3"));
+    }
+
+    #[test]
+    fn wasm_module_parse_records_handle_result_from_code_section() {
+        let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        wasm.extend([0x03, 0x02, 0x01, 0x00]);
+        wasm.extend([
+            0x07, 0x13, 0x02, 0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00, 0x06, b'h',
+            b'a', b'n', b'd', b'l', b'e', 0x00, 0x00,
+        ]);
+        wasm.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b]);
+
+        let module = MvpWasmModule::parse(&wasm).expect("valid tiny module");
+
+        assert!(module.exports_handle);
+        assert!(module.exports_memory);
+        assert_eq!(module.handle_result, 42);
     }
 
     #[test]

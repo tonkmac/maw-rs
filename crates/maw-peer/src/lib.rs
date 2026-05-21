@@ -1959,6 +1959,31 @@ mod remaining_coverage_tests {
     }
 
     #[test]
+    fn peer_add_allows_matching_authenticated_and_probe_pubkeys() {
+        let plan = PeerAddPlan {
+            alias: "white".to_owned(),
+            url: "http://white:3456".to_owned(),
+            node: None,
+            authenticated_pubkey: Some("same-key".to_owned()),
+            authenticated_identity: None,
+            mark_symmetric_check: false,
+            one_way: None,
+            now: "2026-05-21T00:00:00Z".to_owned(),
+            peers: BTreeMap::new(),
+            probe: successful_probe(Some("same-key")),
+        };
+
+        let result = cmd_peer_add_from_plan(&plan).expect("peer add succeeds");
+
+        assert_eq!(result.pubkey_mismatch, None);
+        assert_eq!(result.peer.pubkey.as_deref(), Some("same-key"));
+        assert_eq!(
+            result.peers_after["white"].pubkey.as_deref(),
+            Some("same-key")
+        );
+    }
+
+    #[test]
     fn unreadable_peer_store_path_returns_empty_store() {
         let dir = temp_dir("unreadable");
         fs::create_dir_all(&dir).expect("create dir path");

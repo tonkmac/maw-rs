@@ -127,9 +127,7 @@ fn validate_claude_pane_policy(value: Option<&str>) -> Result<Option<ClaudePaneP
 
 fn is_three_part_numeric_version(value: &str) -> bool {
     let mut parts = value.split('.');
-    let Some(first) = parts.next() else {
-        return false;
-    };
+    let first = parts.next().unwrap_or_default();
     let Some(second) = parts.next() else {
         return false;
     };
