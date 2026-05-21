@@ -135,6 +135,7 @@ mod tests {
 
     #[test]
     fn keeps_non_numeric_prefixes_intact() {
+        assert_eq!(strip_numeric_prefix("feature"), "feature");
         assert_eq!(strip_numeric_prefix("abc-feature"), "abc-feature");
         assert_eq!(strip_numeric_prefix("1-feature"), "feature");
     }

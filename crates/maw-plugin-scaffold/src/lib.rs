@@ -406,10 +406,18 @@ fn copy_tree_entries(
 
 fn read_tree_entry(entry: io::Result<fs::DirEntry>) -> io::Result<TreeEntry> {
     let entry = entry?;
+    tree_entry_from_parts(entry.file_name(), entry.path(), entry.file_type())
+}
+
+fn tree_entry_from_parts(
+    file_name: std::ffi::OsString,
+    source_path: std::path::PathBuf,
+    file_type: io::Result<fs::FileType>,
+) -> io::Result<TreeEntry> {
     Ok(TreeEntry {
-        is_dir: entry.file_type()?.is_dir(),
-        file_name: entry.file_name(),
-        source_path: entry.path(),
+        is_dir: file_type?.is_dir(),
+        file_name,
+        source_path,
     })
 }
 
@@ -575,12 +583,11 @@ mod tests {
 
     #[test]
     fn copy_tree_private_entry_errors_are_covered() {
-        assert_eq!(
-            read_tree_entry(Err(io::ErrorKind::Other.into()))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Other
-        );
+        let err = read_tree_entry(Err(io::ErrorKind::Other.into())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let denied: io::Error = io::ErrorKind::PermissionDenied.into();
+        let err = tree_entry_from_parts("x".into(), "x".into(), Err(denied)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         let root = temp_dir("copy-entry-error");
         fs::create_dir_all(&root).expect("root");
         let err = copy_tree_entries([Err(io::ErrorKind::Interrupted.into())], &root).unwrap_err();

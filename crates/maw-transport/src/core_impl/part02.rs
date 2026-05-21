@@ -510,4 +510,3 @@ mod federation_symmetric_tests {
         assert_eq!(status.pairs[0].pair, PairHealth::HalfUp);
     }
 }
-

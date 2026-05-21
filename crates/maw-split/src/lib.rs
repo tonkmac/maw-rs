@@ -151,6 +151,7 @@ mod tests {
         assert!(is_claude_like_pane(Some("2.1.139")));
         assert!(!is_claude_like_pane(Some("2.1")));
         assert!(!is_claude_like_pane(Some("2.1.x")));
+        assert!(!is_claude_like_pane(Some("2.1.139.4")));
         assert!(!is_claude_like_pane(Some("")));
     }
 }
