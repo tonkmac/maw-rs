@@ -494,4 +494,65 @@ mod tests {
             .any(|warning| warning.contains("legacy plugin")));
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn manifest_error_helpers_cover_validation_tail_edges() {
+        let root = temp_dir("manifest-errors");
+
+        assert_eq!(
+            parse_manifest(
+                &serde_json::json!({"name":"Bad","version":"1.0.0","sdk":"*"}).to_string(),
+                &root,
+            )
+            .expect_err("invalid slug"),
+            "plugin.json: name must match /^[a-z0-9-]+$/ (got \"Bad\")"
+        );
+
+        assert_eq!(
+            parse_manifest(
+                &serde_json::json!({"name":"heavy","version":"1.0.0","sdk":"*","weight":100})
+                    .to_string(),
+                &root,
+            )
+            .expect_err("invalid weight"),
+            "plugin.json: weight must be a number 0-99 (lower = runs first, default 50)"
+        );
+
+        let missing_entry = parse_manifest(
+            &serde_json::json!({
+                "name":"missing-entry",
+                "version":"1.0.0",
+                "sdk":"*",
+                "entry":"missing.ts"
+            })
+            .to_string(),
+            &root,
+        )
+        .expect_err("missing declared entry");
+        assert!(missing_entry.contains("plugin.json: entry file not found:"));
+
+        assert_eq!(
+            split_once_optional("1.2.3-alpha-extra", '-'),
+            ("1.2.3", false)
+        );
+        assert!(!is_semver_core("1"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wasm_private_helpers_cover_remaining_control_edges() {
+        let mut module = MvpWasmModule::default();
+        parse_optional_code_section(&[0x00], None, 0, 1, &mut module)
+            .expect("missing handle export skips code parsing");
+        assert_eq!(module.handle_result, 0);
+
+        let err = parse_optional_code_section(&[0x00], Some(0), 0, 1, &mut module)
+            .expect_err("empty code section cannot contain exported handle body");
+        assert_eq!(err, "failed to parse WebAssembly module");
+
+        let mut memory = [1_u8, 2, 3, 4];
+        write_linear_memory(&mut memory, 4, b"ignored");
+        assert_eq!(memory, [1, 2, 3, 4]);
+    }
 }
