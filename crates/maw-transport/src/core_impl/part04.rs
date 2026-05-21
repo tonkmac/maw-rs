@@ -136,6 +136,22 @@ mod coverage_gap_tests {
     }
 
     #[test]
+    fn tmux_local_host_defaults_and_unknown_result_constructors_are_stable() {
+        assert!(is_local_host(None));
+        assert!(is_local_host(Some("local")));
+        assert!(!is_local_host(Some("remote")));
+        assert_eq!(
+            TransportResult::failure("none", TransportFailureReason::Unknown, false),
+            TransportResult {
+                ok: false,
+                via: "none".to_owned(),
+                reason: Some(TransportFailureReason::Unknown),
+                retryable: false,
+            }
+        );
+    }
+
+    #[test]
     fn classifier_recognizes_alternate_needles_and_rate_limit_shapes() {
         assert_eq!(
             classify_error(None),

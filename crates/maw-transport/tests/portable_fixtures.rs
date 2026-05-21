@@ -1,6 +1,7 @@
 use maw_transport::{
-    classify_error, ClassifiedError, Transport, TransportFailureReason, TransportResult,
-    TransportRouter, TransportTarget,
+    classify_error, ClassifiedError, HttpFederationTransport, HttpPostResult, HttpTransportConfig,
+    HttpTransportIo, TmuxTransportSession, TmuxTransportWindow, Transport, TransportFailureReason,
+    TransportResult, TransportRouter, TransportSession, TransportTarget,
 };
 use serde::Deserialize;
 use std::{cell::RefCell, rc::Rc};
@@ -194,4 +195,79 @@ fn transport_router_fixtures_match_maw_js_portable_spec() {
             }
         }
     }
+}
+
+struct UnresolvedThenHitIo;
+
+impl HttpTransportIo for UnresolvedThenHitIo {
+    fn list_local_sessions(&mut self) -> Result<Vec<TmuxTransportSession>, String> {
+        Ok(Vec::new())
+    }
+
+    fn get_all_sessions(
+        &mut self,
+        _: &[TmuxTransportSession],
+    ) -> Result<Vec<TransportSession>, String> {
+        Ok(vec![
+            remote_session("first", "http://first", 1),
+            remote_session("second", "http://second", 2),
+        ])
+    }
+
+    fn find_target_window(&mut self, sessions: &[TransportSession], _: &str) -> Option<String> {
+        (sessions[0].name == "second").then(|| "second:2".to_owned())
+    }
+
+    fn send_peer_keys(&mut self, source: &str, target: &str, _: &str) -> Result<bool, String> {
+        assert_eq!(source, "http://second");
+        assert_eq!(target, "second:2");
+        Ok(true)
+    }
+
+    fn post_peer_feed(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: u64,
+    ) -> Result<HttpPostResult, String> {
+        Ok(HttpPostResult {
+            ok: true,
+            status: 200,
+        })
+    }
+
+    fn timeout_for(&self, _: &str) -> u64 {
+        1
+    }
+}
+
+fn remote_session(name: &str, source: &str, index: u32) -> TransportSession {
+    TransportSession {
+        name: name.to_owned(),
+        source: Some(source.to_owned()),
+        windows: vec![TmuxTransportWindow {
+            index,
+            name: "mawjs".to_owned(),
+            active: false,
+        }],
+    }
+}
+
+#[test]
+fn http_transport_continues_after_unresolved_remote_window() {
+    let config = HttpTransportConfig {
+        peers: vec!["http://peer".to_owned()],
+        self_host: String::new(),
+    };
+    let mut transport = HttpFederationTransport::new(config, UnresolvedThenHitIo);
+
+    assert!(transport.send(
+        &TransportTarget {
+            oracle: "mawjs".to_owned(),
+            host: Some("remote".to_owned()),
+            tmux_target: None,
+        },
+        "hello"
+    ));
 }

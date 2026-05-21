@@ -581,4 +581,14 @@ mod coverage_gap_tests {
         );
     }
 
+    #[test]
+    fn find_window_preserves_pane_suffix_for_named_window() {
+        let sessions = vec![session("dev", vec![window(5, "main")])];
+
+        assert_eq!(
+            find_window(&sessions, "dev:main.2"),
+            Some("dev:5.2".to_owned())
+        );
+    }
+
 }

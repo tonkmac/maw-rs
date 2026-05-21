@@ -52,3 +52,17 @@ fn loader_surfaces_filesystem_errors_for_unusable_workspace_paths() {
     ));
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn loader_reports_json_directory_as_file_read_warning() {
+    let dir = temp_dir("json-dir");
+    let workspaces = workspaces_dir(&dir);
+    fs::create_dir_all(workspaces.join("nested.json")).expect("create json-named directory");
+
+    let report = load_workspace_configs(&dir).expect("directory entries should enumerate");
+
+    assert!(report.configs.is_empty());
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("failed to parse workspace config: nested.json"));
+    let _ = fs::remove_dir_all(dir);
+}

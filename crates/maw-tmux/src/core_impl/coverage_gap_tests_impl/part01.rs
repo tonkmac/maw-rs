@@ -427,3 +427,14 @@
         assert!(error.message.contains("failed to collect output from tmux"));
         assert!(error.message.contains("pipe closed"));
     }
+
+    #[test]
+    fn command_runner_writes_stdin_and_collects_stdout() {
+        let mut runner = CommandTmuxRunner::with_program("/bin/cat");
+
+        let output = runner
+            .run_with_stdin("-", &[], b"hello from stdin")
+            .expect("cat should echo stdin");
+
+        assert_eq!(output, "hello from stdin");
+    }

@@ -308,3 +308,18 @@ fn copy_tree_reports_unreadable_source_file() {
     let _ = fs::set_permissions(&file, original);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn scaffold_as_reports_missing_template_path() {
+    let root = temp_dir("as-missing-template");
+    let error = scaffold_as(
+        "missing-as",
+        root.join("dest"),
+        root.join("missing-template"),
+    )
+    .expect_err("missing AssemblyScript template should fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(error
+        .to_string()
+        .contains("AssemblyScript template not found"));
+}
