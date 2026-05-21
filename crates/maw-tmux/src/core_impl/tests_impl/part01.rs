@@ -456,6 +456,18 @@
                 session: "ghost-session".to_owned()
             }
         );
+        assert_eq!(
+            decide_tmux_attach_action(
+                "pulse",
+                &BTreeSet::from(["01-pulse".to_owned(), "02-pulse".to_owned()]),
+                false,
+                true,
+                false
+            ),
+            TmuxAttachAction::Recover {
+                session: "pulse".to_owned()
+            }
+        );
 
         assert_eq!(
             tmux_attach_spawn_command(&TmuxAttachAction::SwitchClient {
@@ -519,6 +531,14 @@
                 session: "05-volt".to_owned()
             }
         );
+
+        let numbered_preferred = BTreeSet::from(["05-volt".to_owned(), "volt-oracle".to_owned()]);
+        assert_eq!(
+            resolve_tmux_attach_session("volt", &numbered_preferred),
+            TmuxAttachSessionResolution::Match {
+                session: "05-volt".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -535,6 +555,12 @@
             resolve_tmux_attach_session("ghost", &alive),
             TmuxAttachSessionResolution::Missing {
                 session: "ghost".to_owned()
+            }
+        );
+        assert_eq!(
+            resolve_tmux_attach_session(" :0.1", &alive),
+            TmuxAttachSessionResolution::Missing {
+                session: String::new()
             }
         );
     }

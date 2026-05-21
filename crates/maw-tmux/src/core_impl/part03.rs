@@ -315,9 +315,6 @@ pub fn decide_tmux_attach_action(
             return TmuxAttachAction::Recover { session: query };
         }
     };
-    if !alive_sessions.contains(&session) {
-        return TmuxAttachAction::Recover { session };
-    }
     if print || !is_tty {
         return TmuxAttachAction::Print { session };
     }

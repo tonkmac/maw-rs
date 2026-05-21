@@ -12,7 +12,11 @@ fn main() {
 }
 
 fn main_code(argv: &[String]) -> i32 {
-    if let Some(code) = maybe_exec_attach(argv) {
+    main_code_with(argv, maybe_exec_attach)
+}
+
+fn main_code_with(argv: &[String], attach: impl FnOnce(&[String]) -> Option<i32>) -> i32 {
+    if let Some(code) = attach(argv) {
         return code;
     }
     let output = maw_cli::run_cli(argv);
@@ -119,7 +123,9 @@ fn attach_exec_tmux_args(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_exec_tmux_args, main_code, maybe_exec_attach_with, run_tmux_attach};
+    use super::{
+        attach_exec_tmux_args, main_code, main_code_with, maybe_exec_attach_with, run_tmux_attach,
+    };
     use std::{
         env,
         ffi::OsString,
@@ -257,6 +263,11 @@ mod tests {
             attach_exec_tmux_args(&args(&["a", "volt"]), true, false, &args(&["05-volt"])),
             Some(args(&["attach", "-t", "05-volt"]))
         );
+    }
+
+    #[test]
+    fn main_code_with_returns_fast_attach_status_without_running_cli() {
+        assert_eq!(main_code_with(&args(&["a", "50-mawjs"]), |_| Some(23)), 23);
     }
 
     #[test]
