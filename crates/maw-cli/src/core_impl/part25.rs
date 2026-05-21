@@ -209,7 +209,7 @@ fn parse_worktree_window(value: &str) -> Result<WorktreeWindow, String> {
     let mut parts = value.splitn(3, ':');
     let index = parts
         .next()
-        .ok_or_else(|| "worktree-window: missing window index".to_owned())?
+        .unwrap_or_default()
         .parse::<u32>()
         .map_err(|_| "worktree-window: invalid window index".to_owned())?;
     let Some(name) = parts.next() else {

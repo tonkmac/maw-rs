@@ -57,8 +57,9 @@ use maw_routing::{
 };
 use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
 use maw_tmux::{
-    mark_peer_targets_live, resolve_tmux_live_state, DiscoverLivePane, PeerTargetWithLive,
-    TmuxClient, TmuxLiveStateResult, TmuxPane,
+    decide_tmux_attach_action, mark_peer_targets_live, resolve_tmux_live_state,
+    tmux_attach_spawn_command, DiscoverLivePane, PeerTargetWithLive, TmuxAttachAction, TmuxClient,
+    TmuxLiveStateResult, TmuxPane,
 };
 use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
@@ -110,6 +111,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "plugin-scaffold" => run_plugin_scaffold_plan(&argv[1..]),
         "plugin-manifest" => run_plugin_manifest_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
+        "attach" | "a" => run_attach_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "ls" => run_ls_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -153,6 +155,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         },
     }
 }
+
 
 #[allow(clippy::too_many_lines)]
 fn run_auto_wake_plan(argv: &[String]) -> CliOutput {

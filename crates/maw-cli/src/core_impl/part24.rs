@@ -385,7 +385,7 @@ fn parse_route_window(value: &str) -> Result<RouteWindow, String> {
     let mut parts = value.splitn(3, ':');
     let index = parts
         .next()
-        .ok_or_else(|| "route: missing window index".to_owned())?
+        .unwrap_or_default()
         .parse::<u32>()
         .map_err(|_| "route: invalid window index".to_owned())?;
     let Some(name) = parts.next() else {
