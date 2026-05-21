@@ -75,3 +75,43 @@ fn substring_window_match_requires_a_single_candidate() {
         }
     );
 }
+
+#[test]
+fn remaining_alias_and_substring_edges_are_stable() {
+    assert_eq!(
+        resolve_target(
+            "mawjs",
+            &MawConfig::default(),
+            &[session("mawjs-oracle", vec![window(4, "main")])],
+        ),
+        ResolveResult::Local {
+            target: "mawjs-oracle:4".to_owned(),
+        }
+    );
+
+    assert_eq!(
+        resolve_target(
+            "mawjs",
+            &MawConfig::default(),
+            &[
+                session("101-mawjs", vec![window(1, "main")]),
+                session("mawjs-oracle", vec![window(2, "main")]),
+            ],
+        ),
+        ResolveResult::Local {
+            target: "101-mawjs:1".to_owned(),
+        }
+    );
+
+    assert!(matches!(
+        resolve_target(
+            "home",
+            &MawConfig::default(),
+            &[
+                session("alpha-home", vec![window(1, "main")]),
+                session("beta", vec![window(2, "homebase")]),
+            ],
+        ),
+        ResolveResult::Error { .. }
+    ));
+}
