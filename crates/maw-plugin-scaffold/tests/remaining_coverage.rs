@@ -287,3 +287,24 @@ fn copy_tree_reports_recursive_destination_conflict() {
     ));
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn copy_tree_reports_unreadable_source_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("copy-tree-unreadable-file");
+    let src = root.join("src");
+    let dest = root.join("dest");
+    let file = src.join("secret.txt");
+    fs::create_dir_all(&src).expect("src");
+    fs::write(&file, "secret").expect("source file");
+    let original = fs::metadata(&file).expect("metadata").permissions();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("chmod unreadable");
+
+    let error = copy_tree(&src, &dest).expect_err("unreadable source should reject copy");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    let _ = fs::set_permissions(&file, original);
+    let _ = fs::remove_dir_all(root);
+}

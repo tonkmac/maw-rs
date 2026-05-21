@@ -415,3 +415,15 @@
         assert_eq!(result.live[0].matches, vec!["scratch"]);
         assert_eq!(path_basename("////"), None);
     }
+
+    #[test]
+    fn io_error_formatter_includes_action_program_and_error() {
+        let error = tmux_program_io_error(
+            "collect output from",
+            std::ffi::OsStr::new("tmux"),
+            &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed"),
+        );
+
+        assert!(error.message.contains("failed to collect output from tmux"));
+        assert!(error.message.contains("pipe closed"));
+    }

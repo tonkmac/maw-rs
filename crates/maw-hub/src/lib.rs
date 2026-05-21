@@ -163,3 +163,45 @@ fn websocket_protocol(url: &str) -> Option<&str> {
     }
     Some(protocol)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_workspace_configs_sorts_valid_files_and_warns_on_invalid_ones() {
+        let root = std::env::temp_dir().join(format!("maw-hub-test-{}", std::process::id()));
+        let workspaces = workspaces_dir(&root);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&workspaces).expect("create workspaces");
+        fs::write(
+            workspaces.join("z.json"),
+            r#"{"id":"z","hubUrl":"wss://hub","token":"tok","sharedAgents":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspaces.join("a.json"),
+            r#"{"id":"a","hubUrl":"ws://hub","token":"tok","sharedAgents":["pulse"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspaces.join("bad.json"),
+            r#"{"id":"bad","hubUrl":"http://hub","token":"tok","sharedAgents":[]}"#,
+        )
+        .unwrap();
+
+        let report = load_workspace_configs(&root).expect("load configs");
+
+        assert_eq!(
+            report
+                .configs
+                .iter()
+                .map(|cfg| cfg.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "z"]
+        );
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("invalid workspace config"));
+        fs::remove_dir_all(&root).ok();
+    }
+}

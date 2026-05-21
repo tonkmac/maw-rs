@@ -237,3 +237,28 @@ fn peer_add_covers_legacy_no_pin_paths_without_symmetric_metadata() {
     assert_eq!(legacy_existing.peer.pubkey_first_seen, None);
     assert_eq!(legacy_existing.peer.last_symmetric_check, None);
 }
+
+#[test]
+fn probe_all_failure_persists_last_error_like_maw_js() {
+    let result = probe_all_from_plan(&ProbeAllPlan {
+        timeout_ms: 10,
+        now: now(),
+        peers: vec![("down".to_owned(), peer("https://down.example"))],
+        probe_results: vec![(
+            "https://down.example".to_owned(),
+            err_probe(ProbeErrorCode::Refused, "connection refused"),
+            9,
+        )],
+        removed_before_mutate: vec![],
+    });
+
+    assert_eq!(result.ok_count, 0);
+    assert_eq!(result.fail_count, 1);
+    let stored_error = result.peers_after["down"]
+        .last_error
+        .as_ref()
+        .expect("failed probe writes lastError");
+    assert_eq!(stored_error.code, ProbeErrorCode::Refused);
+    assert_eq!(stored_error.message, "connection refused");
+    assert_eq!(result.rows[0].error.as_ref(), Some(stored_error));
+}

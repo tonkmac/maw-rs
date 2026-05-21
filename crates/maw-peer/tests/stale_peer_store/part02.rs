@@ -69,3 +69,34 @@ impl Drop for TestDir {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
+
+#[test]
+fn valid_iso_timestamps_drive_stale_age_save_and_removal_paths() {
+    assert_eq!(
+        stale_age_ms(&peer("1970-01-01T00:00:00.001Z", None), 2),
+        Some(1)
+    );
+    assert_eq!(
+        stale_age_ms(&peer("2026-05-21T12:34:56.789Z", None), 1_779_366_896_790),
+        Some(1)
+    );
+
+    let tmp = TestDir::new("maw-rs-valid-iso-removal");
+    let file = tmp.path().join("peers.json");
+    let env = PeerStoreEnv::with_vars(
+        tmp.path(),
+        [
+            ("PEERS_FILE", file.to_string_lossy().into_owned()),
+            ("MAW_PEER_STALE_TTL_MS", DAY_MS.to_string()),
+        ],
+    );
+    save_peer_store(
+        &env,
+        &store_from([("old", "http://old.local", iso_days_ago(3), None)]),
+    )
+    .expect("save peer store through atomic JSON writer");
+
+    let removed = remove_stale_peers(&env, NOW_MS).expect("remove stale peer");
+    assert_eq!(removed.message, "removed 1 stale peer");
+    assert!(load_peer_store(&env).peers.is_empty());
+}

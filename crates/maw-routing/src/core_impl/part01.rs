@@ -437,6 +437,22 @@ mod federation_sync_tests {
         );
         assert_eq!(result.applied.len(), 3);
     }
+
+    #[test]
+    fn duplicate_node_identity_keeps_first_peer_claims_only() {
+        let diff = compute_sync_diff(
+            &HashMap::new(),
+            &[
+                peer("white-a", "white", &["pulse"], true),
+                peer("white-b", "white", &["ghost"], true),
+            ],
+            "oracle-world",
+        );
+
+        assert_eq!(diff.add.len(), 1);
+        assert_eq!(diff.add[0].oracle, "pulse");
+    }
+
 }
 
 /// Routing resolution result.

@@ -549,4 +549,36 @@ mod coverage_gap_tests {
         assert_eq!(strip_numeric_fleet_prefix("mawjs"), "mawjs");
         assert_eq!(strip_numeric_fleet_prefix("dev-mawjs"), "dev-mawjs");
     }
+
+    #[test]
+    fn peer_url_lookup_prefers_named_peer_then_peer_substring() {
+        let config = MawConfig {
+            named_peers: vec![NamedPeer {
+                name: "white".to_owned(),
+                url: "http://white".to_owned(),
+            }],
+            peers: vec!["http://mba:3456".to_owned()],
+            ..MawConfig::default()
+        };
+
+        assert_eq!(
+            find_peer_url("white", &config),
+            Some("http://white".to_owned())
+        );
+        assert_eq!(
+            find_peer_url("mba", &config),
+            Some("http://mba:3456".to_owned())
+        );
+        assert_eq!(find_peer_url("ghost", &config), None);
+    }
+
+    #[test]
+    fn oracle_suffixed_alias_is_left_for_agent_routing() {
+        let sessions = vec![session("mawjs", vec![window(0, "mawjs")])];
+        assert!(
+            resolve_session_alias_window_target("mawjs-oracle", &sessions, RouteType::Local)
+                .is_none()
+        );
+    }
+
 }
