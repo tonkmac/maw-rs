@@ -7600,6 +7600,9 @@ fn run_pair_code_store_plan(argv: &[String]) -> CliOutput {
             "pair-code-store: expected register, lookup, or consume",
         );
     };
+    if mode == "constants" {
+        return run_pair_code_store_constants_plan(&argv[1..]);
+    }
     if !matches!(mode, "register" | "lookup" | "consume") {
         return pair_code_store_usage_error(
             "pair-code-store: expected register, lookup, or consume",
@@ -7761,6 +7764,48 @@ fn render_pair_code_store_plan_json(
     )
 }
 
+fn run_pair_code_store_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            arg => {
+                return pair_code_store_constants_usage_error(&format!(
+                    "pair-code-store constants: unknown arg {arg}"
+                ))
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_pair_code_store_constants_json()
+        } else {
+            "pair-code-store constants modes=register,lookup,consume states=live,not-found,expired,consumed seed=code:ttl_ms:created_at_ms\n".to_owned()
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_pair_code_store_constants_json() -> String {
+    r#"{"command":"pair-code-store","action":"constants","modes":["register","lookup","consume"],"states":["live","not-found","expired","consumed"],"seedCodeShape":"code:ttl_ms:created_at_ms","entryFields":["code","expiresAt","createdAt","consumed"],"normalization":"normalize-pair-code","registerRequires":["ttl-ms"],"lookupRequires":["code","now"]}
+"#
+    .to_owned()
+}
+
+fn pair_code_store_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", pair_code_store_constants_usage()),
+    }
+}
+
+fn pair_code_store_constants_usage() -> &'static str {
+    "usage: maw-rs pair-code-store constants [--plan-json]"
+}
+
 fn pair_code_store_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
@@ -7770,7 +7815,8 @@ fn pair_code_store_usage_error(message: &str) -> CliOutput {
 }
 
 fn pair_code_store_usage() -> &'static str {
-    "usage: maw-rs pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]"
+    "usage: maw-rs pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]
+       maw-rs pair-code-store constants [--plan-json]"
 }
 
 fn run_pair_api_constants_plan(argv: &[String]) -> CliOutput {
@@ -10183,7 +10229,7 @@ fn usage_text() -> String {
   discover constants [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]
   federation-health constants [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]
   federation-identity constants [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]
-  federation-sync constants [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-constants [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]\n  consent-expiry --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...> --now <ms> [--plan-json]\n  consent-cleanup --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>... --delete <id> [--plan-json]\n  consent-trust-revoke [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --revoke <from:to:action> [--plan-json]\n  consent-trust-check [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --check <from:to:action> [--plan-json]\n  consent-pending-read [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --id <id> [--plan-json]\n  consent-pending-status [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --set-status <id:pending|approved|rejected|expired> [--plan-json]\n  recent-hello [--hello <zid:seen_at_ms>]... --zid <zid> --now <ms> [--plan-json]\n  recent-hello constants [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  pair-code constants [--plan-json]\n  pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]\n  pair-api <generate|probe|accept|status> --code <code> --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--plan-json]\n  pair-api constants [--plan-json]\n  pair-api-auto --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--plan-json]\n  pair-api-auto constants [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  federation-sync constants [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-constants [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]\n  consent-expiry --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...> --now <ms> [--plan-json]\n  consent-cleanup --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>... --delete <id> [--plan-json]\n  consent-trust-revoke [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --revoke <from:to:action> [--plan-json]\n  consent-trust-check [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --check <from:to:action> [--plan-json]\n  consent-pending-read [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --id <id> [--plan-json]\n  consent-pending-status [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --set-status <id:pending|approved|rejected|expired> [--plan-json]\n  recent-hello [--hello <zid:seen_at_ms>]... --zid <zid> --now <ms> [--plan-json]\n  recent-hello constants [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  pair-code constants [--plan-json]\n  pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]\n  pair-code-store constants [--plan-json]\n  pair-api <generate|probe|accept|status> --code <code> --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--plan-json]\n  pair-api constants [--plan-json]\n  pair-api-auto --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--plan-json]\n  pair-api-auto constants [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe constants [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
