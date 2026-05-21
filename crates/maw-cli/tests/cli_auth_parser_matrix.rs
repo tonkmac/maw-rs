@@ -85,6 +85,10 @@ fn auth_sign_parsers_cover_optional_value_branches() {
         "auth sign-v1: unknown argument --odd",
     );
     usage(
+        &["auth", "sign-headers", "--now", NOW],
+        "auth sign-headers: --token is required",
+    );
+    usage(
         &["auth", "sign-headers", "--now", "bad", "--token", "tok"],
         "auth sign-headers: --now must be an integer",
     );
@@ -147,6 +151,19 @@ fn auth_verify_v1_parser_covers_all_value_and_required_branches() {
     usage(
         &["auth", "verify-v1", "--odd"],
         "auth verify-v1: unknown argument --odd",
+    );
+    usage(
+        &[
+            "auth",
+            "verify-v1",
+            "--token",
+            "tok",
+            "--signature",
+            "sig",
+            "--signed-at",
+            NOW,
+        ],
+        "auth verify-v1: --now is required",
     );
     usage(
         &[

@@ -2,7 +2,9 @@ use std::fs::{create_dir_all, remove_dir_all, write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use maw_plugin_manifest::{load_manifest_from_dir, parse_cli, parse_manifest, LoadedPluginKind};
+use maw_plugin_manifest::{
+    load_manifest_from_dir, parse_cli, parse_manifest, CliFlagKind, LoadedPluginKind, PluginTier,
+};
 use serde_json::json;
 
 #[test]
@@ -13,6 +15,24 @@ fn sparse_cli_capability_manifest_and_wasm_only_load_cover_line_edges() {
         .expect("valid sparse cli")
         .expect("cli present");
     assert_eq!(cli.flags, None);
+
+    let flagged = parse_manifest(
+        &json!({
+            "name": "typed-cli",
+            "version": "1.0.0",
+            "sdk": "*",
+            "tier": "extra",
+            "cli": { "command": "typed", "flags": { "--count": "number" } }
+        })
+        .to_string(),
+        &root,
+    )
+    .expect("number flag manifest parses");
+    assert_eq!(flagged.tier, Some(PluginTier::Extra));
+    assert_eq!(
+        flagged.cli.expect("cli").flags.expect("flags")["--count"],
+        CliFlagKind::Number
+    );
 
     let parsed = parse_manifest(
         &json!({
