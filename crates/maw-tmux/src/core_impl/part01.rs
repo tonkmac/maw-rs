@@ -265,6 +265,14 @@ pub enum TmuxAttachAction {
     Recover { session: String },
 }
 
+/// Session-name resolution selected before a high-level attach action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxAttachSessionResolution {
+    Match { session: String },
+    Ambiguous { query: String, candidates: Vec<String> },
+    Missing { session: String },
+}
+
 /// Spawn command selected by `cmdTmuxAttach` or its recovery path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {

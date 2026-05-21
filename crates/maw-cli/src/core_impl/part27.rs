@@ -572,4 +572,6 @@ mod remaining_cli_private_coverage_tests {
         assert!(rendered.contains("\"status\":\"unknown\""));
         assert!(!rendered.contains("lastActivityAgeSec"));
     }
+    include!("attach_private_tests.rs");
+
 }

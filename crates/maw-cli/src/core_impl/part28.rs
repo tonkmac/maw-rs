@@ -41,8 +41,15 @@ fn run_attach_plan(argv: &[String]) -> CliOutput {
         let mut client = TmuxClient::local();
         alive = client.list_session_names().into_iter().collect();
     }
+    let resolved_target = match resolve_tmux_attach_session(&target, &alive) {
+        TmuxAttachSessionResolution::Match { session }
+        | TmuxAttachSessionResolution::Missing { session } => session,
+        TmuxAttachSessionResolution::Ambiguous { candidates, .. } => {
+            return attach_ambiguous_error(&target, &candidates);
+        }
+    };
     let in_tmux = std::env::var_os("TMUX").is_some();
-    let action = decide_tmux_attach_action(&target, &alive, print || plan_json, false, in_tmux);
+    let action = decide_tmux_attach_action(&resolved_target, &alive, print || plan_json, false, in_tmux);
     let session = match &action {
         TmuxAttachAction::Print { session }
         | TmuxAttachAction::SwitchClient { session }
@@ -59,6 +66,17 @@ fn run_attach_plan(argv: &[String]) -> CliOutput {
         code,
         stdout,
         stderr: String::new(),
+    }
+}
+
+fn attach_ambiguous_error(target: &str, candidates: &[String]) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "attach: '{target}' matches multiple sessions: {}\n  use the full name: maw-rs attach <exact-session>\n",
+            candidates.join(", ")
+        ),
     }
 }
 

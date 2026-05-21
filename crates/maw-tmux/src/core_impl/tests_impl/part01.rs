@@ -491,3 +491,50 @@
         );
     }
 
+    #[test]
+    fn tmux_attach_session_resolution_prefers_exact_then_fuzzy() {
+        let alive = BTreeSet::from([
+            "05-volt".to_owned(),
+            "mawjs-codex".to_owned(),
+            "50-mawjs-codex".to_owned(),
+            "volt".to_owned(),
+        ]);
+        assert_eq!(
+            resolve_tmux_attach_session("volt", &alive),
+            TmuxAttachSessionResolution::Match {
+                session: "volt".to_owned()
+            }
+        );
+        assert_eq!(
+            resolve_tmux_attach_session("mawjscodex", &alive),
+            TmuxAttachSessionResolution::Match {
+                session: "50-mawjs-codex".to_owned()
+            }
+        );
+
+        let only_numbered = BTreeSet::from(["05-volt".to_owned()]);
+        assert_eq!(
+            resolve_tmux_attach_session("volt", &only_numbered),
+            TmuxAttachSessionResolution::Match {
+                session: "05-volt".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_attach_session_resolution_refuses_loose_ambiguity() {
+        let alive = BTreeSet::from(["05-calliope".to_owned(), "06-caller".to_owned()]);
+        assert_eq!(
+            resolve_tmux_attach_session("call", &alive),
+            TmuxAttachSessionResolution::Ambiguous {
+                query: "call".to_owned(),
+                candidates: vec!["05-calliope".to_owned(), "06-caller".to_owned()]
+            }
+        );
+        assert_eq!(
+            resolve_tmux_attach_session("ghost", &alive),
+            TmuxAttachSessionResolution::Missing {
+                session: "ghost".to_owned()
+            }
+        );
+    }
