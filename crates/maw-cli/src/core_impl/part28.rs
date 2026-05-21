@@ -50,12 +50,7 @@ fn run_attach_plan(argv: &[String]) -> CliOutput {
     };
     let in_tmux = std::env::var_os("TMUX").is_some();
     let action = decide_tmux_attach_action(&resolved_target, &alive, print || plan_json, false, in_tmux);
-    let session = match &action {
-        TmuxAttachAction::Print { session }
-        | TmuxAttachAction::SwitchClient { session }
-        | TmuxAttachAction::Attach { session }
-        | TmuxAttachAction::Recover { session } => session,
-    };
+    let session = attach_action_session(&action);
     let stdout = if plan_json {
         render_attach_plan_json(&target, session, &action, readonly)
     } else {
@@ -146,24 +141,24 @@ fn render_attach_plan_json(
 
 fn attach_command_args(action: &TmuxAttachAction, readonly: bool) -> Vec<String> {
     if readonly {
-        let session = match action {
-            TmuxAttachAction::Print { session }
-            | TmuxAttachAction::SwitchClient { session }
-            | TmuxAttachAction::Attach { session }
-            | TmuxAttachAction::Recover { session } => session,
-        };
-        return vec!["attach".to_owned(), "-r".to_owned(), "-t".to_owned(), session.clone()];
+        return vec![
+            "attach".to_owned(),
+            "-r".to_owned(),
+            "-t".to_owned(),
+            attach_action_session(action).to_owned(),
+        ];
     }
     tmux_attach_spawn_command(action).map_or_else(
-        || {
-            let session = match action {
-                TmuxAttachAction::Print { session }
-                | TmuxAttachAction::SwitchClient { session }
-                | TmuxAttachAction::Attach { session }
-                | TmuxAttachAction::Recover { session } => session,
-            };
-            vec!["attach".to_owned(), "-t".to_owned(), session.clone()]
-        },
+        || vec!["attach".to_owned(), "-t".to_owned(), attach_action_session(action).to_owned()],
         |command| command.args,
     )
+}
+
+fn attach_action_session(action: &TmuxAttachAction) -> &str {
+    match action {
+        TmuxAttachAction::Print { session }
+        | TmuxAttachAction::SwitchClient { session }
+        | TmuxAttachAction::Attach { session }
+        | TmuxAttachAction::Recover { session } => session,
+    }
 }

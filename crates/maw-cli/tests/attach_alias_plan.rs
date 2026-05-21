@@ -148,3 +148,15 @@ fn attach_plan_covers_missing_target_and_non_print_attach_text() {
         .stdout
         .contains("\"tmuxArgs\":[\"attach\",\"-r\",\"-t\",\"50-mawjs\"]"));
 }
+
+#[test]
+fn attach_without_fake_alive_uses_live_probe_recover_path() {
+    let missing = run(&[
+        "a",
+        "unlikely-goal-coverage-session-zz-1850",
+        "--print",
+        "--plan-json",
+    ]);
+    assert_eq!(missing.code, 1, "{}{}", missing.stdout, missing.stderr);
+    assert!(missing.stdout.contains("\"action\":\"recover\""));
+}
