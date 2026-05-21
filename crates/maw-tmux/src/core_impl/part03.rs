@@ -363,12 +363,25 @@ pub fn resolve_tmux_attach_session(
                 };
             }
             _ => {
+                if tier == 1 {
+                    if let Some(session) = preferred_numbered_attach_candidate(&candidates) {
+                        return TmuxAttachSessionResolution::Match { session };
+                    }
+                }
                 return TmuxAttachSessionResolution::Ambiguous { query, candidates };
             }
         }
     }
 
     TmuxAttachSessionResolution::Missing { session: query }
+}
+
+fn preferred_numbered_attach_candidate(candidates: &[String]) -> Option<String> {
+    let numbered = candidates
+        .iter()
+        .filter(|candidate| attach_strip_numeric_fleet_prefix(candidate) != candidate.as_str())
+        .collect::<Vec<_>>();
+    (numbered.len() == 1).then(|| numbered[0].clone())
 }
 
 fn attach_session_match_tier(session: &str, normalized_query: &str) -> Option<u8> {
