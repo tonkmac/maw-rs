@@ -485,6 +485,7 @@ impl CommandTmuxRunner {
         };
         let mut command = Command::new(program);
         command.args(rest);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }

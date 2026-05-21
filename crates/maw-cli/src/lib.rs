@@ -58,7 +58,7 @@ use maw_routing::{
 use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
 use maw_tmux::{
     mark_peer_targets_live, resolve_tmux_live_state, DiscoverLivePane, PeerTargetWithLive,
-    TmuxLiveStateResult, TmuxPane,
+    TmuxClient, TmuxLiveStateResult, TmuxPane,
 };
 use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
@@ -77,6 +77,7 @@ use maw_xdg::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -110,6 +111,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "plugin-manifest" => run_plugin_manifest_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
+        "ls" => run_ls_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
         "fuzzy" => run_fuzzy_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
@@ -10973,7 +10975,7 @@ fn usage_ok() -> CliOutput {
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
   auto-wake constants [--plan-json]
-  auth sign-v1 --token <token> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth sign-headers --token <token> --now <ts> [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v1 --token <token> --signature <hex> --signed-at <ts> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth verify-legacy-from --from <oracle:node> --signed-at <iso> --signature <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v3-from --from <oracle:node> --timestamp <ts> --signature-v3 <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth from-sign-payload --from <oracle:node> (--timestamp <ts>|--legacy --signed-at <iso>) [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth hmac-sign --secret <secret> --payload <payload> [--plan-json]\n  auth hmac-verify --secret <secret> --payload <payload> --signature <hex> [--plan-json]\n  auth constants [--plan-json]\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  auth loopback --address <address> [--plan-json]\n  auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n  auth hash-body [--body <body>] [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  hub constants [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  xdg constants [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-scaffold constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  policy constants [--plan-json]\n  plugin-policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bind-host constants [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  feed constants [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  fuzzy constants [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  resolve constants [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  identity constants [--plan-json]\n  normalize <target> [--plan-json]\n  normalize constants [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  calver constants [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  worktree-window constants [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  route constants [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]
+  auth sign-v1 --token <token> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth sign-headers --token <token> --now <ts> [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v1 --token <token> --signature <hex> --signed-at <ts> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth verify-legacy-from --from <oracle:node> --signed-at <iso> --signature <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v3-from --from <oracle:node> --timestamp <ts> --signature-v3 <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth from-sign-payload --from <oracle:node> (--timestamp <ts>|--legacy --signed-at <iso>) [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth hmac-sign --secret <secret> --payload <payload> [--plan-json]\n  auth hmac-verify --secret <secret> --payload <payload> --signature <hex> [--plan-json]\n  auth constants [--plan-json]\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  auth loopback --address <address> [--plan-json]\n  auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n  auth hash-body [--body <body>] [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  hub constants [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  xdg constants [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-scaffold constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  policy constants [--plan-json]\n  plugin-policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bind-host constants [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  ls [<peer>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  feed constants [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  fuzzy constants [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  resolve constants [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  identity constants [--plan-json]\n  normalize <target> [--plan-json]\n  normalize constants [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  calver constants [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  worktree-window constants [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  route constants [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]
   discover constants [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]
   federation-health constants [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]
   federation-identity constants [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]
@@ -10984,6 +10986,619 @@ fn usage_text() -> String {
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]
   peer-sources constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  split-policy constants [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n  transport constants [--plan-json]\n"
         .to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LsPanePlan {
+    id: String,
+    target: String,
+    session: String,
+    command: String,
+    title: String,
+    source: Option<String>,
+    last_activity: Option<u64>,
+    session_created: Option<u64>,
+    status: &'static str,
+    age_sec: u64,
+    agent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LsMode {
+    Compact,
+    Verbose,
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+struct LsPlanOptions {
+    json: bool,
+    mode: LsMode,
+    all: bool,
+    channels: bool,
+    active: bool,
+    active_threshold_sec: Option<u64>,
+    recent: bool,
+    recent_limit: Option<usize>,
+    filter: Option<String>,
+    peer: Option<String>,
+    now: Option<u64>,
+    panes: Vec<TmuxPane>,
+    session_created: BTreeMap<String, u64>,
+}
+
+fn run_ls_plan(argv: &[String]) -> CliOutput {
+    match parse_ls_plan_options(argv) {
+        Ok(options) => render_ls_plan(&options),
+        Err(output) => output,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
+    let mut options = LsPlanOptions {
+        json: false,
+        mode: LsMode::Compact,
+        all: false,
+        channels: false,
+        active: false,
+        active_threshold_sec: None,
+        recent: false,
+        recent_limit: None,
+        filter: None,
+        peer: None,
+        now: None,
+        panes: Vec::new(),
+        session_created: BTreeMap::new(),
+    };
+
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--help" | "-h" => return Err(ls_help_ok()),
+            "--json" | "--plan-json" => options.json = true,
+            "--all" => options.all = true,
+            "--compact" | "-c" => options.mode = LsMode::Compact,
+            "--verbose" | "-v" => options.mode = LsMode::Verbose,
+            "--channels" => options.channels = true,
+            "--active" => {
+                options.active = true;
+                if let Some(next) = argv.get(index + 1) {
+                    if !next.starts_with('-') {
+                        if let Some(seconds) = parse_ls_duration_seconds(next) {
+                            options.active_threshold_sec = Some(seconds);
+                            index += 1;
+                        }
+                    }
+                }
+            }
+            arg if arg.starts_with("--active=") => {
+                options.active = true;
+                let raw = &arg["--active=".len()..];
+                let Some(seconds) = parse_ls_duration_seconds(raw) else {
+                    return Err(ls_usage_error("ls: invalid --active duration"));
+                };
+                options.active_threshold_sec = Some(seconds);
+            }
+            "--recent" | "-r" => {
+                options.recent = true;
+                options.all = true;
+                if let Some(next) = argv.get(index + 1) {
+                    if !next.starts_with('-') {
+                        if let Ok(limit) = next.parse::<usize>() {
+                            options.recent_limit = Some(limit);
+                            index += 1;
+                        }
+                    }
+                }
+            }
+            "--pane" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err(ls_usage_error("ls: missing --pane value"));
+                };
+                match parse_ls_pane(value) {
+                    Ok(pane) => options.panes.push(pane),
+                    Err(message) => return Err(ls_usage_error(&message)),
+                }
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err(ls_usage_error("ls: missing --now value"));
+                };
+                match value.parse::<u64>() {
+                    Ok(value) => options.now = Some(value),
+                    Err(_) => return Err(ls_usage_error("ls: --now must be an integer")),
+                }
+                index += 1;
+            }
+            "--session-created" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err(ls_usage_error("ls: missing --session-created value"));
+                };
+                let Some((session, created)) = value.split_once('=') else {
+                    return Err(ls_usage_error(
+                        "ls: --session-created must use <session=epoch_seconds>",
+                    ));
+                };
+                match created.parse::<u64>() {
+                    Ok(created) => {
+                        options.session_created.insert(session.to_owned(), created);
+                    }
+                    Err(_) => {
+                        return Err(ls_usage_error(
+                            "ls: session-created epoch must be an integer",
+                        ));
+                    }
+                }
+                index += 1;
+            }
+            "--verify" | "--fix" => {
+                // Accepted for top-level maw-js surface parity. This plan-only
+                // port does not mutate/prune worktrees.
+            }
+            "-a" => {
+                options.all = true;
+            }
+            arg if arg.starts_with('-') => {
+                return Err(ls_usage_error(&format!("ls: unknown argument {arg}")));
+            }
+            arg => positionals.push(arg.to_owned()),
+        }
+        index += 1;
+    }
+
+    if let Some(first) = positionals.first() {
+        if options.active || !options.panes.is_empty() {
+            options.filter = Some(first.clone());
+        } else {
+            options.peer = Some(first.clone());
+        }
+    }
+
+    Ok(options)
+}
+
+fn parse_ls_pane(value: &str) -> Result<TmuxPane, String> {
+    parse_discover_pane(value).map_err(|message| message.replacen("discover:", "ls:", 1))
+}
+
+fn parse_ls_duration_seconds(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim().to_lowercase();
+    let (digits, unit) = match trimmed.as_bytes().last().copied() {
+        Some(b's' | b'm' | b'h' | b'd') => (
+            &trimmed[..trimmed.len() - 1],
+            trimmed.as_bytes().last().copied(),
+        ),
+        _ => (trimmed.as_str(), None),
+    };
+    let value = digits.parse::<u64>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let multiplier = match unit {
+        Some(b's') => 1,
+        Some(b'm') | None => 60,
+        Some(b'h') => 60 * 60,
+        Some(b'd') => 24 * 60 * 60,
+        _ => return None,
+    };
+    Some(value * multiplier)
+}
+
+fn render_ls_plan(options: &LsPlanOptions) -> CliOutput {
+    if let Some(peer) = &options.peer {
+        return CliOutput {
+            code: 0,
+            stdout: if options.json {
+                format!(
+                    "{{\"command\":\"ls\",\"scope\":\"peer\",\"peer\":{},\"sessions\":[]}}\n",
+                    json_string(peer)
+                )
+            } else {
+                format!("ls peer {peer}: no fake sessions\n")
+            },
+            stderr: String::new(),
+        };
+    }
+
+    let mut live_options;
+    let effective_options = if options.panes.is_empty() {
+        let mut client = TmuxClient::local();
+        let live_panes = client.list_panes();
+        live_options = options.clone();
+        live_options.panes = live_panes;
+        if live_options.now.is_none() {
+            live_options.now = Some(current_epoch_seconds());
+        }
+        &live_options
+    } else {
+        options
+    };
+    let panes = project_ls_panes(effective_options);
+    CliOutput {
+        code: 0,
+        stdout: if options.json {
+            render_ls_json(options, &panes)
+        } else {
+            render_ls_text(options, &panes)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn project_ls_panes(options: &LsPlanOptions) -> Vec<LsPanePlan> {
+    let now = options.now.unwrap_or_else(|| {
+        options
+            .panes
+            .iter()
+            .filter_map(|pane| pane.last_activity)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(600)
+    });
+    let mut panes = options
+        .panes
+        .iter()
+        .filter_map(|pane| {
+            let session = pane
+                .target
+                .split_once(':')
+                .map_or(&pane.target[..], |(session, _)| session);
+            if !options.channels && is_ls_channel_session(session) {
+                return None;
+            }
+            if !options.all
+                && options.mode == LsMode::Compact
+                && !is_default_ls_oracle_session(session)
+            {
+                return None;
+            }
+            let source = None;
+            let values = [
+                session,
+                pane.target.as_str(),
+                pane.title.as_str(),
+                pane.command.as_str(),
+            ];
+            if let Some(filter) = &options.filter {
+                let filter = filter.to_lowercase();
+                if !values
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&filter))
+                {
+                    return None;
+                }
+            }
+            let age_sec = pane
+                .last_activity
+                .map_or(0, |last| now.saturating_sub(last));
+            if options.active
+                && pane
+                    .last_activity
+                    .is_none_or(|_| age_sec > options.active_threshold_sec.unwrap_or(30 * 60))
+            {
+                return None;
+            }
+            Some(LsPanePlan {
+                id: pane.id.clone(),
+                target: pane.target.clone(),
+                session: session.to_owned(),
+                command: pane.command.clone(),
+                title: pane.title.clone(),
+                source,
+                last_activity: pane.last_activity,
+                session_created: options.session_created.get(session).copied(),
+                status: ls_pane_status(age_sec),
+                age_sec,
+                agent: is_ls_agent_command(&pane.command),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if options.recent {
+        panes.sort_by(|left, right| {
+            right
+                .session_created
+                .unwrap_or(0)
+                .cmp(&left.session_created.unwrap_or(0))
+                .then_with(|| left.target.cmp(&right.target))
+        });
+        if let Some(limit) = options.recent_limit {
+            let mut seen = BTreeSet::new();
+            panes.retain(|pane| {
+                seen.insert(pane.session.clone());
+                seen.len() <= limit
+            });
+        }
+    } else {
+        panes.sort_by(|left, right| left.target.cmp(&right.target));
+    }
+    panes
+}
+
+fn is_default_ls_oracle_session(session: &str) -> bool {
+    session.split_once('-').is_some_and(|(prefix, suffix)| {
+        prefix.chars().all(|ch| ch.is_ascii_digit()) && !suffix.starts_with('-')
+    }) || session.ends_with("-oracle")
+}
+
+fn is_ls_channel_session(session: &str) -> bool {
+    session.ends_with("-discord") && !session.contains("discord-admin")
+}
+
+fn is_ls_agent_command(command: &str) -> bool {
+    let command = command.to_lowercase();
+    command.contains("claude") || command.contains("codex") || command.contains("node")
+}
+
+fn ls_pane_status(age_sec: u64) -> &'static str {
+    if age_sec < 30 {
+        "active"
+    } else if age_sec < 300 {
+        "idle"
+    } else {
+        "stale"
+    }
+}
+
+fn render_ls_json(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
+    let mut fields = vec![
+        "\"command\":\"ls\"".to_owned(),
+        format!(
+            "\"mode\":\"{}\"",
+            if options.mode == LsMode::Verbose {
+                "verbose"
+            } else {
+                "compact"
+            }
+        ),
+        "\"scope\":\"local\"".to_owned(),
+        "\"json\":true".to_owned(),
+    ];
+    if options.active {
+        fields.push(format!(
+            "\"activeThresholdSec\":{}",
+            options.active_threshold_sec.unwrap_or(30 * 60)
+        ));
+    }
+    if let Some(limit) = options.recent_limit {
+        fields.push(format!("\"recentLimit\":{limit}"));
+    }
+    if options.mode == LsMode::Verbose {
+        fields.push(format!("\"panes\":{}", render_ls_panes_json(panes)));
+    } else {
+        fields.push(format!(
+            "\"sessions\":{}",
+            render_ls_sessions_json(panes, options.recent)
+        ));
+    }
+    format!("{{{}}}\n", fields.join(","))
+}
+
+fn render_ls_panes_json(panes: &[LsPanePlan]) -> String {
+    let rows = panes
+        .iter()
+        .map(|pane| {
+            format!(
+                "{{\"id\":{},\"target\":{},\"session\":{},\"command\":{},\"title\":{},\"status\":{},\"ageSec\":{},\"agent\":{}}}",
+                json_string(&pane.id),
+                json_string(&pane.target),
+                json_string(&pane.session),
+                json_string(&pane.command),
+                json_string(&pane.title),
+                json_string(pane.status),
+                pane.age_sec,
+                pane.agent
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", rows.join(","))
+}
+
+fn render_ls_sessions_json(panes: &[LsPanePlan], include_recent: bool) -> String {
+    let mut by_session: BTreeMap<String, Vec<&LsPanePlan>> = BTreeMap::new();
+    for pane in panes {
+        by_session
+            .entry(pane.session.clone())
+            .or_default()
+            .push(pane);
+    }
+    let mut rows = by_session.into_iter().collect::<Vec<_>>();
+    if include_recent {
+        rows.sort_by(|left, right| {
+            right
+                .1
+                .first()
+                .and_then(|pane| pane.session_created)
+                .unwrap_or(0)
+                .cmp(
+                    &left
+                        .1
+                        .first()
+                        .and_then(|pane| pane.session_created)
+                        .unwrap_or(0),
+                )
+                .then_with(|| left.0.cmp(&right.0))
+        });
+    }
+    let rows = rows
+        .into_iter()
+        .map(|(session, panes)| {
+            let status = ls_best_status(&panes);
+            let agents = panes.iter().filter(|pane| pane.agent).count();
+            let mut fields = vec![
+                format!("\"session\":{}", json_string(&session)),
+                format!("\"status\":{}", json_string(status)),
+                format!("\"panes\":{}", panes.len()),
+                format!("\"agents\":{agents}"),
+            ];
+            if let Some(created) = panes.first().and_then(|pane| pane.session_created) {
+                fields.push(format!("\"created\":{created}"));
+            }
+            if let Some(age) = panes
+                .iter()
+                .filter_map(|pane| pane.last_activity.map(|_| pane.age_sec))
+                .min()
+            {
+                if panes
+                    .first()
+                    .and_then(|pane| pane.session_created)
+                    .is_some()
+                {
+                    fields.push(format!("\"lastActivityAgeSec\":{age}"));
+                }
+            }
+            format!("{{{}}}", fields.join(","))
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", rows.join(","))
+}
+
+fn ls_best_status(panes: &[&LsPanePlan]) -> &'static str {
+    if panes.iter().any(|pane| pane.status == "active") {
+        "active"
+    } else if panes.iter().any(|pane| pane.status == "idle") {
+        "idle"
+    } else if panes.iter().any(|pane| pane.status == "stale") {
+        "stale"
+    } else {
+        "unknown"
+    }
+}
+
+fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
+    if panes.is_empty() {
+        return if options.active {
+            format!(
+                "No sessions active in the last {}.\n",
+                format_ls_duration(options.active_threshold_sec.unwrap_or(30 * 60))
+            )
+        } else {
+            "No active sessions.\n  → maw bud <name>     create new oracle\n  → maw wake <name>    attach existing\n".to_owned()
+        };
+    }
+    if options.mode == LsMode::Verbose {
+        let mut lines = vec!["TARGET CMD AGE TITLE".to_owned()];
+        for pane in panes {
+            lines.push(format!(
+                "{} {} {} {}",
+                ls_color("36", &pane.target),
+                ls_color("2", &pane.command),
+                ls_color("2", &format_ls_duration(pane.age_sec)),
+                pane.title
+            ));
+        }
+        lines.join("\n") + "\n"
+    } else {
+        let mut out = String::new();
+        for (session, panes) in group_ls_sessions(panes) {
+            let agents = panes.iter().filter(|pane| pane.agent).count();
+            let status = ls_best_status(&panes);
+            let dot = ls_status_dot(status);
+            let session = ls_color("36", &session);
+            let pane_count = ls_color(
+                "2",
+                &format!(
+                    "{} pane{}",
+                    panes.len(),
+                    if panes.len() == 1 { "" } else { "s" }
+                ),
+            );
+            let agent_count = if agents > 0 {
+                format!(
+                    "  {}",
+                    ls_color(
+                        "94",
+                        &format!("{agents} agent{}", if agents == 1 { "" } else { "s" })
+                    )
+                )
+            } else {
+                String::new()
+            };
+            let _ = writeln!(out, "{dot} {session}  {pane_count}{agent_count}");
+        }
+        let _ = writeln!(out, "\n  {}", ls_color("2", "→ maw ls -v    full detail"));
+        out
+    }
+}
+
+fn ls_status_dot(status: &str) -> String {
+    match status {
+        "active" => ls_color("92", "●"),
+        "idle" => ls_color("93", "◌"),
+        "stale" => ls_color("31", "◌"),
+        _ => ls_color("2", "◌"),
+    }
+}
+
+fn ls_color(code: &str, value: &str) -> String {
+    if std::env::var_os("NO_COLOR").is_some() {
+        value.to_owned()
+    } else {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    }
+}
+
+fn group_ls_sessions(panes: &[LsPanePlan]) -> Vec<(String, Vec<&LsPanePlan>)> {
+    let mut by_session: BTreeMap<String, Vec<&LsPanePlan>> = BTreeMap::new();
+    for pane in panes {
+        by_session
+            .entry(pane.session.clone())
+            .or_default()
+            .push(pane);
+    }
+    by_session.into_iter().collect()
+}
+
+fn format_ls_duration(sec: u64) -> String {
+    if sec < 60 {
+        format!("{sec}s")
+    } else if sec < 3600 {
+        format!("{}m", sec / 60)
+    } else if sec < 86_400 {
+        format!("{}h", sec / 3600)
+    } else {
+        format!("{}d", sec / 86_400)
+    }
+}
+
+fn ls_help_ok() -> CliOutput {
+    CliOutput {
+        code: 0,
+        stdout: [
+            "maw ls — list live sessions (local or cross-node)",
+            "",
+            "Usage:",
+            "  maw ls                  list live local sessions (default)",
+            "  maw ls <peer>           list sessions on a federation peer",
+            "  maw ls --all            aggregate sessions from all known peers",
+            "  maw ls --json           emit JSON (combine with <peer> or --all)",
+            "  maw ls --active [30m]   local sessions touched within a recent threshold",
+            "  maw ls --verify         include worktree-bind diagnostics",
+            "  maw ls --fix            prune orphaned worktrees (local only)",
+        ]
+        .join("\n")
+            + "\n",
+        stderr: String::new(),
+    }
+}
+
+fn ls_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs ls [<peer>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n"
+        ),
+    }
 }
 
 fn run_bring_plan(argv: &[String]) -> CliOutput {
