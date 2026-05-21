@@ -2336,6 +2336,48 @@ mod tests {
     }
 
     #[test]
+    fn wasm_parser_covers_second_defined_body_and_helper_edges() {
+        let first_body = [0x00, 0x41, 0x01, 0x0b];
+        let second_body = [0x00, 0x41, 0x2a, 0x0b];
+        let section = [
+            0x02,
+            u8::try_from(first_body.len()).expect("small first body"),
+            first_body[0],
+            first_body[1],
+            first_body[2],
+            first_body[3],
+            u8::try_from(second_body.len()).expect("small second body"),
+            second_body[0],
+            second_body[1],
+            second_body[2],
+            second_body[3],
+        ];
+
+        assert_eq!(
+            parse_handle_result(&section, 1, 0, 2).expect("second body result"),
+            42
+        );
+
+        let mut limits_without_max = WasmCursor::new(&[0x00, 0x01]);
+        skip_limits(&mut limits_without_max).expect("limits without max");
+
+        let mut partial = [0_u8; 4];
+        write_linear_memory(&mut partial, 2, b"abcd");
+        assert_eq!(partial, [0, 0, b'a', b'b']);
+
+        assert_eq!(
+            read_wasm_result_from_memory(&[0, 0, 0, 0], 1),
+            InvokeResult::ok()
+        );
+        assert_eq!(read_length_prefixed_wasm_output(&[0, 0, 0], 0), None);
+        assert_eq!(
+            split_once_optional("1.2.3+build+again", '+'),
+            ("1.2.3", false)
+        );
+        assert!(!is_semver_core("1..3"));
+    }
+
+    #[test]
     fn discover_applies_weight_overrides() {
         let root = temp_dir("discover");
         let plugin_dir = root.join("demo");

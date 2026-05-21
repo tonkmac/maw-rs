@@ -1929,6 +1929,36 @@ mod remaining_coverage_tests {
     }
 
     #[test]
+    fn peer_add_authenticated_probe_mismatch_without_existing_peer_stays_empty() {
+        let plan = PeerAddPlan {
+            alias: "new-peer".to_owned(),
+            url: "http://new-peer:3456".to_owned(),
+            node: None,
+            authenticated_pubkey: Some("auth-key".to_owned()),
+            authenticated_identity: None,
+            mark_symmetric_check: false,
+            one_way: None,
+            now: "2026-05-21T00:00:00Z".to_owned(),
+            peers: BTreeMap::new(),
+            probe: successful_probe(Some("probe-key")),
+        };
+
+        let result = cmd_peer_add_from_plan(&plan).expect("peer add mismatch result");
+
+        assert!(!result.overwrote);
+        assert_eq!(result.peer.url, "http://new-peer:3456");
+        assert_eq!(
+            result.pubkey_mismatch,
+            Some(PeerPubkeyMismatchError::new(
+                "new-peer",
+                "auth-key",
+                "probe-key"
+            ))
+        );
+        assert!(result.peers_after.is_empty());
+    }
+
+    #[test]
     fn unreadable_peer_store_path_returns_empty_store() {
         let dir = temp_dir("unreadable");
         fs::create_dir_all(&dir).expect("create dir path");

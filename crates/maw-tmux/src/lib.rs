@@ -4866,6 +4866,37 @@ mod coverage_gap_tests {
     }
 
     #[test]
+    fn helper_edges_cover_missing_fleet_entry_empty_role_and_bad_duration_forms() {
+        assert_eq!(
+            attach_recovery_candidates(
+                "pulse",
+                "missing-session",
+                "fleet-window",
+                &[AttachRecoveryFleetEntry {
+                    session: "other".to_owned(),
+                    first_window_name: Some("pulse-oracle".to_owned()),
+                    repo: None,
+                }],
+                &[],
+            ),
+            Vec::<AttachRecoveryCandidate>::new()
+        );
+        assert_eq!(
+            worktree_names_from_cwd("/tmp/mawjs-oracle.wt-1"),
+            vec![("mawjs-oracle.wt-1".to_owned(), "worktree-dir".to_owned())]
+        );
+        assert_eq!(parse_active_duration_seconds(Some("0m")), None);
+        assert_eq!(
+            parse_active_duration_seconds(Some("999999999999999999999999999999m")),
+            None
+        );
+        assert_eq!(
+            active_duration_arg(&["--active".to_owned(), "--bad".to_owned()], "--active"),
+            None
+        );
+    }
+
+    #[test]
     fn session_created_formats_zero_and_valid_epoch() {
         assert_eq!(format_session_created(None), "—");
         assert_eq!(format_session_created(Some(0)), "—");

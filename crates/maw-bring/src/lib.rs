@@ -275,4 +275,14 @@ mod tests {
         assert_eq!(parsed.opts.engine.as_deref(), Some("codex"));
         assert!(parsed.opts.pick);
     }
+
+    #[test]
+    fn bring_args_tolerate_trailing_to_without_value() {
+        let parsed = parse_bring_args(&["pulse".to_owned(), "--to".to_owned()])
+            .expect("trailing --to is left for downstream parsing");
+
+        assert_eq!(parsed.oracle, "pulse");
+        assert_eq!(parsed.opts.session, None);
+        assert_eq!(parsed.opts.split_target, None);
+    }
 }

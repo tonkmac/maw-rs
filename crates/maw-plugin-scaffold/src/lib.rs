@@ -440,6 +440,27 @@ mod tests {
     }
 
     #[test]
+    fn scaffold_edges_cover_package_without_manifest_and_name_start() {
+        let template = temp_dir("as-template-no-package");
+        let dest = temp_dir("as-dest-no-package");
+        fs::create_dir_all(&template).expect("create template");
+
+        scaffold_as("edge_plugin", &dest, &template).expect("scaffold as without package");
+
+        assert!(dest.join("plugin.json").exists());
+        assert!(!dest.join("package.json").exists());
+        assert_eq!(
+            validate_plugin_name("1bad"),
+            Some(
+                "\"1bad\" is invalid — use lowercase letters, digits, - or _ (must start with a letter)"
+                    .to_owned()
+            )
+        );
+        let _ = fs::remove_dir_all(template);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    #[test]
     fn invalid_empty_plugin_name_is_rejected() {
         assert_eq!(
             validate_plugin_name("").as_deref(),
