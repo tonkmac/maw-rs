@@ -469,4 +469,63 @@ mod tests {
         assert!(validate_plugin_name("1bad").is_some());
         assert!(!is_valid_plugin_name(""));
     }
+
+    #[test]
+    fn private_rewriters_cover_no_newline_and_readme_shapes() {
+        let cargo = "name = \"template\"\n[dependencies]\nmaw-plugin-sdk = { path = \"old\" }";
+        let rewritten = rewrite_rust_cargo_toml(cargo, "hello-rust", "../sdk");
+
+        assert!(!rewritten.ends_with('\n'));
+        assert!(rewritten.contains("name = \"hello-rust\""));
+        assert!(rewritten.contains("maw-plugin-sdk = { path = \"../sdk\" }"));
+        assert!(
+            rust_readme("hello-rust", Path::new("/tmp/plugin"), "../sdk").contains("maw::send")
+        );
+        assert!(as_readme("hello-as", Path::new("/tmp/as-plugin")).contains("npm run build"));
+    }
+
+    #[test]
+    fn copy_tree_recurses_and_skips_artifact_directories() {
+        let template = temp_dir("copy-tree-template");
+        let dest = temp_dir("copy-tree-dest");
+        fs::create_dir_all(template.join("src/nested")).expect("create nested");
+        fs::create_dir_all(template.join("target")).expect("create target");
+        fs::create_dir_all(template.join(".git")).expect("create git");
+        fs::create_dir_all(template.join("node_modules")).expect("create modules");
+        fs::write(template.join("src/nested/lib.rs"), "pub fn ok() {}\n").expect("write nested");
+        fs::write(template.join("target/skip"), "skip").expect("write target");
+        fs::write(template.join(".git/skip"), "skip").expect("write git");
+        fs::write(template.join("node_modules/skip"), "skip").expect("write modules");
+
+        copy_tree(&template, &dest).expect("copy template tree");
+
+        assert!(dest.join("src/nested/lib.rs").exists());
+        assert!(!dest.join("target").exists());
+        assert!(!dest.join(".git").exists());
+        assert!(!dest.join("node_modules").exists());
+        let _ = fs::remove_dir_all(template);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn scaffold_reports_midstream_template_shape_errors() {
+        let rust_template = temp_dir("rust-template-missing-cargo");
+        let rust_dest = temp_dir("rust-dest-missing-cargo");
+        fs::create_dir_all(&rust_template).expect("create rust template");
+        let error = scaffold_rust("hello-rust", &rust_dest, &rust_template, "../sdk")
+            .expect_err("missing Cargo.toml should surface read error");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+        let as_template = temp_dir("as-template-package-dir");
+        let as_dest = temp_dir("as-dest-package-dir");
+        fs::create_dir_all(as_template.join("package.json")).expect("create package dir");
+        let error = scaffold_as("hello-as", &as_dest, &as_template)
+            .expect_err("package.json directory should surface read error");
+        assert!(error.to_string().contains("Is a directory"));
+
+        let _ = fs::remove_dir_all(rust_template);
+        let _ = fs::remove_dir_all(rust_dest);
+        let _ = fs::remove_dir_all(as_template);
+        let _ = fs::remove_dir_all(as_dest);
+    }
 }

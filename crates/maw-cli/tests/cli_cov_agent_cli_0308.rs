@@ -57,6 +57,7 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn auth_0308_parser_defaults_and_value_error_edges_are_stable() {
     assert_usage_contains(&["auth"], "auth: expected sign-v1, sign-headers, verify-v1");
     assert_usage_contains(&["auth", "mystery"], "auth: unknown subcommand mystery");
@@ -67,6 +68,48 @@ fn auth_0308_parser_defaults_and_value_error_edges_are_stable() {
     assert_usage_contains(
         &["auth", "sign-headers", "--token"],
         "auth: missing --token value",
+    );
+    assert_usage_contains(
+        &["auth", "sign-v1", "--now", NOW],
+        "auth sign-v1: --token is required",
+    );
+    assert_usage_contains(
+        &["auth", "sign-v1", "--token", "t"],
+        "auth sign-v1: --now is required",
+    );
+    assert_usage_contains(
+        &["auth", "sign-headers", "--token", "tok"],
+        "auth sign-headers: --now is required",
+    );
+    assert_usage_contains(
+        &[
+            "auth",
+            "verify-v1",
+            "--signature",
+            "sig",
+            "--signed-at",
+            "1",
+            "--now",
+            NOW,
+        ],
+        "auth verify-v1: --token is required",
+    );
+    assert_usage_contains(
+        &[
+            "auth",
+            "verify-v3-from",
+            "--from",
+            FROM,
+            "--timestamp",
+            NOW,
+            "--now",
+            NOW,
+        ],
+        "auth verify-v3-from: --signature-v3 is required",
+    );
+    assert_usage_contains(
+        &["auth", "from-sign-payload", "--from", FROM],
+        "auth from-sign-payload: --timestamp is required",
     );
     assert_usage_contains(
         &[
@@ -357,6 +400,59 @@ fn plugin_manifest_0308_parse_load_discover_and_import_edges_are_stable() {
     );
 
     remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn consent_store_part17_null_and_dash_render_branches_are_stable() {
+    const TRUST_ENTRY: &str =
+        "from=neo,to=mawjs,action=hey,approved_at=2026-01-02T00:00:00.000Z,approved_by=human";
+    const PENDING_REQ: &str = "id=req-1,from=neo,to=mawjs,action=plugin-install,summary=install,pin_hash=hash,created_at=2026-01-02T00:00:00.000Z,expires_at=2026-01-02T00:01:00.000Z,status=pending";
+
+    assert_ok_contains(
+        &[
+            "consent-store",
+            "trust",
+            "--entry",
+            TRUST_ENTRY,
+            "--plan-json",
+        ],
+        "\"trusted\":null",
+    );
+    assert_ok_contains(
+        &["consent-store", "trust", "--entry", TRUST_ENTRY],
+        "consent-store trust trusted=- trustKey=-",
+    );
+    assert_ok_contains(
+        &[
+            "consent-store",
+            "pending",
+            "--request",
+            PENDING_REQ,
+            "--plan-json",
+        ],
+        "\"updated\":null",
+    );
+    assert_ok_contains(
+        &["consent-store", "pending", "--request", PENDING_REQ],
+        "consent-store pending updated=-",
+    );
+    assert_usage_contains(
+        &["consent-store", "trust", "--entry", "=bad"],
+        "consent-store: expected non-empty field name",
+    );
+    assert_usage_contains(
+        &[
+            "consent-store",
+            "trust",
+            "--entry",
+            "from=neo,to=mawjs,action=hey,approved_at=now,approved_by=robot",
+        ],
+        "consent-store: invalid approved_by",
+    );
+    assert_usage_contains(
+        &["consent-store", "pending", "--set-status", ":approved"],
+        "consent-store: --set-status missing id",
+    );
 }
 
 #[test]

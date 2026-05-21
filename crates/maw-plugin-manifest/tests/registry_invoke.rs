@@ -152,6 +152,38 @@ fn invoke_plugin_default_name_help_for_dispatchable_plugins() {
 }
 
 #[test]
+fn invoke_plugin_help_for_non_dispatchable_plugin_has_no_cli_surface() {
+    let root = make_temp_dir("help-no-surface");
+    let mut plugin = make_plugin(&root, LoadedPluginKind::Ts);
+    plugin.manifest.name = "dormant".to_owned();
+
+    let result = invoke_plugin(&plugin, &cli(&["--help"]), &mut FakeRuntime::default());
+
+    assert!(result.ok);
+    let output = result.output.expect("output");
+    assert!(output.contains("dormant v1.0.0"));
+    assert!(!output.contains("usage:"));
+    assert!(!output.contains("cli: maw dormant"));
+    assert!(output.contains("surfaces:"));
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn invoke_plugin_version_for_non_dispatchable_plugin_reports_empty_surfaces() {
+    let root = make_temp_dir("version-no-surface");
+    let mut plugin = make_plugin(&root, LoadedPluginKind::Ts);
+    plugin.manifest.name = "quiet".to_owned();
+
+    let result = invoke_plugin(&plugin, &cli(&["-v"]), &mut FakeRuntime::default());
+
+    assert!(result.ok);
+    let output = result.output.expect("output");
+    assert!(output.contains("quiet v1.0.0 (ts, weight:50)"));
+    assert!(output.contains("surfaces: \n"));
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn invoke_plugin_ts_dispatches_through_injected_runtime() {
     let root = make_temp_dir("ts-runtime");
     let entry = root.join("index.ts");

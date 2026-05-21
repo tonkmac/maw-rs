@@ -189,6 +189,77 @@
     }
 
     #[test]
+    fn constructors_defaults_and_private_helpers_stay_deterministic() {
+        assert_eq!(
+            NewSessionOptions::default(),
+            NewSessionOptions {
+                window: None,
+                cwd: None,
+                detached: true,
+                command: None,
+                print_format: None,
+            }
+        );
+        assert_eq!(
+            TmuxSplitActionOptions::default(),
+            TmuxSplitActionOptions {
+                vertical: false,
+                pct: 50.0,
+                command: None,
+            }
+        );
+
+        let mut tracker = TmuxSendTracker::default();
+        tracker.set(
+            "%1",
+            SendTrackerEntry {
+                last_ts: 10,
+                count: 2,
+                window_start: 1,
+            },
+        );
+        assert_eq!(
+            tracker.get("%1"),
+            Some(SendTrackerEntry {
+                last_ts: 10,
+                count: 2,
+                window_start: 1,
+            })
+        );
+        tracker.clear();
+        assert_eq!(tracker.get("%1"), None);
+
+        let candidate = PaneTargetCandidate {
+            name: "pulse".to_owned(),
+            resolved: "%7".to_owned(),
+            source: "pane-title".to_owned(),
+            target: "pulse:1.0".to_owned(),
+        };
+        assert_eq!(candidate.name(), "pulse");
+        assert_eq!(TmuxError::new("boom").to_string(), "boom");
+    }
+
+    #[test]
+    fn local_client_constructors_build_tmux_runner_without_executing_tmux() {
+        let local = TmuxClient::local();
+        assert_eq!(
+            local.runner.argv("display-message", &[]),
+            vec![OsString::from("tmux"), OsString::from("display-message")]
+        );
+
+        let with_socket = TmuxClient::local_with_socket("/tmp/maw.sock");
+        assert_eq!(
+            with_socket.runner.argv("display-message", &[]),
+            vec![
+                OsString::from("tmux"),
+                OsString::from("-S"),
+                OsString::from("/tmp/maw.sock"),
+                OsString::from("display-message"),
+            ]
+        );
+    }
+
+    #[test]
     fn command_runner_handles_success_stdin_and_failure_details() {
         let mut runner = CommandTmuxRunner::with_program("sh");
 
@@ -269,4 +340,30 @@
         );
 
         assert_eq!(result.live[0].matches, vec!["scratch", "scratch"]);
+    }
+
+    #[test]
+    fn live_state_match_labels_use_oracle_and_empty_cwd_is_ignored() {
+        let peers = vec![maw_peer::PeerTarget {
+            name: None,
+            url: "http://scratch".to_owned(),
+            source: maw_peer::PeerSourceKind::Scout,
+            node: None,
+            oracle: Some("scratch".to_owned()),
+        }];
+        let result = resolve_tmux_live_state(
+            &peers,
+            &[TmuxPane {
+                id: "%11".to_owned(),
+                command: "zsh".to_owned(),
+                target: "demo:1.0".to_owned(),
+                title: "scratch".to_owned(),
+                pid: None,
+                cwd: Some("////".to_owned()),
+                last_activity: None,
+            }],
+        );
+
+        assert_eq!(result.live[0].matches, vec!["scratch"]);
+        assert_eq!(path_basename("////"), None);
     }

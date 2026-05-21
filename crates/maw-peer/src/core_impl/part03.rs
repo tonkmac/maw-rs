@@ -484,3 +484,114 @@ fn probe_failure_without_error() -> ProbePeerResult {
     }
 }
 
+#[cfg(test)]
+mod part03_coverage_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("maw-peer-part03-{name}-{nonce}"))
+    }
+
+    fn peer_record(url: &str) -> PeerRecord {
+        PeerRecord {
+            url: url.to_owned(),
+            node: None,
+            added_at: "2026-05-21T00:00:00Z".to_owned(),
+            last_seen: None,
+            last_error: None,
+            nickname: None,
+            pubkey: None,
+            pubkey_first_seen: None,
+            identity: None,
+            one_way: None,
+            last_symmetric_check: None,
+        }
+    }
+
+    fn successful_probe(pubkey: Option<&str>) -> ProbePeerResult {
+        ProbePeerResult {
+            node: None,
+            nickname: None,
+            pubkey: pubkey.map(str::to_owned),
+            identity: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn peer_add_existing_empty_pin_preserves_existing_metadata_edges() {
+        let mut existing = peer_record("http://old:3456");
+        existing.last_symmetric_check = Some("2026-05-20T00:00:00Z".to_owned());
+        existing.one_way = Some(true);
+        let plan = PeerAddPlan {
+            alias: "white".to_owned(),
+            url: "http://white:3456".to_owned(),
+            node: Some("plan-node".to_owned()),
+            authenticated_pubkey: None,
+            authenticated_identity: None,
+            mark_symmetric_check: false,
+            one_way: None,
+            now: "2026-05-21T00:00:00Z".to_owned(),
+            peers: BTreeMap::from([("white".to_owned(), existing)]),
+            probe: successful_probe(Some("observed-key")),
+        };
+
+        let result = cmd_peer_add_from_plan(&plan).expect("peer add succeeds");
+
+        assert_eq!(result.peer.pubkey.as_deref(), Some("observed-key"));
+        assert_eq!(
+            result.peer.last_symmetric_check.as_deref(),
+            Some("2026-05-20T00:00:00Z")
+        );
+        assert_eq!(result.peer.one_way, Some(true));
+    }
+
+    #[test]
+    fn peer_store_error_paths_propagate_from_public_mutators() {
+        let blocked_parent = temp_dir("blocked-parent");
+        fs::write(&blocked_parent, "not a directory").expect("write blocked parent");
+        let blocked_env = PeerStoreEnv::with_vars(
+            temp_dir("blocked-home"),
+            [(
+                "PEERS_FILE",
+                blocked_parent.join("peers.json").display().to_string(),
+            )],
+        );
+        assert!(forget_peer_pubkey(&blocked_env, "white").is_err());
+        let bootstrap = TofuDecision {
+            kind: TofuDecisionKind::TofuBootstrap,
+            alias: "white".to_owned(),
+            cached: None,
+            observed: Some("observed-key".to_owned()),
+            message: String::new(),
+        };
+        assert!(apply_tofu_decision(&blocked_env, &bootstrap, "2026-05-21T00:00:00Z").is_err());
+        let _ = fs::remove_file(&blocked_parent);
+
+        let path = temp_dir("tmp-dir-peer-file");
+        let tmp = tmp_peer_store_path(&path);
+        fs::create_dir_all(&tmp).expect("create tmp directory");
+        let env = PeerStoreEnv::with_vars(
+            temp_dir("tmp-dir-home"),
+            [("PEERS_FILE", path.display().to_string())],
+        );
+        assert!(save_peer_store(&env, &empty_peer_store()).is_err());
+        let _ = fs::remove_dir_all(tmp);
+
+        let stale_home = temp_dir("stale-one");
+        let stale_env = PeerStoreEnv::new(&stale_home);
+        let mut store = empty_peer_store();
+        store
+            .peers
+            .insert("old".to_owned(), peer_record("http://old"));
+        save_peer_store(&stale_env, &store).expect("save stale peer");
+        let check = remove_stale_peers(&stale_env, u64::MAX).expect("remove stale peer");
+        assert_eq!(check.message, "removed 1 stale peer");
+        let _ = fs::remove_dir_all(stale_home);
+    }
+}

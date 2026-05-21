@@ -181,12 +181,39 @@ fn mvp_wasm_parser_covers_remaining_error_and_import_shapes() {
             "wasm compile error",
         ),
         (
+            "invalid-section-id",
+            wasm(&[(13, vec![])]),
+            "wasm compile error",
+        ),
+        (
+            "invalid-export-name",
+            wasm_module(
+                vec![],
+                0,
+                vec![0x01, 0x01, 0xff, 0x02, 0x00],
+                vec![],
+                vec![],
+            ),
+            "wasm compile error",
+        ),
+        (
             "import-memory-global",
             wasm_module(
                 vec![
                     import_entry("env", "mem", 0x02, vec![0x01, 0x01, 0x02]),
                     import_entry("env", "global", 0x03, vec![0x7f, 0x00]),
                 ],
+                1,
+                exports(&[("memory", 0x02, 0), ("handle", 0x00, 0)]),
+                code(&[body(&[0x00, 0x41, 0x00, 0x0b])]),
+                vec![],
+            ),
+            "wasm instantiation failed: unresolved imports",
+        ),
+        (
+            "import-table",
+            wasm_module(
+                vec![import_entry("env", "table", 0x01, vec![0x00, 0x01])],
                 1,
                 exports(&[("memory", 0x02, 0), ("handle", 0x00, 0)]),
                 code(&[body(&[0x00, 0x41, 0x00, 0x0b])]),
@@ -259,6 +286,22 @@ fn mvp_wasm_parser_covers_remaining_error_and_import_shapes() {
             "wasm compile error",
         ),
         (
+            "data-negative-offset",
+            valid_wasm_with_body(
+                &[0x00, 0x41, 0x00, 0x0b],
+                data_section(vec![vec![0x00, 0x41, 0x7f, 0x0b, 0x00]]),
+            ),
+            "wasm compile error",
+        ),
+        (
+            "data-truncated-bytes",
+            valid_wasm_with_body(
+                &[0x00, 0x41, 0x00, 0x0b],
+                data_section(vec![vec![0x00, 0x41, 0x00, 0x0b, 0x03, b'a']]),
+            ),
+            "wasm compile error",
+        ),
+        (
             "signed-overlong",
             valid_wasm_with_body(&[0x00, 0x41, 0x80, 0x80, 0x80, 0x80, 0x80], vec![]),
             "wasm compile error",
@@ -288,6 +331,19 @@ fn mvp_wasm_parser_covers_remaining_error_and_import_shapes() {
     );
     assert_eq!(
         invoke_plugin(&negative, &cli(), &mut MvpWasmInvokeRuntime),
+        InvokeResult::ok()
+    );
+
+    let zero_length = write_wasm_plugin(
+        &root,
+        "zero-length",
+        &valid_wasm_with_body(
+            &[0x00, 0x41, 0xe4, 0x00, 0x0b],
+            data_section(vec![vec![0x00, 0x41, 0xe4, 0x00, 0x0b, 0x04, 0, 0, 0, 0]]),
+        ),
+    );
+    assert_eq!(
+        invoke_plugin(&zero_length, &cli(), &mut MvpWasmInvokeRuntime),
         InvokeResult::ok()
     );
 
