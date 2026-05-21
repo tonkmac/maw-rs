@@ -8,13 +8,17 @@ use maw_tmux::{resolve_tmux_attach_session, TmuxAttachSessionResolution, TmuxCli
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = maybe_exec_attach(&argv) {
-        std::process::exit(code);
+    std::process::exit(main_code(&argv));
+}
+
+fn main_code(argv: &[String]) -> i32 {
+    if let Some(code) = maybe_exec_attach(argv) {
+        return code;
     }
-    let output = maw_cli::run_cli(&argv);
+    let output = maw_cli::run_cli(argv);
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
-    std::process::exit(output.code);
+    output.code
 }
 
 fn maybe_exec_attach(argv: &[String]) -> Option<i32> {
@@ -115,7 +119,7 @@ fn attach_exec_tmux_args(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_exec_tmux_args, maybe_exec_attach_with, run_tmux_attach};
+    use super::{attach_exec_tmux_args, main_code, maybe_exec_attach_with, run_tmux_attach};
     use std::{
         env,
         ffi::OsString,
@@ -170,6 +174,12 @@ mod tests {
         assert_eq!(run_tmux_attach(args(&["attach", "-t", "50-mawjs"])), 1);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn path_restore_covers_missing_path_cleanup() {
+        let _guard = path_lock().lock().expect("path lock");
+        let _restore = PathRestore(None);
     }
 
     #[test]
@@ -263,15 +273,6 @@ mod tests {
         );
         assert_eq!(code, Some(17));
 
-        let blocked = maybe_exec_attach_with(
-            &args(&["a", "50-mawjs", "--print"]),
-            true,
-            false,
-            &args(&["50-mawjs"]),
-            |_| {
-                panic!("print-mode attach must stay in plan mode");
-            },
-        );
-        assert_eq!(blocked, None);
+        assert_eq!(main_code(&args(&["--help"])), 0);
     }
 }

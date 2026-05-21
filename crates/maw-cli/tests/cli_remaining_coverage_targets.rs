@@ -5,6 +5,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_cli::{run_cli, CliOutput};
 
+fn maw_rs_bin() -> PathBuf {
+    let cargo_bin = PathBuf::from(env!("CARGO_BIN_EXE_maw-rs"));
+    if cargo_bin.exists() {
+        return cargo_bin;
+    }
+    let mut current = std::env::current_exe().expect("current test exe");
+    current.pop();
+    if current.file_name().is_some_and(|name| name == "deps") {
+        current.pop();
+    }
+    current.join("maw-rs")
+}
+
 fn run(args: &[&str]) -> CliOutput {
     run_cli(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
 }
@@ -230,7 +243,7 @@ fn ls_empty_local_text_and_live_tmux_fallback_are_stable() {
 
 #[test]
 fn ls_child_process_emits_color_when_no_color_is_absent() {
-    let bin = env!("CARGO_BIN_EXE_maw-rs");
+    let bin = maw_rs_bin();
     let output = Command::new(bin)
         .env_remove("NO_COLOR")
         .args([
