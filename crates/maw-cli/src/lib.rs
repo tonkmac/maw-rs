@@ -4443,6 +4443,10 @@ fn render_policy_default_active_json(key: &str, group: maw_policy::DefaultActive
 }
 
 fn run_transport_plan(argv: &[String]) -> CliOutput {
+    if matches!(argv.first().map(String::as_str), Some("constants")) {
+        return run_transport_constants_plan(&argv[1..]);
+    }
+
     let mut plan_json = false;
     let mut classify = None;
     let mut should_send = false;
@@ -4530,13 +4534,52 @@ fn run_transport_plan(argv: &[String]) -> CliOutput {
     }
 }
 
+fn run_transport_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            other => {
+                return transport_constants_usage_error(&format!(
+                    "transport constants: unknown argument {other}"
+                ))
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_transport_constants_json()
+        } else {
+            "transport constants reasons=timeout,unreachable,auth,rate_limit,rejected,parse_error,unknown\n"
+                .to_owned()
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_transport_constants_json() -> String {
+    r#"{"command":"transport","kind":"constants","actions":["classify-error","classify-empty","send"],"failureReasons":["timeout","unreachable","auth","rate_limit","rejected","parse_error","unknown"],"retryableReasons":["timeout","unreachable","rate_limit"],"fatalReasons":["auth","rejected","parse_error","unknown"],"sendFailover":["skip disconnected","skip unreachable","fall through false","fall through retryable throw","stop on fatal throw","first ok wins"],"transportSpec":{"shape":"name[:connected][:canReach][:ok|false|throw=err]","booleanValues":["true","false"],"defaultConnected":true,"defaultCanReach":true,"defaultAction":"ok"},"defaultTarget":{"oracle":"neo","host":null,"tmuxTarget":"neo:1","message":"hello","from":"codex"}}
+"#
+    .to_owned()
+}
+
 fn transport_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+            "{message}\nusage: maw-rs transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n       maw-rs transport constants [--plan-json]\n"
         ),
+    }
+}
+
+fn transport_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\nusage: maw-rs transport constants [--plan-json]\n"),
     }
 }
 
@@ -10596,7 +10639,7 @@ fn usage_text() -> String {
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]
-  peer-sources constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+  peer-sources constants [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n  transport constants [--plan-json]\n"
         .to_owned()
 }
 
