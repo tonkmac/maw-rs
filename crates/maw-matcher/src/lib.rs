@@ -391,9 +391,8 @@ mod tests {
     }
     #[test]
     fn matcher_edge_branches_cover_empty_str_alias_and_ambiguous_windows() {
-        assert_eq!("literal".name(), "literal");
         let borrowed: &str = "borrowed";
-        assert_eq!(borrowed.name(), "borrowed");
+        assert_eq!(Named::name(&borrowed), "borrowed");
 
         assert_eq!(
             resolve_numeric_fleet_stem_prefix("", &[session("20-homekeeper")]),

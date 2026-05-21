@@ -256,4 +256,23 @@ mod tests {
         assert_eq!(strip_numeric_pane_suffix("s:oracle.v2"), "s:oracle.v2");
         assert_eq!(strip_numeric_pane_suffix("s:oracle.12"), "s:oracle");
     }
+
+    #[test]
+    fn bring_args_parse_to_session_and_window_target() {
+        let parsed = parse_bring_args(&[
+            "pulse".to_owned(),
+            "--to".to_owned(),
+            "work:3".to_owned(),
+            "--engine".to_owned(),
+            "codex".to_owned(),
+            "--pick".to_owned(),
+        ])
+        .expect("bring args parse");
+
+        assert_eq!(parsed.oracle, "pulse");
+        assert_eq!(parsed.opts.session.as_deref(), Some("work"));
+        assert_eq!(parsed.opts.split_target.as_deref(), Some("work:3"));
+        assert_eq!(parsed.opts.engine.as_deref(), Some("codex"));
+        assert!(parsed.opts.pick);
+    }
 }

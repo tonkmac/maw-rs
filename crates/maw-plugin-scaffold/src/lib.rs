@@ -381,3 +381,70 @@ fn is_valid_plugin_name(name: &str) -> bool {
     first.is_ascii_lowercase()
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("maw-plugin-scaffold-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn scaffold_rust_writes_manifest_readme_and_rewritten_cargo() {
+        let template = temp_dir("rust-template");
+        let dest = temp_dir("rust-dest");
+        fs::create_dir_all(&template).expect("create template");
+        fs::write(
+            template.join("Cargo.toml"),
+            "name = \"template\"\nmaw-plugin-sdk = { path = \"../old\" }\n",
+        )
+        .expect("write cargo");
+
+        scaffold_rust("hello-plugin", &dest, &template, "../sdk").expect("scaffold rust");
+
+        let cargo = fs::read_to_string(dest.join("Cargo.toml")).expect("read cargo");
+        assert!(cargo.contains("name = \"hello-plugin\""));
+        assert!(cargo.contains("maw-plugin-sdk = { path = \"../sdk\" }"));
+        let manifest = fs::read_to_string(dest.join("plugin.json")).expect("read manifest");
+        assert!(manifest.contains("\"name\": \"hello-plugin\""));
+        assert!(fs::read_to_string(dest.join("README.md"))
+            .expect("read readme")
+            .contains("hello-plugin"));
+        let _ = fs::remove_dir_all(template);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn scaffold_as_rewrites_package_and_writes_manifest() {
+        let template = temp_dir("as-template");
+        let dest = temp_dir("as-dest");
+        fs::create_dir_all(&template).expect("create template");
+        fs::write(template.join("package.json"), r#"{"name":"template"}"#).expect("write package");
+
+        scaffold_as("hello_as", &dest, &template).expect("scaffold as");
+
+        assert!(fs::read_to_string(dest.join("package.json"))
+            .expect("read package")
+            .contains("\"name\": \"hello_as\""));
+        assert!(fs::read_to_string(dest.join("plugin.json"))
+            .expect("read manifest")
+            .contains("\"name\": \"hello-as\""));
+        let _ = fs::remove_dir_all(template);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn invalid_empty_plugin_name_is_rejected() {
+        assert_eq!(
+            validate_plugin_name("").as_deref(),
+            Some("name is required")
+        );
+        assert!(validate_plugin_name("1bad").is_some());
+    }
+}

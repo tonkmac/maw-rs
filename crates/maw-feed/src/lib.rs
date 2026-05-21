@@ -244,3 +244,35 @@ fn days_in_month(year: i32, month: u32) -> Option<u32> {
 const fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_parser_rejects_invalid_months_and_non_leap_days() {
+        assert_eq!(parse_timestamp_ms("2026-13-01 00:00:00"), None);
+        assert_eq!(parse_timestamp_ms("2026-02-29 00:00:00"), None);
+        assert!(parse_timestamp_ms("2024-02-29 00:00:00").is_some());
+    }
+
+    #[test]
+    fn activity_descriptions_cover_empty_and_unknown_messages() {
+        let event = FeedEvent {
+            timestamp: "2026-05-21 00:00:00".to_owned(),
+            oracle: "pulse".to_owned(),
+            host: "white".to_owned(),
+            event: "PostToolUse".to_owned(),
+            project: "maw".to_owned(),
+            session_id: "s".to_owned(),
+            message: "  ".to_owned(),
+            ts: 1,
+        };
+        assert_eq!(describe_activity(&event), "✓ Tool done");
+
+        let mut unknown = event.clone();
+        unknown.event = "CustomEvent".to_owned();
+        unknown.message.clear();
+        assert_eq!(describe_activity(&unknown), "CustomEvent");
+    }
+}

@@ -2216,3 +2216,150 @@ fn is_semver_core(core: &str) -> bool {
             .iter()
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("maw-plugin-manifest-{name}-{nonce}"))
+    }
+
+    fn manifest(name: &str) -> PluginManifest {
+        PluginManifest {
+            name: name.to_owned(),
+            version: "1.2.3".to_owned(),
+            weight: None,
+            tier: None,
+            wasm: None,
+            entry: None,
+            sdk: "*".to_owned(),
+            cli: None,
+            api: None,
+            description: Some("demo plugin".to_owned()),
+            author: None,
+            hooks: None,
+            cron: None,
+            module: None,
+            transport: None,
+            engine: None,
+            target: None,
+            capability_namespaces: None,
+            capabilities: None,
+            capability_warnings: Vec::new(),
+            dependencies: None,
+            artifact: None,
+        }
+    }
+
+    fn loaded(name: &str, dir: PathBuf) -> LoadedPlugin {
+        LoadedPlugin {
+            manifest: manifest(name),
+            dir,
+            wasm_path: PathBuf::new(),
+            entry_path: None,
+            kind: LoadedPluginKind::Wasm,
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn module_exports_reject_missing_or_empty_exports() {
+        let missing = serde_json::json!({"module": {"path": "./mod.js"}});
+        assert_eq!(
+            parse_module(&missing).expect_err("missing exports"),
+            "plugin.json: module.exports must be a non-empty array of strings"
+        );
+
+        let empty = serde_json::json!({"module": {"exports": [], "path": "./mod.js"}});
+        assert_eq!(
+            parse_module(&empty).expect_err("empty exports"),
+            "plugin.json: module.exports must be a non-empty array of strings"
+        );
+    }
+
+    #[test]
+    fn import_symbol_reports_missing_module_path_before_loading() {
+        let plugin = loaded("demo", temp_dir("missing-module"));
+        let err = resolve_plugin_module_path(&plugin).expect_err("missing module path");
+        assert_eq!(err, "plugin 'demo' does not declare module.path");
+    }
+
+    #[test]
+    fn wasm_parser_reads_handle_body_and_errors_when_body_is_absent() {
+        let body = [0x00, 0x41, 0x2a, 0x0b];
+        let section = [
+            0x01,
+            u8::try_from(body.len()).expect("small wasm body"),
+            body[0],
+            body[1],
+            body[2],
+            body[3],
+        ];
+        assert_eq!(
+            parse_handle_result(&section, 0, 0, 1).expect("const handle result"),
+            42
+        );
+        assert_eq!(
+            parse_handle_result(&[0x00], 0, 0, 1).expect_err("missing body"),
+            "failed to parse WebAssembly module"
+        );
+    }
+
+    #[test]
+    fn wasm_helpers_cover_limits_memory_bounds_and_result_fallbacks() {
+        let mut limits = WasmCursor::new(&[0x01, 0x01, 0x02]);
+        skip_limits(&mut limits).expect("limits with max");
+
+        let mut memory = [0_u8; 4];
+        write_linear_memory(&mut memory, 10, b"ignored");
+        assert_eq!(memory, [0, 0, 0, 0]);
+
+        assert_eq!(read_wasm_result_from_memory(&memory, 0), InvokeResult::ok());
+        assert_eq!(
+            read_wasm_result_from_memory(&memory, 99),
+            InvokeResult::ok()
+        );
+    }
+
+    #[test]
+    fn semver_helpers_reject_empty_optional_segments_and_missing_core_parts() {
+        assert!(!is_semver("1.2.3+"));
+        assert!(!is_semver("1.2.3-alpha-extra-more"));
+        assert!(!is_semver_core("1.2"));
+        assert!(!is_semver_core("1.2."));
+    }
+
+    #[test]
+    fn discover_applies_weight_overrides() {
+        let root = temp_dir("discover");
+        let plugin_dir = root.join("demo");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"demo","version":"1.0.0","sdk":"*"}"#,
+        )
+        .expect("write manifest");
+        std::fs::write(root.join(".overrides.json"), r#"{"demo":7}"#).expect("write overrides");
+
+        let report = discover_packages(&DiscoverPackagesOptions {
+            scan_dirs: vec![root.clone()],
+            disabled_plugins: Vec::new(),
+            runtime_version: runtime_sdk_version(),
+            use_cache: false,
+        });
+
+        assert_eq!(report.plugins.len(), 1);
+        assert_eq!(report.plugins[0].manifest.weight, Some(7));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("legacy plugin")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
