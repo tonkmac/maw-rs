@@ -3204,6 +3204,10 @@ fn json_opt_string(value: Option<&str>) -> String {
 }
 
 fn run_bind_host_plan(argv: &[String]) -> CliOutput {
+    if matches!(argv.first().map(String::as_str), Some("constants")) {
+        return run_bind_host_constants_plan(&argv[1..]);
+    }
+
     let parsed = match parse_bind_host_args(argv) {
         Ok(parsed) => parsed,
         Err(message) => return bind_host_usage_error(&message),
@@ -3308,6 +3312,48 @@ fn render_bind_host_plan_json(
         input_fields.join(","),
         json_string(&result.hostname)
     )
+}
+
+fn run_bind_host_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            arg => {
+                return bind_host_constants_usage_error(&format!(
+                    "bind-host constants: unknown arg {arg}"
+                ))
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_bind_host_constants_json()
+        } else {
+            "bind-host constants hosts=127.0.0.1,0.0.0.0 reasons=config.peers,config.namedPeers,MAW_HOST,peers.json\n".to_owned()
+        },
+        stderr: String::new(),
+    }
+}
+
+fn render_bind_host_constants_json() -> String {
+    r#"{"command":"bind-host","action":"constants","hosts":{"loopback":"127.0.0.1","remote":"0.0.0.0"},"inputFlags":["config-peers-len","config-named-peers-len","maw-host","peers-store-len","peers-store-error"],"remoteReasons":["config.peers","config.namedPeers","MAW_HOST","peers.json"],"remoteMawHostValue":"0.0.0.0","priority":["config.peers","config.namedPeers","MAW_HOST","peers.json"]}
+"#
+    .to_owned()
+}
+
+fn bind_host_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", bind_host_constants_usage()),
+    }
+}
+
+fn bind_host_constants_usage() -> &'static str {
+    "usage: maw-rs bind-host constants [--plan-json]"
 }
 
 fn bind_host_usage_error(message: &str) -> CliOutput {
@@ -10273,7 +10319,7 @@ fn usage_ok() -> CliOutput {
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
   auto-wake constants [--plan-json]
-  auth sign-v1 --token <token> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth sign-headers --token <token> --now <ts> [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v1 --token <token> --signature <hex> --signed-at <ts> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth verify-legacy-from --from <oracle:node> --signed-at <iso> --signature <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v3-from --from <oracle:node> --timestamp <ts> --signature-v3 <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth from-sign-payload --from <oracle:node> (--timestamp <ts>|--legacy --signed-at <iso>) [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth hmac-sign --secret <secret> --payload <payload> [--plan-json]\n  auth hmac-verify --secret <secret> --payload <payload> --signature <hex> [--plan-json]\n  auth constants [--plan-json]\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  auth loopback --address <address> [--plan-json]\n  auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n  auth hash-body [--body <body>] [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]
+  auth sign-v1 --token <token> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth sign-headers --token <token> --now <ts> [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v1 --token <token> --signature <hex> --signed-at <ts> --now <ts> [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth verify-legacy-from --from <oracle:node> --signed-at <iso> --signature <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth verify-v3-from --from <oracle:node> --timestamp <ts> --signature-v3 <hex> --now <ts> [--cached-pubkey <key>] [--method <method>] [--path <path>] [--body <body>] [--plan-json]\n  auth from-sign-payload --from <oracle:node> (--timestamp <ts>|--legacy --signed-at <iso>) [--method <method>] [--path <path>] [--body-hash <sha256>] [--plan-json]\n  auth hmac-sign --secret <secret> --payload <payload> [--plan-json]\n  auth hmac-verify --secret <secret> --payload <payload> --signature <hex> [--plan-json]\n  auth constants [--plan-json]\n  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  auth loopback --address <address> [--plan-json]\n  auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n  auth hash-body [--body <body>] [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bind-host constants [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]
   discover constants [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]
   federation-health constants [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]
   federation-identity constants [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]
