@@ -289,7 +289,7 @@ fn parse_iso_timestamp_ms(value: &str) -> Option<u64> {
         return None;
     }
 
-    let days = days_from_civil(year, month, day)?;
+    let days = days_from_civil(year, month, day);
     let seconds = days
         .checked_mul(86_400)?
         .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
@@ -323,15 +323,15 @@ const fn is_leap_year(year: i32) -> bool {
 }
 
 /// Days since Unix epoch for a Gregorian date.
-fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let year = year - i32::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
-    let month_i = i32::try_from(month).ok()?;
-    let doy =
-        (153 * (month_i + if month_i > 2 { -3 } else { 9 }) + 2) / 5 + i32::try_from(day).ok()? - 1;
+    let month_i = month.cast_signed();
+    let day_i = day.cast_signed();
+    let doy = (153 * (month_i + if month_i > 2 { -3 } else { 9 }) + 2) / 5 + day_i - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(i64::from(era) * 146_097 + i64::from(doe) - 719_468)
+    i64::from(era) * 146_097 + i64::from(doe) - 719_468
 }
 
 #[cfg(test)]
@@ -531,7 +531,7 @@ mod remaining_coverage_tests {
         ] {
             assert_eq!(parse_iso_timestamp_ms(input), Some(expected), "{input}");
         }
-        assert!(days_from_civil(-1, 3, 1).is_some());
+        assert!(days_from_civil(-1, 3, 1) < 0);
     }
 
     #[test]

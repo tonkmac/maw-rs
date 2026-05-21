@@ -360,9 +360,7 @@ pub fn remove_stale_peers(env: &PeerStoreEnv, now_ms: u64) -> io::Result<PeerDoc
     let mut removed = 0;
     mutate_peer_store(env, |data| {
         for stale_peer in &stale {
-            if data.peers.remove(&stale_peer.alias).is_some() {
-                removed += 1;
-            }
+            removed += usize::from(data.peers.remove(&stale_peer.alias).is_some());
         }
     })?;
     Ok(PeerDoctorCheck {

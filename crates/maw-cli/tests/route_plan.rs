@@ -132,6 +132,21 @@ fn route_plan_cli_matches_maw_js_routing_fixtures() {
 }
 
 #[test]
+fn route_plan_json_includes_error_hint() {
+    let output = run_cli(&[
+        "route".to_owned(),
+        "--plan-json".to_owned(),
+        "--query".to_owned(),
+        String::new(),
+    ]);
+
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let actual: Value = serde_json::from_str(&output.stdout).expect("route json");
+    assert_eq!(actual["type"], "error");
+    assert_eq!(actual["hint"], "usage: maw hey <agent> <message>");
+}
+
+#[test]
 fn route_plan_rejects_window_without_session() {
     let argv = vec![
         "route".to_owned(),

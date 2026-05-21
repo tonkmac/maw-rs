@@ -483,7 +483,7 @@ fn read_wasm_result_from_memory(memory: &[u8], result_ptr: i32) -> InvokeResult 
 
 fn read_length_prefixed_wasm_output(data: &[u8], start: usize) -> Option<String> {
     let len_bytes = data.get(start..start + 4)?;
-    let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+    let len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
     if len == 0 || len >= 1_000_000 {
         return None;
     }

@@ -96,6 +96,16 @@ fn stale_age_uses_last_seen_then_added_at_and_clamps_future_dates() {
         stale_age_ms(&peer("2026-05-18T00:00:00.aZ", None), now),
         None
     );
+    for invalid in [
+        "year-05-18T00:00:00.000Z",
+        "2026-month-18T00:00:00.000Z",
+        "2026-05-dayT00:00:00.000Z",
+        "2026-05-18Thour:00:00.000Z",
+        "2026-05-18T00:minute:00.000Z",
+        "2026-05-18T00:00Z",
+    ] {
+        assert_eq!(stale_age_ms(&peer(invalid, None), now), None, "{invalid}");
+    }
 }
 
 #[test]
