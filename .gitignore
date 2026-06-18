@@ -2,3 +2,7 @@ target/
 ψ/*
 !ψ/teams/
 ψ/
+
+# codex coder runtime homes (worktree-local CODEX_HOME)
+.codex/
+.maw-engine/
