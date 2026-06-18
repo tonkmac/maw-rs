@@ -43,7 +43,7 @@ use maw_peer::{
 use maw_plugin_manifest::{
     discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
     DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
-    LoadedPluginKind, MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
+    MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -158,13 +158,10 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
 }
 
 fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
-    let mut options = DiscoverPackagesOptions::default();
-    options.runtime_version = "1.0.0".to_owned();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let default_dir = format!("{home}/.maw/plugins");
-    if std::path::Path::new(&default_dir).is_dir() {
-        options.scan_dirs = vec![default_dir.into()];
-    }
+    let options = DiscoverPackagesOptions {
+        runtime_version: "1.0.0".to_owned(),
+        ..DiscoverPackagesOptions::default()
+    };
     let report = discover_packages(&options);
     let (plugin, matched_args) = report
         .plugins
@@ -178,7 +175,11 @@ fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
     };
 
     if plugin.entry_path.is_some() {
-        let cli_command = plugin.manifest.cli.as_ref().map(|c| c.command.as_str()).unwrap_or("");
+        let cli_command = plugin
+            .manifest
+            .cli
+            .as_ref()
+            .map_or("", |c| c.command.as_str());
         let mut cmd_args: Vec<&str> = cli_command.split_whitespace().collect();
         for arg in &ctx.args {
             cmd_args.push(arg.as_str());
