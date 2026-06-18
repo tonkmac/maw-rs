@@ -43,7 +43,7 @@ use maw_peer::{
 use maw_plugin_manifest::{
     discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
     DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
-    LoadedPluginKind, MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
+    MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -113,6 +113,8 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "plugin-manifest" => run_plugin_manifest_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "attach" | "a" => run_attach_plan(&argv[1..]),
+        "run" => run_run_command(&argv[1..]),
+        "send-enter" => run_send_enter_command(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "ls" => run_ls_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -158,11 +160,13 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
 }
 
 fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
-    let mut options = DiscoverPackagesOptions::default();
-    options.runtime_version = "1.0.0".to_owned();
+    let mut options = DiscoverPackagesOptions {
+        runtime_version: "1.0.0".to_owned(),
+        ..Default::default()
+    };
     let home = std::env::var("HOME").unwrap_or_default();
     let default_dir = format!("{home}/.maw/plugins");
-    if std::path::Path::new(&default_dir).is_dir() {
+    if std::env::var_os("MAW_PLUGINS_DIR").is_none() && std::path::Path::new(&default_dir).is_dir() {
         options.scan_dirs = vec![default_dir.into()];
     }
     let report = discover_packages(&options);
@@ -178,7 +182,11 @@ fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
     };
 
     if plugin.entry_path.is_some() {
-        let cli_command = plugin.manifest.cli.as_ref().map(|c| c.command.as_str()).unwrap_or("");
+        let cli_command = plugin
+            .manifest
+            .cli
+            .as_ref()
+            .map_or("", |cli| cli.command.as_str());
         let mut cmd_args: Vec<&str> = cli_command.split_whitespace().collect();
         for arg in &ctx.args {
             cmd_args.push(arg.as_str());

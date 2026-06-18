@@ -289,6 +289,23 @@ pub fn tmux_split_action_args(
     Ok(args)
 }
 
+/// Build tmux args for `send-keys -l <text>` literal typing.
+#[must_use]
+pub fn tmux_send_keys_literal_args(target: &str, text: &str) -> Vec<String> {
+    vec![
+        "-t".to_owned(),
+        target.to_owned(),
+        "-l".to_owned(),
+        text.to_owned(),
+    ]
+}
+
+/// Build tmux args for sending one Enter key.
+#[must_use]
+pub fn tmux_send_enter_args(target: &str) -> Vec<String> {
+    vec!["-t".to_owned(), target.to_owned(), "Enter".to_owned()]
+}
+
 /// Build tmux args for maw-js `cmdTmuxSend`.
 #[must_use]
 pub fn tmux_send_command_args(resolved: &str, command: &str, literal: bool) -> Vec<String> {

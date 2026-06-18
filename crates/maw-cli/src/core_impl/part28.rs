@@ -162,3 +162,180 @@ fn attach_action_session(action: &TmuxAttachAction) -> &str {
         | TmuxAttachAction::Recover { session } => session,
     }
 }
+
+fn run_run_command(argv: &[String]) -> CliOutput {
+    let (target, text) = match parse_run_command_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return run_usage_error(&message),
+    };
+    let mut client = TmuxClient::local();
+    let resolved = match resolve_local_tmux_command_target(&mut client, &target) {
+        Ok(target) => target,
+        Err(message) => return command_target_error("run", &message),
+    };
+    if !text.is_empty() {
+        if let Err(error) = client.send_keys_literal(&resolved, &text) {
+            return command_target_error("run", &format!("tmux send-keys failed: {error}"));
+        }
+    }
+    if let Err(error) = client.send_enter(&resolved) {
+        return command_target_error("run", &format!("tmux send-keys failed: {error}"));
+    }
+    CliOutput {
+        code: 0,
+        stdout: format!("\x1b[32mran\x1b[0m → {resolved}: {}\n", truncate_cli_text(&text, 200)),
+        stderr: String::new(),
+    }
+}
+
+fn run_send_enter_command(argv: &[String]) -> CliOutput {
+    let (target, count) = match parse_send_enter_command_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return send_enter_usage_error(&message),
+    };
+    let mut client = TmuxClient::local();
+    let resolved = match resolve_local_tmux_command_target(&mut client, &target) {
+        Ok(target) => target,
+        Err(message) => return command_target_error("send-enter", &message),
+    };
+    for _ in 0..count {
+        if let Err(error) = client.send_enter(&resolved) {
+            return command_target_error(
+                "send-enter",
+                &format!("tmux send-keys failed: {error}"),
+            );
+        }
+    }
+    let plural = if count == 1 {
+        "Enter".to_owned()
+    } else {
+        format!("{count} Enters")
+    };
+    CliOutput {
+        code: 0,
+        stdout: format!("\x1b[32mdelivered\x1b[0m → {resolved}: {plural}\n"),
+        stderr: String::new(),
+    }
+}
+
+fn parse_run_command_args(argv: &[String]) -> Result<(String, String), String> {
+    let Some(target_index) = argv.iter().position(|arg| !arg.starts_with('-')) else {
+        return Err("usage: maw-rs run <target> \"<cmd>\"".to_owned());
+    };
+    let target = argv[target_index].clone();
+    let text = argv[target_index + 1..].join(" ");
+    Ok((target, text))
+}
+
+fn parse_send_enter_command_args(argv: &[String]) -> Result<(String, usize), String> {
+    let mut target = None;
+    let mut count = 1usize;
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if matches!(arg.as_str(), "--N" | "-N" | "--n") {
+            let Some(next) = argv.get(index + 1) else {
+                return Err("--N requires a positive integer (got: nothing)".to_owned());
+            };
+            count = parse_send_enter_count(next, next)?;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg
+            .strip_prefix("--N=")
+            .or_else(|| arg.strip_prefix("--n="))
+        {
+            count = parse_send_enter_count(value, arg)?;
+            index += 1;
+            continue;
+        }
+        if target.is_none() && !arg.starts_with('-') {
+            target = Some(arg.clone());
+        }
+        index += 1;
+    }
+    let Some(target) = target else {
+        return Err("usage: maw-rs send-enter <target> [--N <count>]".to_owned());
+    };
+    Ok((target, count))
+}
+
+fn parse_send_enter_count(raw: &str, label: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(count) if count > 0 => Ok(count),
+        _ => Err(format!("--N requires a positive integer (got: {label})")),
+    }
+}
+
+fn resolve_local_tmux_command_target(
+    client: &mut TmuxClient<maw_tmux::CommandTmuxRunner>,
+    query: &str,
+) -> Result<String, String> {
+    if query.starts_with('%') {
+        return Ok(query.to_owned());
+    }
+    let sessions = client
+        .list_all()
+        .into_iter()
+        .map(|session| RouteSession {
+            name: session.name,
+            windows: session
+                .windows
+                .into_iter()
+                .map(|window| RouteWindow {
+                    index: window.index,
+                    name: window.name,
+                    active: window.active,
+                })
+                .collect(),
+            source: None,
+        })
+        .collect::<Vec<_>>();
+    match resolve_route_target(query, &RouteConfig::default(), &sessions) {
+        RouteResult::Local { target } | RouteResult::SelfNode { target } => Ok(target),
+        RouteResult::Peer { node, target, .. } => Err(format!(
+            "cross-node target '{query}' (node '{node}', target '{target}') is not supported"
+        )),
+        RouteResult::Error { detail, hint, .. } => {
+            if let Some(hint) = hint {
+                Err(format!("{detail} — {hint}"))
+            } else {
+                Err(detail)
+            }
+        }
+    }
+}
+
+fn command_target_error(command: &str, message: &str) -> CliOutput {
+    CliOutput {
+        code: 1,
+        stdout: String::new(),
+        stderr: format!("{command}: {message}\n"),
+    }
+}
+
+fn run_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\nusage: maw-rs run <target> \"<cmd>\"\n"),
+    }
+}
+
+fn send_enter_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\nusage: maw-rs send-enter <target> [--N <count>]\n"),
+    }
+}
+
+fn truncate_cli_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}

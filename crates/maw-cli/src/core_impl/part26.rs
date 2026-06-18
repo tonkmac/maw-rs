@@ -337,6 +337,8 @@ fn usage_text() -> String {
         "usage: maw-rs <command> [args]\n",
         "ported commands:\n",
         "  a|attach <target> [--print] [--readonly|-r]   attach to a tmux session\n",
+        "  run <target> <cmd...>                         type text and press Enter\n",
+        "  send-enter <target> [--N <count>]             send Enter to a tmux target\n",
         "  ls [--compact|-c] [--verbose|-v] [--json]     list live local sessions\n",
         "  plugin ls [-v|--verbose]                      list installed plugins\n",
         "  bring|b <oracle> [--to <session[:window]>]    plan a wake split target\n",

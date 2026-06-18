@@ -44,8 +44,10 @@ fn parse_plugin_args(argv: &[String]) -> Result<PluginAction, String> {
 }
 
 fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, String> {
-    let mut options = DiscoverPackagesOptions::default();
-    options.runtime_version = "1.0.0".to_owned();
+    let mut options = DiscoverPackagesOptions {
+        runtime_version: "1.0.0".to_owned(),
+        ..Default::default()
+    };
     let mut scan_dirs = Vec::new();
     let mut verbose = false;
     let mut index = 0;
@@ -72,14 +74,14 @@ fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, String> {
         }
         index += 1;
     }
-    if !scan_dirs.is_empty() {
-        options.scan_dirs = scan_dirs;
-    } else {
+    if scan_dirs.is_empty() {
         let home = std::env::var("HOME").unwrap_or_default();
         let default_dir = format!("{home}/.maw/plugins");
         if std::path::Path::new(&default_dir).is_dir() {
             options.scan_dirs = vec![default_dir.into()];
         }
+    } else {
+        options.scan_dirs = scan_dirs;
     }
 
     Ok(PluginAction::Ls { options, verbose })
@@ -116,12 +118,11 @@ fn render_plugin_ls(plugins: &[LoadedPlugin], warnings: &[String], verbose: bool
         let _ = writeln!(output, "{} plugins", tier.as_str());
         let _ = writeln!(
             output,
-            "{:<name_width$}  {:<version_width$}  {:<tier_width$}  {:<surfaces_width$}  {}",
+            "{:<name_width$}  {:<version_width$}  {:<tier_width$}  {:<surfaces_width$}  dir",
             "name",
             "version",
             "tier",
             "surfaces",
-            "dir",
             name_width = widths.name,
             version_width = widths.version,
             tier_width = widths.tier,
@@ -165,6 +166,7 @@ fn render_plugin_ls(plugins: &[LoadedPlugin], warnings: &[String], verbose: bool
         output.push('\n');
         output.push_str("warnings\n");
         for warning in warnings {
+            let warning = warning.replace("requires maw SDK", "requires sdk");
             let _ = writeln!(output, "  - {warning}");
         }
     }
@@ -246,16 +248,11 @@ fn plugin_ls_surfaces(cli_command: Option<&str>, api_path: Option<&str>) -> Stri
 }
 
 fn plugin_ls_cli_command(plugin: &LoadedPlugin) -> Option<String> {
-    plugin.manifest.cli.as_ref().map_or_else(
-        || {
-            let dispatchable = match plugin.kind {
-                LoadedPluginKind::Ts => plugin.entry_path.is_some(),
-                LoadedPluginKind::Wasm => !plugin.wasm_path.as_os_str().is_empty(),
-            };
-            dispatchable.then(|| plugin.manifest.name.clone())
-        },
-        |cli| Some(cli.command.clone()),
-    )
+    plugin
+        .manifest
+        .cli
+        .as_ref()
+        .map(|cli| cli.command.clone())
 }
 
 const fn plugin_tier_order(tier: PluginTier) -> u8 {
