@@ -115,6 +115,8 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "attach" | "a" => run_attach_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "ls" => run_ls_plan(&argv[1..]),
+        "run" => run_run_command(&argv[1..]),
+        "send-enter" => run_send_enter_command(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
         "fuzzy" => run_fuzzy_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
