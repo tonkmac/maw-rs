@@ -58,6 +58,21 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
+fn bun_available() -> bool {
+    std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn skip_without_bun(test_name: &str) -> bool {
+    if bun_available() {
+        return false;
+    }
+    eprintln!("skipping {test_name}: bun is not available on PATH");
+    true
+}
+
 fn write_bun_shim(bin_dir: &Path) {
     let shim = bin_dir.join("bun");
     write(
@@ -168,7 +183,12 @@ fn ctx(args: &[&str]) -> InvokeContext {
 
 #[test]
 fn bun_invoke_runtime_calls_real_ts_default_export_handler() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if skip_without_bun("bun_invoke_runtime_calls_real_ts_default_export_handler") {
+        return;
+    }
     let _restore = EnvRestore::capture();
     let root = temp_dir("real-handler");
     let plugin_dir = root.join("plugin");
@@ -184,7 +204,12 @@ fn bun_invoke_runtime_calls_real_ts_default_export_handler() {
 
 #[test]
 fn bun_invoke_runtime_passes_driver_args_stdin_context_and_parses_result() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if skip_without_bun("bun_invoke_runtime_passes_driver_args_stdin_context_and_parses_result") {
+        return;
+    }
     let _restore = EnvRestore::capture();
     let root = temp_dir("happy");
     let capture_dir = setup_fake_bun(&root);
@@ -214,7 +239,12 @@ fn bun_invoke_runtime_passes_driver_args_stdin_context_and_parses_result() {
 
 #[test]
 fn bun_invoke_runtime_maps_nonzero_exit_to_error() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if skip_without_bun("bun_invoke_runtime_maps_nonzero_exit_to_error") {
+        return;
+    }
     let _restore = EnvRestore::capture();
     let root = temp_dir("nonzero");
     setup_fake_bun(&root);
@@ -235,7 +265,9 @@ fn bun_invoke_runtime_maps_nonzero_exit_to_error() {
 
 #[test]
 fn bun_invoke_runtime_reports_missing_bun() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _restore = EnvRestore::capture();
     let root = temp_dir("missing");
     let missing_path = root.join("missing-bin");
@@ -256,7 +288,12 @@ fn bun_invoke_runtime_reports_missing_bun() {
 
 #[test]
 fn bun_invoke_runtime_reports_timeout() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if skip_without_bun("bun_invoke_runtime_reports_timeout") {
+        return;
+    }
     let _restore = EnvRestore::capture();
     let root = temp_dir("timeout");
     setup_fake_bun(&root);
