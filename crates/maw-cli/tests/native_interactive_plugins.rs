@@ -324,3 +324,68 @@ fn attach_remote_tier3_plan_json_matches_committed_golden_without_ref_checkout()
     );
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
 }
+
+#[test]
+fn attach_ssh_refuses_option_injection_alias_before_ssh_spawn() {
+    let root = temp_dir("attach-ssh-option-alias");
+    let pwned = root.join("pwned");
+    let payload = format!("-oProxyCommand=touch+{}", pwned.display());
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node",
+            "peer-one",
+            "--session",
+            "foo",
+            "--ssh-alias",
+            &payload,
+        ],
+        &root,
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stderr.contains("unsafe ssh alias '-oProxyCommand="),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unreachable"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ssh exited"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert!(!pwned.exists(), "ssh ProxyCommand payload must not run");
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+}
+
+#[test]
+fn attach_ssh_refuses_option_injection_node_before_ssh_spawn() {
+    let root = temp_dir("attach-ssh-option-node");
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node=-oProxyCommand=touch+/tmp/pwned",
+            "--session",
+            "foo",
+            "--ssh-alias",
+            "peer-one",
+        ],
+        &root,
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("unsafe node '-oProxyCommand="), "{stderr}");
+    assert!(
+        !stderr.contains("unreachable"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ssh exited"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+}

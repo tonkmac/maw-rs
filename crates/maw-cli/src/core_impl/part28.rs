@@ -742,11 +742,42 @@ fn attach_ssh_usage_text() -> String {
 }
 
 fn validate_attach_ssh_target(target: &AttachSshTarget) -> Result<(), String> {
-    if target.ssh_alias.trim().is_empty() { return Err(format!("cannot attach to {}: missing SSH target", target.node)); }
-    if !target.session_name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')) {
-        return Err(format!("cannot attach to {}: unsafe tmux session '{}'", target.node, target.session_name));
+    validate_attach_ssh_node(&target.node)?;
+    validate_attach_ssh_alias(&target.node, &target.ssh_alias)?;
+    if !is_safe_attach_ssh_token(&target.session_name) {
+        return Err(format!(
+            "cannot attach to {}: unsafe tmux session '{}'",
+            target.node, target.session_name
+        ));
     }
     Ok(())
+}
+
+fn validate_attach_ssh_node(node: &str) -> Result<(), String> {
+    if !is_safe_attach_ssh_token(node) {
+        return Err(format!("cannot attach: unsafe node '{node}'"));
+    }
+    Ok(())
+}
+
+fn validate_attach_ssh_alias(node: &str, alias: &str) -> Result<(), String> {
+    if alias.trim().is_empty() {
+        return Err(format!("cannot attach to {node}: missing SSH target"));
+    }
+    if !is_safe_attach_ssh_token(alias) {
+        return Err(format!("cannot attach to {node}: unsafe ssh alias '{alias}'"));
+    }
+    Ok(())
+}
+
+fn is_safe_attach_ssh_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && !trimmed.starts_with('-')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
 }
 
 fn attach_ssh_probe_args(alias: &str) -> Vec<String> {
