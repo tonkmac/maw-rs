@@ -5,12 +5,37 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_plugin_manifest::{
-    hash_file, invoke_plugin, BunInvokeRuntime, ExtismWasmInvokeRuntime, InvokeContext,
-    InvokeResult, InvokeSource, LoadedPlugin, LoadedPluginKind, MawWasmHost, PluginManifest,
+    hash_file, invoke_plugin, load_manifest_from_dir, BunInvokeRuntime, ExtismWasmInvokeRuntime,
+    InvokeContext, InvokeResult, InvokeSource, LoadedPlugin, LoadedPluginKind, MawWasmHost,
+    PluginManifest,
 };
 use serde_json::Value;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+const PROFILE_CURRENT_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.fs.read",
+    "fs:read:config",
+    "/config/profile-active",
+)];
+const PROFILE_LIST_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.read", "fs:read:config", "/config/profile-active"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:config", "/config/profiles/all.json"),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:config",
+        "/config/profiles/minimal.json",
+    ),
+];
+const PROFILE_SHOW_MINIMAL_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.fs.read",
+    "fs:read:config",
+    "/config/profiles/minimal.json",
+)];
+const PROFILE_USE_ALL_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.read", "fs:read:config", "/config/profiles/all.json"),
+    ExpectedHostCall::new("maw.fs.write", "fs:write:config", "/config/profile-active"),
+];
 
 #[test]
 fn golden_parity_trivial_bun_and_wasm_outputs_match_in_isolated_maw_home() {
@@ -19,6 +44,7 @@ fn golden_parity_trivial_bun_and_wasm_outputs_match_in_isolated_maw_home() {
         manifest_name: "trivial-parity",
         args: &["alpha", "beta"],
         expected_host_calls: None,
+        expected_host_transcript: None,
         real_maw_js_entry: RealMawJsEntry::DefaultHandler(
             "examples/wasm-parity/trivial/bun/index.ts",
         ),
@@ -33,6 +59,7 @@ fn golden_parity_shellenv_bun_and_wasm_outputs_match_in_isolated_maw_home() {
             manifest_name: "shellenv-parity",
             args,
             expected_host_calls: Some(0),
+            expected_host_transcript: None,
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/shellenv/src/index.ts",
             ),
@@ -55,6 +82,7 @@ fn golden_parity_learn_bun_and_wasm_outputs_match_in_isolated_maw_home() {
             manifest_name: "learn-parity",
             args,
             expected_host_calls: Some(0),
+            expected_host_transcript: None,
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/learn/index.ts",
             ),
@@ -69,6 +97,7 @@ fn golden_parity_cross_team_queue_bun_and_wasm_outputs_match_in_isolated_maw_hom
         manifest_name: "cross-team-queue-parity",
         args: &[],
         expected_host_calls: Some(0),
+        expected_host_transcript: None,
         real_maw_js_entry: RealMawJsEntry::CrossTeamQueueHandle,
     });
 }
@@ -90,6 +119,7 @@ fn golden_parity_project_bun_and_wasm_outputs_match_in_isolated_maw_home() {
             manifest_name: "project-parity",
             args,
             expected_host_calls: Some(0),
+            expected_host_transcript: None,
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/project/index.ts",
             ),
@@ -104,10 +134,32 @@ fn golden_parity_triggers_bun_and_wasm_outputs_match_in_isolated_maw_home() {
         manifest_name: "triggers-parity",
         args: &[],
         expected_host_calls: Some(0),
+        expected_host_transcript: None,
         real_maw_js_entry: RealMawJsEntry::DefaultHandler(
             "src/vendor/mpr-plugins/triggers/index.ts",
         ),
     });
+}
+
+#[test]
+fn golden_parity_profile_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&["current"][..], PROFILE_CURRENT_TRANSCRIPT),
+        (&["list"][..], PROFILE_LIST_TRANSCRIPT),
+        (&["show", "minimal"][..], PROFILE_SHOW_MINIMAL_TRANSCRIPT),
+        (&["use", "all"][..], PROFILE_USE_ALL_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "profile",
+            manifest_name: "profile-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/profile/index.ts",
+            ),
+        });
+    }
 }
 
 #[test]
@@ -124,6 +176,7 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         manifest_name: "trivial-parity",
         args: &["alpha", "beta"],
         expected_host_calls: None,
+        expected_host_transcript: None,
         real_maw_js_entry: RealMawJsEntry::DefaultHandler(
             "examples/wasm-parity/trivial/bun/index.ts",
         ),
@@ -135,6 +188,7 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
             manifest_name: "shellenv-parity",
             args,
             expected_host_calls: Some(0),
+            expected_host_transcript: None,
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/shellenv/src/index.ts",
             ),
@@ -154,6 +208,7 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
             manifest_name: "learn-parity",
             args,
             expected_host_calls: Some(0),
+            expected_host_transcript: None,
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/learn/index.ts",
             ),
@@ -165,6 +220,7 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         manifest_name: "cross-team-queue-parity",
         args: &[],
         expected_host_calls: Some(0),
+        expected_host_transcript: None,
         real_maw_js_entry: RealMawJsEntry::CrossTeamQueueHandle,
     });
 
@@ -183,6 +239,7 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
             manifest_name: "project-parity",
             args,
             expected_host_calls: Some(0),
+            expected_host_transcript: None,
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/project/index.ts",
             ),
@@ -194,10 +251,29 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         manifest_name: "triggers-parity",
         args: &[],
         expected_host_calls: Some(0),
+        expected_host_transcript: None,
         real_maw_js_entry: RealMawJsEntry::DefaultHandler(
             "src/vendor/mpr-plugins/triggers/index.ts",
         ),
     });
+
+    for (args, expected_host_transcript) in [
+        (&["current"][..], PROFILE_CURRENT_TRANSCRIPT),
+        (&["list"][..], PROFILE_LIST_TRANSCRIPT),
+        (&["show", "minimal"][..], PROFILE_SHOW_MINIMAL_TRANSCRIPT),
+        (&["use", "all"][..], PROFILE_USE_ALL_TRANSCRIPT),
+    ] {
+        cases.push(ParityCase {
+            plugin: "profile",
+            manifest_name: "profile-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/profile/index.ts",
+            ),
+        });
+    }
 
     cases
 }
@@ -214,6 +290,7 @@ fn generate_golden(case: ParityCase<'_>) {
     let temp = temp_dir("wasm-parity-golden");
     let isolated_home = temp.join("home");
     create_dir_all(&isolated_home).expect("isolated MAW_HOME");
+    seed_real_maw_home(&fixture, &isolated_home);
     let old_maw_home = std::env::var_os("MAW_HOME");
     let old_plugins_dir = std::env::var_os("MAW_PLUGINS_DIR");
     std::env::set_var("MAW_HOME", &isolated_home);
@@ -319,11 +396,29 @@ fn command_stdout(command: &mut Command) -> String {
 }
 
 #[derive(Clone, Copy)]
+struct ExpectedHostCall<'a> {
+    host_fn: &'a str,
+    capability: &'a str,
+    resource: &'a str,
+}
+
+impl<'a> ExpectedHostCall<'a> {
+    const fn new(host_fn: &'a str, capability: &'a str, resource: &'a str) -> Self {
+        Self {
+            host_fn,
+            capability,
+            resource,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct ParityCase<'a> {
     plugin: &'a str,
     manifest_name: &'a str,
     args: &'a [&'a str],
     expected_host_calls: Option<usize>,
+    expected_host_transcript: Option<&'a [ExpectedHostCall<'a>]>,
     real_maw_js_entry: RealMawJsEntry,
 }
 
@@ -345,6 +440,7 @@ fn run_parity_case(case: ParityCase<'_>) {
     let temp = temp_dir("wasm-parity");
     let isolated_home = temp.join("home");
     create_dir_all(&isolated_home).expect("isolated MAW_HOME");
+    seed_real_maw_home(&fixture, &isolated_home);
     let old_maw_home = std::env::var_os("MAW_HOME");
     let old_plugins_dir = std::env::var_os("MAW_PLUGINS_DIR");
     std::env::set_var("MAW_HOME", &isolated_home);
@@ -373,14 +469,50 @@ fn run_parity_case(case: ParityCase<'_>) {
         case.plugin,
         case.args
     );
+    let audit = host_audit.audit_json_lines();
     if let Some(expected) = case.expected_host_calls {
-        let audit = host_audit.audit_json_lines();
         let actual = audit.lines().filter(|line| !line.trim().is_empty()).count();
         assert_eq!(
             actual, expected,
             "host-call audit mismatch for {} {:?}: {audit}",
             case.plugin, case.args
         );
+    }
+    if let Some(expected) = case.expected_host_transcript {
+        assert_host_transcript(case.plugin, case.args, &audit, expected);
+    }
+}
+
+fn assert_host_transcript(
+    plugin: &str,
+    args: &[&str],
+    audit: &str,
+    expected: &[ExpectedHostCall<'_>],
+) {
+    let actual = audit
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("audit json"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "host transcript length for {plugin} {args:?}: {audit}"
+    );
+    for (event, expected) in actual.iter().zip(expected.iter()) {
+        assert_eq!(
+            event["host_fn"], expected.host_fn,
+            "host_fn for {plugin} {args:?}"
+        );
+        assert_eq!(
+            event["capability"], expected.capability,
+            "capability for {plugin} {args:?}"
+        );
+        assert_eq!(
+            event["resource"], expected.resource,
+            "resource for {plugin} {args:?}"
+        );
+        assert_eq!(event["status"], "ok", "status for {plugin} {args:?}");
     }
 }
 
@@ -397,6 +529,26 @@ fn assert_fixture_metadata(fixture: &Path) {
     );
 }
 
+fn seed_real_maw_home(fixture: &Path, isolated_home: &Path) {
+    let host_state_path = fixture.join("host-state.json");
+    let host_state: Value = serde_json::from_str(
+        &std::fs::read_to_string(&host_state_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", host_state_path.display())),
+    )
+    .unwrap_or_else(|err| panic!("parse {}: {err}", host_state_path.display()));
+    if let Some(files) = host_state.get("seedFiles").and_then(Value::as_object) {
+        for (relative, content) in files {
+            let path = isolated_home.join(relative);
+            if let Some(parent) = path.parent() {
+                create_dir_all(parent)
+                    .unwrap_or_else(|err| panic!("create seed dir {}: {err}", parent.display()));
+            }
+            std::fs::write(&path, content.as_str().expect("seed file content"))
+                .unwrap_or_else(|err| panic!("write seed file {}: {err}", path.display()));
+        }
+    }
+}
+
 fn seeded_host(fixture: &Path, plugin: &LoadedPlugin) -> MawWasmHost {
     let host_state: Value = serde_json::from_str(
         &std::fs::read_to_string(fixture.join("host-state.json")).expect("host-state"),
@@ -405,10 +557,19 @@ fn seeded_host(fixture: &Path, plugin: &LoadedPlugin) -> MawWasmHost {
     host_state["calls"].as_array().expect("calls").iter().fold(
         MawWasmHost::new(plugin),
         |host, call| {
-            host.with_fake_response(
+            host.with_audited_fake_response(
                 call["name"].as_str().expect("fake name"),
                 call["input"].as_str().expect("fake input"),
                 call["output"].as_str().expect("fake output"),
+                call.get("capability")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                call.get("resource")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                call.get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             )
         },
     )
@@ -509,15 +670,19 @@ fn write_cross_team_queue_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBu
 }
 
 fn load_wasm_fixture(dir: &Path, manifest_name: &str) -> LoadedPlugin {
-    LoadedPlugin {
-        manifest: manifest(manifest_name),
-        dir: dir.to_path_buf(),
-        wasm_path: dir.join("plugin.wasm"),
-        entry_path: None,
-        wasm_export: "handle".to_owned(),
-        kind: LoadedPluginKind::Wasm,
-        disabled: false,
-    }
+    let mut plugin = load_manifest_from_dir(dir)
+        .unwrap_or_else(|err| panic!("load fixture manifest {}: {err}", dir.display()))
+        .unwrap_or_else(|| LoadedPlugin {
+            manifest: manifest(manifest_name),
+            dir: dir.to_path_buf(),
+            wasm_path: dir.join("plugin.wasm"),
+            entry_path: None,
+            wasm_export: "handle".to_owned(),
+            kind: LoadedPluginKind::Wasm,
+            disabled: false,
+        });
+    manifest_name.clone_into(&mut plugin.manifest.name);
+    plugin
 }
 
 fn manifest(name: &str) -> PluginManifest {
