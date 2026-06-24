@@ -134,7 +134,11 @@ fn tmux_split_dry_run_is_capturable_without_live_fleet_pane() {
 
 #[test]
 fn init_interactive_wizard_uses_isolated_pty_when_script_is_available() {
-    if Command::new("script").arg("--version").output().is_err() {
+    let probe = Command::new("script")
+        .args(["-q", "-e", "-c", "true", "/dev/null"])
+        .output();
+    if !probe.is_ok_and(|output| output.status.success()) {
+        eprintln!("skipping isolated PTY init test: GNU-style script(1) unavailable");
         return;
     }
     let root = temp_dir("init-pty");
