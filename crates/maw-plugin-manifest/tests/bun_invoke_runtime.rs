@@ -64,7 +64,7 @@ fn write_bun_shim(bin_dir: &Path) {
         &shim,
         r#"#!/bin/sh
 capture="$MAW_BUN_CAPTURE_DIR"
-printf '%s\n' "$*" > "$capture/argv.txt"
+printf 'arg1=%s\narg3=%s\narg4=%s\narg5=%s\n' "$1" "$3" "$4" "$5" > "$capture/argv.txt"
 /bin/cat > "$capture/stdin.json"
 case "$MAW_BUN_MODE" in
   nonzero)
@@ -145,6 +145,20 @@ fn make_ts_plugin(dir: &Path) -> LoadedPlugin {
     }
 }
 
+fn make_real_handler_plugin(dir: &Path) -> LoadedPlugin {
+    let plugin = make_ts_plugin(dir);
+    let entry_path = plugin.entry_path.as_ref().expect("entry path");
+    write(
+        entry_path,
+        br#"export default async function handler(ctx) {
+  return { ok: true, output: `handler:${ctx.source}:${ctx.args.join("|")}` };
+}
+"#,
+    )
+    .expect("real handler entry");
+    plugin
+}
+
 fn ctx(args: &[&str]) -> InvokeContext {
     InvokeContext {
         source: InvokeSource::Cli,
@@ -153,7 +167,23 @@ fn ctx(args: &[&str]) -> InvokeContext {
 }
 
 #[test]
-fn bun_invoke_runtime_runs_bun_with_args_stdin_context_and_parses_result() {
+fn bun_invoke_runtime_calls_real_ts_default_export_handler() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("real-handler");
+    let plugin_dir = root.join("plugin");
+    create_dir_all(&plugin_dir).expect("plugin dir");
+    let plugin = make_real_handler_plugin(&plugin_dir);
+
+    let result = BunInvokeRuntime::default().invoke_ts(&plugin, &ctx(&["one", "two"]));
+
+    assert_eq!(result, InvokeResult::output("handler:cli:one|two"));
+
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn bun_invoke_runtime_passes_driver_args_stdin_context_and_parses_result() {
     let _guard = env_lock().lock().expect("env lock");
     let _restore = EnvRestore::capture();
     let root = temp_dir("happy");
@@ -168,7 +198,10 @@ fn bun_invoke_runtime_runs_bun_with_args_stdin_context_and_parses_result() {
     assert_eq!(result, InvokeResult::output("from bun"));
     assert_eq!(
         read_to_string(capture_dir.join("argv.txt")).expect("argv"),
-        format!("run {} one two\n", entry_path.display())
+        format!(
+            "arg1=-e\narg3={}\narg4=one\narg5=two\n",
+            entry_path.display()
+        )
     );
     let context: serde_json::Value =
         serde_json::from_str(&read_to_string(capture_dir.join("stdin.json")).expect("stdin json"))

@@ -17,6 +17,46 @@ impl PluginInvokeRuntime for MvpWasmInvokeRuntime {
 }
 
 const BUN_INVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const BUN_TS_INVOKE_DRIVER: &str = r#"
+import { realpathSync } from "fs";
+import { pathToFileURL } from "url";
+
+const entryPath = process.argv[1];
+
+async function readStdin() {
+  return await new Response(Bun.stdin.stream()).text();
+}
+
+function errorResult(error) {
+  const e = error instanceof Error ? error : new Error(String(error));
+  return { ok: false, error: e.stack || e.message };
+}
+
+try {
+  if (!entryPath) {
+    process.stdout.write(JSON.stringify({ ok: false, error: "TS plugin entry path is required" }));
+    process.exit(0);
+  }
+
+  const ctx = JSON.parse(await readStdin());
+  const logs = [];
+  ctx.writer ??= (...args) => logs.push(args.map(String).join(" "));
+
+  const mod = await import(pathToFileURL(realpathSync(entryPath)).href);
+  const handler = mod.default ?? mod.handler;
+  if (typeof handler !== "function") {
+    process.stdout.write(JSON.stringify({ ok: false, error: "TS plugin has no default export or handler" }));
+    process.exit(0);
+  }
+
+  const result = await handler(ctx);
+  const out = result && typeof result === "object" && "ok" in result ? result : { ok: true };
+  if (out.ok && out.output === undefined && logs.length > 0) out.output = logs.join("\n");
+  process.stdout.write(JSON.stringify(out));
+} catch (error) {
+  process.stdout.write(JSON.stringify(errorResult(error)));
+}
+"#;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BunInvokeRuntime {
@@ -60,7 +100,8 @@ fn invoke_ts_with_bun(plugin: &LoadedPlugin, ctx: &InvokeContext, timeout: Durat
 
     let context_json = invoke_context_json(ctx);
     let mut child = match Command::new("bun")
-        .arg("run")
+        .arg("-e")
+        .arg(BUN_TS_INVOKE_DRIVER)
         .arg(entry_path)
         .args(&ctx.args)
         .stdin(Stdio::piped())
