@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_auth::{build_from_sign_payload, hash_body, verify_hmac_sig};
-use maw_transport::{PeerSendRequest, PeerWakeRequest, ReqwestHttpTransportIo};
+use maw_cli::run_cli_async;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 struct CapturedRequest {
@@ -13,142 +17,121 @@ struct CapturedRequest {
     body: String,
 }
 
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_lock() -> &'static Mutex<()> {
+    ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[tokio::test]
-async fn reqwest_http_transport_posts_api_send_with_verifiable_v3_signature() {
+async fn native_send_posts_signed_api_send_to_configured_peer() {
+    let _guard = env_lock().lock().await;
+    let env = TestEnv::new("native-send");
     let peer_key = "known-peer-key";
-    let timestamp = 1_700_000_123_i64;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    env.write_config(&format!("http://{addr}"));
+    std::env::set_var("MAW_HOME", &env.root);
+    std::env::set_var("MAW_PEER_KEY", peer_key);
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let captured = read_one_http_request(&mut socket).await;
-        socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 53\r\n\r\n{\"ok\":true,\"target\":\"remote-oracle\",\"state\":\"queued\"}",
-            )
-            .await
-            .expect("response");
+        write_json_response(
+            &mut socket,
+            r#"{"ok":true,"target":"agent","state":"queued"}"#,
+        )
+        .await;
         tx.send(captured).expect("send capture");
     });
 
-    let client = ReqwestHttpTransportIo::new(2_000).expect("client");
-    let response = client
-        .send_peer(&PeerSendRequest {
-            peer_url: format!("http://{addr}"),
-            target: "remote-oracle".to_owned(),
-            text: "E1 signed capture".to_owned(),
-            inbox: Some(true),
-            from: "sender-oracle:sender-node".to_owned(),
-            peer_key: peer_key.to_owned(),
-            timestamp,
-        })
-        .await
-        .expect("send peer");
+    let output = run_cli_async(&args(&[
+        "send",
+        "remote:agent",
+        "hello",
+        "there",
+        "--inbox",
+        "--from",
+        "sender-oracle:sender-node",
+    ]))
+    .await;
 
-    assert!(response.delivered_or_queued());
-    assert_eq!(response.state.as_deref(), Some("queued"));
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "queued agent\n");
 
     let captured = rx.await.expect("capture");
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/api/send");
     assert_eq!(
         captured.body,
-        r#"{"target":"remote-oracle","text":"E1 signed capture","inbox":true}"#
+        r#"{"target":"agent","text":"hello there","inbox":true}"#
     );
-    assert_eq!(
-        captured.headers.get("content-type").map(String::as_str),
-        Some("application/json")
-    );
-    assert_eq!(
-        captured.headers.get("x-maw-from").map(String::as_str),
-        Some("sender-oracle:sender-node")
-    );
-    assert_eq!(
-        captured.headers.get("x-maw-timestamp").map(String::as_str),
-        Some("1700000123")
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get("x-maw-auth-version")
-            .map(String::as_str),
-        Some("v3")
-    );
-    let signature = captured
-        .headers
-        .get("x-maw-signature-v3")
-        .expect("signature");
-    assert_eq!(signature.len(), 64);
-    assert!(signature.chars().all(|ch| ch.is_ascii_hexdigit()));
-    assert_eq!(signature, &signature.to_ascii_lowercase());
-
-    let body_hash = hash_body(Some(captured.body.as_bytes()));
-    let payload = build_from_sign_payload(
+    assert_common_v3_headers_and_signature(
+        &captured,
+        peer_key,
         "sender-oracle:sender-node",
-        timestamp,
-        "POST",
         "/api/send",
-        &body_hash,
     );
-    assert!(verify_hmac_sig(peer_key, &payload, signature));
 }
 
 #[tokio::test]
-async fn reqwest_http_transport_posts_api_wake_with_verifiable_v3_signature() {
+async fn native_wake_posts_signed_api_wake_to_configured_peer() {
+    let _guard = env_lock().lock().await;
+    let env = TestEnv::new("native-wake");
     let peer_key = "known-peer-key";
-    let timestamp = 1_700_000_456_i64;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    env.write_config(&format!("http://{addr}"));
+    std::env::set_var("MAW_HOME", &env.root);
+    std::env::set_var("MAW_PEER_KEY", peer_key);
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let captured = read_one_http_request(&mut socket).await;
-        socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"ok\":true,\"target\":\"remote-oracle\"}",
-            )
-            .await
-            .expect("response");
+        write_json_response(&mut socket, r#"{"ok":true,"target":"agent"}"#).await;
         tx.send(captured).expect("send capture");
     });
 
-    let client = ReqwestHttpTransportIo::new(2_000).expect("client");
-    let response = client
-        .wake_peer(&PeerWakeRequest {
-            peer_url: format!("http://{addr}"),
-            target: "remote-oracle".to_owned(),
-            task: Some("fix issue".to_owned()),
-            from: "sender-oracle:sender-node".to_owned(),
-            peer_key: peer_key.to_owned(),
-            timestamp,
-        })
-        .await
-        .expect("wake peer");
+    let output = run_cli_async(&args(&[
+        "wake",
+        "remote:agent",
+        "--task",
+        "fix issue",
+        "--from",
+        "sender-oracle:sender-node",
+    ]))
+    .await;
 
-    assert!(response.ok);
-    assert_eq!(response.target.as_deref(), Some("remote-oracle"));
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "woke agent\n");
 
     let captured = rx.await.expect("capture");
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/api/wake");
-    assert_eq!(
-        captured.body,
-        r#"{"target":"remote-oracle","task":"fix issue"}"#
+    assert_eq!(captured.body, r#"{"target":"agent","task":"fix issue"}"#);
+    assert_common_v3_headers_and_signature(
+        &captured,
+        peer_key,
+        "sender-oracle:sender-node",
+        "/api/wake",
     );
+}
+
+fn assert_common_v3_headers_and_signature(
+    captured: &CapturedRequest,
+    peer_key: &str,
+    from: &str,
+    path: &str,
+) {
     assert_eq!(
         captured.headers.get("content-type").map(String::as_str),
         Some("application/json")
     );
     assert_eq!(
         captured.headers.get("x-maw-from").map(String::as_str),
-        Some("sender-oracle:sender-node")
-    );
-    assert_eq!(
-        captured.headers.get("x-maw-timestamp").map(String::as_str),
-        Some("1700000456")
+        Some(from)
     );
     assert_eq!(
         captured
@@ -157,6 +140,12 @@ async fn reqwest_http_transport_posts_api_wake_with_verifiable_v3_signature() {
             .map(String::as_str),
         Some("v3")
     );
+    let timestamp = captured
+        .headers
+        .get("x-maw-timestamp")
+        .expect("timestamp")
+        .parse::<i64>()
+        .expect("timestamp i64");
     let signature = captured
         .headers
         .get("x-maw-signature-v3")
@@ -166,14 +155,20 @@ async fn reqwest_http_transport_posts_api_wake_with_verifiable_v3_signature() {
     assert_eq!(signature, &signature.to_ascii_lowercase());
 
     let body_hash = hash_body(Some(captured.body.as_bytes()));
-    let payload = build_from_sign_payload(
-        "sender-oracle:sender-node",
-        timestamp,
-        "POST",
-        "/api/wake",
-        &body_hash,
-    );
+    let payload = build_from_sign_payload(from, timestamp, "POST", path, &body_hash);
     assert!(verify_hmac_sig(peer_key, &payload, signature));
+}
+
+async fn write_json_response(socket: &mut tokio::net::TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    socket
+        .write_all(response.as_bytes())
+        .await
+        .expect("response");
 }
 
 async fn read_one_http_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
@@ -222,4 +217,42 @@ async fn read_one_http_request(socket: &mut tokio::net::TcpStream) -> CapturedRe
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+struct TestEnv {
+    root: PathBuf,
+}
+
+impl TestEnv {
+    fn new(name: &str) -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("maw-rs-{name}-{nonce}"));
+        std::fs::create_dir_all(root.join("config")).expect("config dir");
+        Self { root }
+    }
+
+    fn write_config(&self, peer_url: &str) {
+        std::fs::write(
+            self.root.join("config").join("maw.config.json"),
+            format!(
+                r#"{{"node":"sender-node","oracle":"sender-oracle","namedPeers":[{{"name":"remote","url":"{peer_url}"}}]}}"#
+            ),
+        )
+        .expect("write config");
+    }
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+        std::env::remove_var("MAW_HOME");
+        std::env::remove_var("MAW_PEER_KEY");
+    }
 }
