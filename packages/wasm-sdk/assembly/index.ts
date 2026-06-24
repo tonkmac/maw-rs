@@ -8,6 +8,7 @@ import { length } from "@extism/as-pdk/lib/env";
 @external("extism:host/user", "maw.state.set") declare function mawStateSet(input: u64): u64;
 @external("extism:host/user", "maw.fs.read") declare function mawFsRead(input: u64): u64;
 @external("extism:host/user", "maw.fs.write") declare function mawFsWrite(input: u64): u64;
+@external("extism:host/user", "maw.fs.remove") declare function mawFsRemove(input: u64): u64;
 @external("extism:host/user", "maw.fs.list") declare function mawFsList(input: u64): u64;
 @external("extism:host/user", "maw.fs.stat") declare function mawFsStat(input: u64): u64;
 @external("extism:host/user", "maw.exec.run") declare function mawExecRun(input: u64): u64;
@@ -143,6 +144,7 @@ export function readAudit(argsJson: string): string { return call(mawStateGet, a
 export function logAudit(argsJson: string): string { return call(mawStateSet, argsJson); }
 export function fsRead(argsJson: string): string { return call(mawFsRead, argsJson); }
 export function fsWrite(argsJson: string): string { return call(mawFsWrite, argsJson); }
+export function fsRemove(argsJson: string): string { return call(mawFsRemove, argsJson); }
 export function fsList(argsJson: string): string { return call(mawFsList, argsJson); }
 export function fsStat(argsJson: string): string { return call(mawFsStat, argsJson); }
 export function hostExec(argsJson: string): string { return call(mawExecRun, argsJson); }

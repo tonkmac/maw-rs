@@ -241,6 +241,7 @@ impl MawWasmHost {
             )),
             "maw.fs.read" => to_json(&self.fs_read(input)),
             "maw.fs.write" => to_json(&self.fs_write(input)),
+            "maw.fs.remove" => to_json(&self.fs_remove(input)),
             "maw.fs.list" => to_json(&self.fs_list(input)),
             "maw.fs.stat" => to_json(&self.fs_stat(input)),
             "maw.http.request" => to_json(&self.http_request(input)),
@@ -399,6 +400,18 @@ impl MawWasmHost {
         if let Err(error) = file.write_all(&bytes) { return HostResult::err(HostErrorCode::IoError, format!("write failed: {error}")); }
         let result = HostResult::ok(json!({"path": path.display().to_string(), "bytes": bytes.len()}));
         self.audit("maw.fs.write", &cap, &path.display().to_string(), status_of(&result), start);
+        result
+    }
+
+    fn fs_remove(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<FsRemoveArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let (cap, path) = match self.secure_remove_path(&args.path) { Ok(value) => value, Err(err) => return err };
+        let result = match remove_bounded_path(&path, args.recursive.unwrap_or(false), &self.roots_for("write")) {
+            Ok(removed) => HostResult::ok(json!({"path": path.display().to_string(), "removed": removed})),
+            Err(err) => err,
+        };
+        self.audit("maw.fs.remove", &cap, &path.display().to_string(), status_of(&result), start);
         result
     }
 
@@ -587,6 +600,19 @@ impl MawWasmHost {
         Ok((cap, path))
     }
 
+    fn secure_remove_path(&self, requested: &str) -> Result<(String, PathBuf), HostResult<Value>> {
+        if contains_glob_pattern(requested) { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "glob/wildcard filesystem paths are denied")); }
+        let raw = Path::new(requested);
+        let meta = std::fs::symlink_metadata(raw).map_err(|error| HostResult::err(if error.kind() == std::io::ErrorKind::NotFound { HostErrorCode::NotFound } else { HostErrorCode::IoError }, format!("stat failed: {error}")))?;
+        if meta.file_type().is_symlink() { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "symlink deletion is denied")); }
+        let path = canonicalize_checked_path(raw)?;
+        if deny_special_path(&path) { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special filesystem path denied")); }
+        let roots = self.roots_for("write");
+        let (scope, _) = roots.iter().find(|(_, root)| path.starts_with(root)).ok_or_else(|| HostResult::err(HostErrorCode::CapabilityDenied, "filesystem path outside declared write roots"))?;
+        let cap = self.caps.require("fs", "write", Some(scope))?;
+        Ok((cap, path))
+    }
+
     fn roots_for(&self, verb: &str) -> BTreeMap<String, PathBuf> {
         self.caps.scopes_for("fs", verb).into_iter().filter_map(|scope| self.fs_roots.get(&scope).and_then(|root| canonicalize_checked_path(root).ok()).map(|root| (scope, root))).collect()
     }
@@ -662,7 +688,7 @@ impl PluginInvokeRuntime for ExtismWasmInvokeRuntime {
 }
 
 pub const HOST_FN_NAMES: &[&str] = &[
-    "maw.exec.run", "maw.exec.spawn", "maw.config.get", "maw.config.set", "maw.consent.read", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
+    "maw.exec.run", "maw.exec.spawn", "maw.config.get", "maw.config.set", "maw.consent.read", "maw.fs.read", "maw.fs.write", "maw.fs.remove", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
 ];
 
 fn extism_host_call_named(
@@ -696,6 +722,9 @@ struct ExecRunArgs { cmd: String, #[serde(default)] args: Vec<String>, cwd: Opti
 struct FsReadArgs { path: String, encoding: Option<String>, max_bytes: Option<u64> }
 #[derive(Debug, Deserialize)]
 struct FsPathArgs { #[serde(alias = "target")] path: String }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsRemoveArgs { path: String, recursive: Option<bool> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FsWriteArgs { path: String, content: String, encoding: Option<String>, mode: Option<String>, mkdirp: Option<bool> }
@@ -798,6 +827,64 @@ fn default_state_root() -> PathBuf {
     }
     std::env::var_os("HOME").map_or_else(|| PathBuf::from(".local").join("state").join("maw"), |home| PathBuf::from(home).join(".local").join("state").join("maw"))
 }
+
+fn contains_glob_pattern(path: &str) -> bool { path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}')) }
+
+fn remove_bounded_path(path: &Path, recursive: bool, roots: &BTreeMap<String, PathBuf>) -> Result<bool, HostResult<Value>> {
+    if !roots.values().any(|root| path.starts_with(root)) {
+        return Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem path outside declared write roots"));
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|error| HostResult::err(if error.kind() == std::io::ErrorKind::NotFound { HostErrorCode::NotFound } else { HostErrorCode::IoError }, format!("stat failed: {error}")))?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Err(HostResult::err(HostErrorCode::CapabilityDenied, "symlink deletion is denied"));
+    }
+    if file_type.is_file() {
+        let file = open_nofollow_existing(path)?;
+        verify_fd_path(&file, path)?;
+        drop(file);
+        std::fs::remove_file(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("remove file failed: {error}")))?;
+        return Ok(true);
+    }
+    if file_type.is_dir() {
+        if !recursive {
+            std::fs::remove_dir(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("remove dir failed: {error}")))?;
+            return Ok(true);
+        }
+        remove_bounded_dir_recursive(path, roots)?;
+        return Ok(true);
+    }
+    Err(HostResult::err(HostErrorCode::CapabilityDenied, "device/special file deletion denied"))
+}
+
+fn remove_bounded_dir_recursive(path: &Path, roots: &BTreeMap<String, PathBuf>) -> Result<(), HostResult<Value>> {
+    if !roots.values().any(|root| path.starts_with(root)) {
+        return Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem path outside declared write roots"));
+    }
+    for entry in std::fs::read_dir(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("read dir failed: {error}")))? {
+        let entry = entry.map_err(|error| HostResult::err(HostErrorCode::IoError, format!("read dir entry failed: {error}")))?;
+        let child = entry.path();
+        if !child.starts_with(path) || !roots.values().any(|root| child.starts_with(root)) {
+            return Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem path outside declared write roots"));
+        }
+        let meta = std::fs::symlink_metadata(&child).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("stat failed: {error}")))?;
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            std::fs::remove_file(&child).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("remove symlink failed: {error}")))?;
+        } else if file_type.is_dir() {
+            remove_bounded_dir_recursive(&child, roots)?;
+        } else if file_type.is_file() {
+            let file = open_nofollow_existing(&child)?;
+            verify_fd_path(&file, &child)?;
+            drop(file);
+            std::fs::remove_file(&child).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("remove file failed: {error}")))?;
+        } else {
+            return Err(HostResult::err(HostErrorCode::CapabilityDenied, "device/special file deletion denied"));
+        }
+    }
+    std::fs::remove_dir(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("remove dir failed: {error}")))
+}
+
 fn open_nofollow_existing(path: &Path) -> Result<File, HostResult<Value>> {
     let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW_FLAG).open(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("open failed: {error}")))?;
     let meta = file.metadata().map_err(|error| HostResult::err(HostErrorCode::IoError, format!("metadata failed: {error}")))?;

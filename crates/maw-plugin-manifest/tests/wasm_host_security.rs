@@ -576,3 +576,106 @@ fn tmux_send_host_allows_destructive_send_with_force_cap() {
         "{audit}"
     );
 }
+
+#[test]
+fn fs_remove_host_side_allows_only_declared_root_and_real_files() {
+    let dir = temp("remove-allowed");
+    let victim = dir.join("victim.txt");
+    write(&victim, "delete me").expect("victim");
+    let host = host(&dir, &["fs:write:sandbox"]);
+
+    let removed = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": victim, "recursive": false}),
+    );
+
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(!dir.join("victim.txt").exists());
+    let audit = host.audit_json_lines();
+    assert!(audit.contains("\"host_fn\":\"maw.fs.remove\""), "{audit}");
+    assert!(
+        audit.contains("\"capability\":\"fs:write:sandbox\""),
+        "{audit}"
+    );
+}
+
+#[test]
+fn fs_remove_denies_outside_root_traversal_symlink_and_glob() {
+    let dir = temp("remove-deny");
+    let outside_dir = temp("remove-outside");
+    let outside_file = outside_dir.join("outside.txt");
+    write(&outside_file, "must survive").expect("outside");
+    create_dir_all(dir.join("nested")).expect("nested");
+    symlink(&outside_file, dir.join("nested/link-outside")).expect("symlink");
+    let inside_file = dir.join("nested/inside.txt");
+    write(&inside_file, "inside").expect("inside");
+    let host = host(&dir, &["fs:write:sandbox"]);
+
+    let outside = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": outside_file, "recursive": false}),
+    );
+    assert_eq!(outside["ok"], false, "{outside}");
+    assert_eq!(outside["code"], "capability_denied");
+
+    let traversal = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": dir.join("../").join(outside_dir.file_name().unwrap()).join("outside.txt"), "recursive": false}),
+    );
+    assert_eq!(traversal["ok"], false, "{traversal}");
+    assert_eq!(traversal["code"], "capability_denied");
+
+    let symlink_escape = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": dir.join("nested/link-outside"), "recursive": false}),
+    );
+    assert_eq!(symlink_escape["ok"], false, "{symlink_escape}");
+    assert_eq!(symlink_escape["code"], "capability_denied");
+
+    let glob = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": format!("{}/*.txt", dir.display()), "recursive": true}),
+    );
+    assert_eq!(glob["ok"], false, "{glob}");
+    assert_eq!(glob["code"], "capability_denied");
+
+    assert_eq!(
+        read_to_string(&outside_file).expect("outside survives"),
+        "must survive"
+    );
+    assert!(
+        inside_file.exists(),
+        "denied calls must not delete inside by accident"
+    );
+}
+
+#[test]
+fn fs_remove_recursive_is_confined_and_does_not_follow_symlink_escape() {
+    let dir = temp("remove-recursive");
+    let outside_dir = temp("remove-recursive-outside");
+    let outside_file = outside_dir.join("outside.txt");
+    write(&outside_file, "outside").expect("outside");
+    let tree = dir.join("tree");
+    create_dir_all(tree.join("child")).expect("tree");
+    write(tree.join("child/file.txt"), "inside").expect("inside");
+    symlink(&outside_file, tree.join("child/link-outside")).expect("symlink");
+    let host = host(&dir, &["fs:write:sandbox"]);
+
+    let removed = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": tree, "recursive": true}),
+    );
+
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(!dir.join("tree").exists());
+    assert_eq!(
+        read_to_string(&outside_file).expect("outside survives"),
+        "outside"
+    );
+}
