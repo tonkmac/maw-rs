@@ -47,6 +47,16 @@ const CONFIG_SET_PORT_JSON_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall:
     "sdk:config:write",
     "config:port",
 )];
+const CONSENT_LIST_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.consent.read",
+    "sdk:consent:read",
+    "consent:pending",
+)];
+const CONSENT_LIST_TRUST_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.consent.read",
+    "sdk:consent:read",
+    "consent:trust",
+)];
 
 const PEEK_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.tmux.list_sessions", "tmux:read", "tmux://sessions"),
@@ -207,6 +217,26 @@ fn golden_parity_config_set_bun_and_wasm_outputs_match_seeded_host() {
             expected_host_transcript: Some(expected_host_transcript),
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/commands/plugins/config/index.ts",
+            ),
+        });
+    }
+}
+
+#[test]
+fn golden_parity_consent_read_only_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&[][..], CONSENT_LIST_TRANSCRIPT),
+        (&["list"][..], CONSENT_LIST_TRANSCRIPT),
+        (&["list-trust"][..], CONSENT_LIST_TRUST_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "consent",
+            manifest_name: "consent-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/consent/index.ts",
             ),
         });
     }
@@ -422,6 +452,23 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
             expected_host_transcript: Some(expected_host_transcript),
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/commands/plugins/config/index.ts",
+            ),
+        });
+    }
+
+    for (args, expected_host_transcript) in [
+        (&[][..], CONSENT_LIST_TRANSCRIPT),
+        (&["list"][..], CONSENT_LIST_TRANSCRIPT),
+        (&["list-trust"][..], CONSENT_LIST_TRUST_TRANSCRIPT),
+    ] {
+        cases.push(ParityCase {
+            plugin: "consent",
+            manifest_name: "consent-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/consent/index.ts",
             ),
         });
     }

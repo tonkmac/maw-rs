@@ -316,6 +316,113 @@ fn config_set_without_write_capability_is_denied_by_host() {
 }
 
 #[test]
+fn consent_read_uses_read_capability_and_never_exposes_pin_hash() {
+    let dir = temp("consent-read");
+    let state = dir.join("state");
+    create_dir_all(state.join("consent-pending")).expect("pending dir");
+    write(
+        state.join("consent-pending/req-1.json"),
+        r#"{
+  "id": "req-1",
+  "from": "nova",
+  "to": "tk",
+  "action": "hey",
+  "summary": "Allow Nova to say hello",
+  "pinHash": "sha256:must-not-leak",
+  "createdAt": "2026-06-24T09:00:00.000Z",
+  "expiresAt": "2099-01-01T00:00:00.000Z",
+  "status": "pending"
+}
+"#,
+    )
+    .expect("pending");
+    write(
+        state.join("trust.json"),
+        r#"{
+  "version": 1,
+  "trust": {
+    "tk→nova:hey": {
+      "from": "tk",
+      "to": "nova",
+      "action": "hey",
+      "approvedAt": "2026-06-20T10:00:00.000Z",
+      "approvedBy": "human",
+      "requestId": "req-1"
+    }
+  }
+}
+"#,
+    )
+    .expect("trust");
+    let host = host(&dir, &["sdk:consent:read"]).with_fs_root("state", &state);
+
+    let pending = call(&host, "maw.consent.read", &json!({"view": "pending"}));
+    assert_eq!(pending["ok"], true);
+    assert!(pending["value"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("req-1"));
+    assert!(
+        !pending.to_string().contains("must-not-leak"),
+        "pin hash leaked to WASM guest: {pending}"
+    );
+
+    let trust = call(&host, "maw.consent.read", &json!({"view": "trust"}));
+    assert_eq!(trust["ok"], true);
+    assert!(trust["value"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("tk → nova"));
+    let audit = host.audit_json_lines();
+    assert!(
+        audit.contains("\"host_fn\":\"maw.consent.read\""),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("\"capability\":\"sdk:consent:read\""),
+        "{audit}"
+    );
+}
+
+#[test]
+fn consent_guest_approval_and_trust_host_fns_are_hard_denied() {
+    let dir = temp("consent-deny");
+    let host = host(
+        &dir,
+        &[
+            "sdk:consent:read",
+            "sdk:consent:write",
+            "sdk:consent:approve",
+        ],
+    );
+
+    for name in [
+        "maw.consent.approve",
+        "maw.consent.reject",
+        "maw.consent.trust",
+        "maw.consent.untrust",
+        "maw.state.set",
+    ] {
+        let denied = call(
+            &host,
+            name,
+            &json!({"id": "req-1", "pin": "123456", "peer": "nova"}),
+        );
+        assert_eq!(denied["ok"], false, "{name}: {denied}");
+        assert_eq!(denied["code"], "capability_denied", "{name}: {denied}");
+    }
+}
+
+#[test]
+fn consent_read_without_read_capability_is_denied() {
+    let dir = temp("consent-cap-deny");
+    let host = host(&dir, &[]);
+    let denied = call(&host, "maw.consent.read", &json!({"view": "pending"}));
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["code"], "capability_denied");
+}
+
+#[test]
 fn ipv4_mapped_ipv6_private_hosts_are_denied() {
     let dir = temp("ipv4-mapped");
     let host = host(
