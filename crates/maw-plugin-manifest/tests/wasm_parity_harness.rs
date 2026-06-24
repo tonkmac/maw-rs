@@ -37,6 +37,17 @@ const PROFILE_USE_ALL_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.write", "fs:write:config", "/config/profile-active"),
 ];
 
+const CONFIG_SET_NODE_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.config.set",
+    "sdk:config:write",
+    "config:node",
+)];
+const CONFIG_SET_PORT_JSON_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.config.set",
+    "sdk:config:write",
+    "config:port",
+)];
+
 const PEEK_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.tmux.list_sessions", "tmux:read", "tmux://sessions"),
     ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "wasm-parity-peek:0"),
@@ -174,6 +185,67 @@ fn golden_parity_profile_bun_and_wasm_outputs_match_seeded_host() {
             ),
         });
     }
+}
+
+#[test]
+fn golden_parity_config_set_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (
+            &["set", "node", "nova-node"][..],
+            CONFIG_SET_NODE_TRANSCRIPT,
+        ),
+        (
+            &["set", "port", "4567", "--json"][..],
+            CONFIG_SET_PORT_JSON_TRANSCRIPT,
+        ),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "config",
+            manifest_name: "config-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/commands/plugins/config/index.ts",
+            ),
+        });
+    }
+}
+
+#[test]
+fn config_wasm_denies_secret_like_set_without_host_call() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
+    let wasm_plugin = load_wasm_fixture(&fixture, "config-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["sdk:config:write".to_owned()][..]),
+        "config-write must declare only sdk:config:write"
+    );
+    let host = seeded_host(&fixture, &wasm_plugin);
+    let host_audit = host.clone();
+    let mut wasm_runtime =
+        ExtismWasmInvokeRuntime::default().with_host(wasm_plugin.manifest.name.clone(), host);
+    let ctx = InvokeContext {
+        source: InvokeSource::Cli,
+        args: ["set", "federationToken", "secret-value"]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect(),
+    };
+
+    let result = invoke_plugin(&wasm_plugin, &ctx, &mut wasm_runtime);
+
+    assert!(!result.ok, "secret-like config write must fail");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("maw config set: secret-like keys are host-gated and cannot be written from WASM")
+    );
+    assert_eq!(
+        host_audit.audit_json_lines(),
+        "",
+        "secret write reached host"
+    );
 }
 
 #[test]
@@ -328,6 +400,28 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
             expected_host_transcript: Some(expected_host_transcript),
             real_maw_js_entry: RealMawJsEntry::DefaultHandler(
                 "src/vendor/mpr-plugins/profile/index.ts",
+            ),
+        });
+    }
+
+    for (args, expected_host_transcript) in [
+        (
+            &["set", "node", "nova-node"][..],
+            CONFIG_SET_NODE_TRANSCRIPT,
+        ),
+        (
+            &["set", "port", "4567", "--json"][..],
+            CONFIG_SET_PORT_JSON_TRANSCRIPT,
+        ),
+    ] {
+        cases.push(ParityCase {
+            plugin: "config",
+            manifest_name: "config-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/commands/plugins/config/index.ts",
             ),
         });
     }
