@@ -1,5 +1,6 @@
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,6 +73,183 @@ fn golden_parity_cross_team_queue_bun_and_wasm_outputs_match_in_isolated_maw_hom
     });
 }
 
+#[test]
+#[ignore = "regenerates committed maw-js parity goldens; requires MAW_JS_REF_DIR"]
+fn generate_wasm_parity_goldens_from_real_maw_js() {
+    for case in parity_cases() {
+        generate_golden(case);
+    }
+}
+
+fn parity_cases() -> Vec<ParityCase<'static>> {
+    let mut cases = vec![ParityCase {
+        plugin: "trivial",
+        manifest_name: "trivial-parity",
+        args: &["alpha", "beta"],
+        expected_host_calls: None,
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+            "examples/wasm-parity/trivial/bun/index.ts",
+        ),
+    }];
+
+    for args in [&["zsh"][..], &["bash"][..], &["fish"][..], &[][..]] {
+        cases.push(ParityCase {
+            plugin: "shellenv",
+            manifest_name: "shellenv-parity",
+            args,
+            expected_host_calls: Some(0),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/shellenv/src/index.ts",
+            ),
+        });
+    }
+
+    for args in [
+        &["Soul-Brews-Studio/maw-js"][..],
+        &["Soul-Brews-Studio/maw-js", "--fast"][..],
+        &["Soul-Brews-Studio/maw-js", "--deep"][..],
+        &["repo", "--fast", "--deep"][..],
+        &["repo", "--turbo"][..],
+        &[][..],
+    ] {
+        cases.push(ParityCase {
+            plugin: "learn",
+            manifest_name: "learn-parity",
+            args,
+            expected_host_calls: Some(0),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/learn/index.ts",
+            ),
+        });
+    }
+
+    cases.push(ParityCase {
+        plugin: "cross-team-queue",
+        manifest_name: "cross-team-queue-parity",
+        args: &[],
+        expected_host_calls: Some(0),
+        real_maw_js_entry: RealMawJsEntry::CrossTeamQueueHandle,
+    });
+
+    cases
+}
+
+fn generate_golden(case: ParityCase<'_>) {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wasm-parity")
+        .join(case.plugin);
+    assert_fixture_metadata(&fixture);
+
+    let temp = temp_dir("wasm-parity-golden");
+    let isolated_home = temp.join("home");
+    create_dir_all(&isolated_home).expect("isolated MAW_HOME");
+    let old_maw_home = std::env::var_os("MAW_HOME");
+    let old_plugins_dir = std::env::var_os("MAW_PLUGINS_DIR");
+    std::env::set_var("MAW_HOME", &isolated_home);
+    std::env::remove_var("MAW_PLUGINS_DIR");
+
+    let ctx = InvokeContext {
+        source: InvokeSource::Cli,
+        args: case.args.iter().map(|arg| (*arg).to_owned()).collect(),
+    };
+
+    let maw_js_ref = maw_js_ref_dir();
+    let maw_js_provenance = maw_js_provenance(&maw_js_ref);
+    let bun_entry = real_maw_js_entry_path(&temp, &maw_js_ref, case.real_maw_js_entry);
+    let bun_plugin = make_bun_plugin(&bun_entry, case.manifest_name);
+    let mut bun_runtime = BunInvokeRuntime::default();
+    let bun = invoke_plugin(&bun_plugin, &ctx, &mut bun_runtime);
+
+    restore_env("MAW_HOME", old_maw_home);
+    restore_env("MAW_PLUGINS_DIR", old_plugins_dir);
+    let _ = std::fs::remove_dir_all(temp);
+
+    let golden = golden_path(&fixture, case.args);
+    std::fs::write(
+        &golden,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&capture(&bun)).expect("golden json")
+        ),
+    )
+    .unwrap_or_else(|err| panic!("write {}: {err}", golden.display()));
+    write_maw_js_provenance(&fixture, &maw_js_provenance);
+}
+
+#[derive(Clone)]
+struct MawJsProvenance {
+    version: Option<String>,
+    commit: String,
+}
+
+fn maw_js_provenance(maw_js_ref: &Path) -> MawJsProvenance {
+    assert!(
+        maw_js_ref.exists(),
+        "MAW_JS_REF_DIR must point at a maw-js checkout for golden refresh: {}",
+        maw_js_ref.display()
+    );
+    let commit = command_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(maw_js_ref)
+            .arg("rev-parse")
+            .arg("HEAD"),
+    );
+    let package_json = maw_js_ref.join("package.json");
+    let version = serde_json::from_str::<Value>(
+        &std::fs::read_to_string(&package_json)
+            .unwrap_or_else(|err| panic!("read {}: {err}", package_json.display())),
+    )
+    .unwrap_or_else(|err| panic!("parse {}: {err}", package_json.display()))
+    .get("version")
+    .and_then(Value::as_str)
+    .map(str::to_owned);
+
+    MawJsProvenance { version, commit }
+}
+
+fn write_maw_js_provenance(fixture: &Path, provenance: &MawJsProvenance) {
+    let path = fixture.join("metadata.json");
+    let mut metadata: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display())),
+    )
+    .unwrap_or_else(|err| panic!("parse {}: {err}", path.display()));
+    let obj = metadata.as_object_mut().expect("metadata object");
+    if let Some(version) = &provenance.version {
+        obj.insert("mawJsVersion".to_owned(), Value::String(version.clone()));
+    }
+    obj.insert(
+        "mawJsCommit".to_owned(),
+        Value::String(provenance.commit.clone()),
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&metadata).expect("metadata json")
+        ),
+    )
+    .unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
+}
+
+fn command_stdout(command: &mut Command) -> String {
+    let output = command.output().expect("run command");
+    assert!(
+        output.status.success(),
+        "command failed status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8 stdout")
+        .trim()
+        .to_owned()
+}
+
 #[derive(Clone, Copy)]
 struct ParityCase<'a> {
     plugin: &'a str,
@@ -88,7 +266,9 @@ enum RealMawJsEntry {
 }
 
 fn run_parity_case(case: ParityCase<'_>) {
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/wasm-parity")
         .join(case.plugin);
@@ -107,12 +287,6 @@ fn run_parity_case(case: ParityCase<'_>) {
         args: case.args.iter().map(|arg| (*arg).to_owned()).collect(),
     };
 
-    let maw_js_ref = maw_js_ref_dir();
-    let bun_entry = real_maw_js_entry_path(&temp, &maw_js_ref, case.real_maw_js_entry);
-    let bun_plugin = make_bun_plugin(&bun_entry, case.manifest_name);
-    let mut bun_runtime = BunInvokeRuntime::default();
-    let bun = invoke_plugin(&bun_plugin, &ctx, &mut bun_runtime);
-
     let wasm_plugin = load_wasm_fixture(&fixture, case.manifest_name);
     let host = seeded_host(&fixture, &wasm_plugin);
     let host_audit = host.clone();
@@ -125,7 +299,7 @@ fn run_parity_case(case: ParityCase<'_>) {
     let _ = std::fs::remove_dir_all(temp);
 
     assert_eq!(
-        capture(&bun),
+        read_golden(&fixture, case.args),
         capture(&wasm),
         "plugin={} args={:?}",
         case.plugin,
@@ -178,6 +352,38 @@ fn capture(result: &InvokeResult) -> Value {
         "stderr": result.error.as_deref().unwrap_or(""),
         "result": { "ok": result.ok, "output": result.output, "error": result.error }
     })
+}
+
+fn read_golden(fixture: &Path, args: &[&str]) -> Value {
+    let path = golden_path(fixture, args);
+    serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read golden {}: {err}", path.display())),
+    )
+    .unwrap_or_else(|err| panic!("parse golden {}: {err}", path.display()))
+}
+
+fn golden_path(fixture: &Path, args: &[&str]) -> PathBuf {
+    fixture.join(format!("golden.{}.json", args_slug(args)))
+}
+
+fn args_slug(args: &[&str]) -> String {
+    if args.is_empty() {
+        return "no-args".to_owned();
+    }
+    args.iter()
+        .map(|arg| {
+            arg.chars()
+                .map(|ch| match ch {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
+                    _ => '-',
+                })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("--")
 }
 
 fn make_bun_plugin(entry_path: &Path, manifest_name: &str) -> LoadedPlugin {
