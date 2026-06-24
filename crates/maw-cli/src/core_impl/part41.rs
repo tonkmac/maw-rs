@@ -143,7 +143,15 @@ fn locate_parse_args(argv: &[String]) -> Result<(String, LocateOptions), String>
 fn locate_cmd(oracle: &str, opts: &LocateOptions) -> Result<String, String> {
     let mut tmux = TmuxClient::local();
     let sessions = tmux.list_all();
-    let info = locate_gather_info(oracle, !opts.path, &sessions)?;
+    locate_cmd_with_sessions(oracle, opts, &sessions)
+}
+
+fn locate_cmd_with_sessions(
+    oracle: &str,
+    opts: &LocateOptions,
+    sessions: &[TmuxSession],
+) -> Result<String, String> {
+    let info = locate_gather_info(oracle, !opts.path, sessions)?;
 
     if info.repo_path.is_none()
         && info.session_name.is_none()
@@ -536,12 +544,103 @@ mod locate_tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
+    const LOCATE_ENV_KEYS: &[&str] = &[
+        "HOME",
+        "GHQ_ROOT",
+        "MAW_HOME",
+        "MAW_CONFIG_DIR",
+        "MAW_DATA_DIR",
+        "MAW_STATE_DIR",
+        "MAW_CACHE_DIR",
+        "MAW_XDG",
+        "MAW_JS_REF_DIR",
+        "TMUX",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ];
+
+    struct LocateHermeticEnv {
+        home: std::path::PathBuf,
+        ghq: std::path::PathBuf,
+        xdg_config: std::path::PathBuf,
+        xdg_data: std::path::PathBuf,
+        xdg_state: std::path::PathBuf,
+        xdg_cache: std::path::PathBuf,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl LocateHermeticEnv {
+        fn new(name: &str) -> Self {
+            let root = locate_temp_root(name);
+            let home = root.join("home");
+            let ghq = root.join("ghq");
+            let xdg_config = root.join("xdg-config");
+            let xdg_data = root.join("xdg-data");
+            let xdg_state = root.join("xdg-state");
+            let xdg_cache = root.join("xdg-cache");
+            for dir in [&home, &ghq, &xdg_config, &xdg_data, &xdg_state, &xdg_cache] {
+                std::fs::create_dir_all(dir).expect("hermetic dir");
+            }
+            let saved = LOCATE_ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            for key in LOCATE_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("HOME", &home);
+            std::env::set_var("GHQ_ROOT", &ghq);
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
+            std::env::set_var("XDG_DATA_HOME", &xdg_data);
+            std::env::set_var("XDG_STATE_HOME", &xdg_state);
+            std::env::set_var("XDG_CACHE_HOME", &xdg_cache);
+            std::env::set_var("MAW_XDG", "1");
+            std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+            Self {
+                home,
+                ghq,
+                xdg_config,
+                xdg_data,
+                xdg_state,
+                xdg_cache,
+                saved,
+            }
+        }
+
+        fn maw_config_path(&self, parts: &[&str]) -> std::path::PathBuf {
+            let path = maw_config_path(&current_xdg_env(), parts);
+            assert!(path.starts_with(&self.xdg_config));
+            path
+        }
+
+        fn maw_cache_path(&self, parts: &[&str]) -> std::path::PathBuf {
+            let path = maw_cache_path(&current_xdg_env(), parts);
+            assert!(path.starts_with(&self.xdg_cache));
+            path
+        }
+    }
+
+    impl Drop for LocateHermeticEnv {
+        fn drop(&mut self) {
+            for key in LOCATE_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            for (key, value) in self.saved.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
+
     fn locate_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn locate_temp_home(name: &str) -> std::path::PathBuf {
+    fn locate_temp_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "maw-rs-locate-{name}-{}",
             SystemTime::now()
@@ -560,10 +659,10 @@ mod locate_tests {
         std::fs::write(path, text).expect("write");
     }
 
-    fn locate_expected_golden(home: &std::path::Path, repo: &std::path::Path) -> String {
+    fn locate_expected_golden(fleet_config: &std::path::Path, repo: &std::path::Path) -> String {
         include_str!("../../tests/fixtures/locate/atlas.json")
-            .replace("/tmp/placeholder/.config/maw/fleet/alpha.json", &path_string(home.join(".config/maw/fleet/alpha.json")))
-            .replace("/tmp/placeholder", &path_string(repo))
+            .replace("__CONFIG_PLACEHOLDER__/maw/fleet/alpha.json", &path_string(fleet_config))
+            .replace("__REPO_PLACEHOLDER__", &path_string(repo))
     }
 
     fn locate_window(index: u32, name: &str) -> maw_tmux::TmuxWindow {
@@ -578,29 +677,34 @@ mod locate_tests {
     #[test]
     fn locate_json_matches_committed_golden_and_ignores_missing_js_ref() {
         let _guard = locate_env_lock().lock().expect("env lock");
-        let home = locate_temp_home("json");
-        let ghq = home.join("ghq");
-        let repo = ghq.join("github.com/acme/atlas-oracle");
+        let env = LocateHermeticEnv::new("json");
+        assert_eq!(std::env::var_os("TMUX"), None);
+        assert_eq!(current_xdg_env().home_dir(), env.home.as_path());
+        let repo = env.ghq.join("github.com/acme/atlas-oracle");
         std::fs::create_dir_all(repo.join("ψ")).expect("repo");
-        std::env::set_var("HOME", &home);
-        std::env::set_var("GHQ_ROOT", &ghq);
-        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
         locate_write(
-            &home.join(".config/maw/maw.config.json"),
+            &env.maw_config_path(&["maw.config.json"]),
             r#"{"node":"local","agents":{"atlas":"edge"},"sessions":{"atlas":"session-uuid"}}"#,
         );
+        let fleet_config = env.maw_config_path(&["fleet", "alpha.json"]);
         locate_write(
-            &home.join(".config/maw/fleet/alpha.json"),
+            &fleet_config,
             r#"{"name":"alpha","windows":[{"name":"atlas-oracle","repo":"acme/atlas-oracle"},{"name":"logs","repo":""}]}"#,
         );
+        let registry_cache = env.maw_cache_path(&["oracles.json"]);
         locate_write(
-            &home.join(".maw/oracles.json"),
+            &registry_cache,
             &format!(
                 r#"{{"schema":1,"local_scanned_at":"2026-06-25T00:00:00Z","ghq_root":"{}","oracles":[{{"org":"acme","repo":"atlas-oracle","name":"atlas","local_path":"{}","has_psi":true,"has_fleet_config":true,"budded_from":null,"budded_at":null,"federation_node":"edge","detected_at":"2026-06-25T00:00:00Z"}}]}}"#,
-                ghq.display(),
+                env.ghq.display(),
                 repo.display()
             ),
         );
+        assert!(env.xdg_data.exists());
+        assert!(env.xdg_state.exists());
+        assert!(env.xdg_cache.exists());
+        assert!(fleet_config.starts_with(&env.xdg_config));
+        assert!(registry_cache.starts_with(&env.xdg_cache));
         let sessions = vec![TmuxSession {
             name: "alpha".to_owned(),
             windows: vec![locate_window(1, "atlas-oracle"), locate_window(2, "logs")],
@@ -608,21 +712,30 @@ mod locate_tests {
 
         let info = locate_gather_info("atlas", true, &sessions).expect("locate info");
         let rendered = serde_json::to_string_pretty(&info).expect("json") + "\n";
-        let expected = locate_expected_golden(&home, &repo);
+        let expected = locate_expected_golden(&fleet_config, &repo);
         assert_eq!(rendered, expected);
     }
 
     #[test]
     fn locate_path_is_one_clean_line_from_temp_home() {
         let _guard = locate_env_lock().lock().expect("env lock");
-        let home = locate_temp_home("path");
-        let ghq = home.join("ghq");
-        let repo = ghq.join("github.com/acme/pathfinder-oracle");
+        let env = LocateHermeticEnv::new("path");
+        assert_eq!(std::env::var_os("TMUX"), None);
+        let repo = env.ghq.join("github.com/acme/pathfinder-oracle");
         std::fs::create_dir_all(&repo).expect("repo");
-        std::env::set_var("HOME", &home);
-        std::env::set_var("GHQ_ROOT", &ghq);
+        locate_write(
+            &env.maw_config_path(&["maw.config.json"]),
+            r#"{"node":"local","agents":{"pathfinder":"edge"},"sessions":{"pathfinder":"path-session"}}"#,
+        );
+        locate_write(
+            &env.maw_config_path(&["fleet", "pathfinder.json"]),
+            r#"{"name":"pathfinder","windows":[{"name":"pathfinder-oracle","repo":"acme/pathfinder-oracle"}]}"#,
+        );
         let opts = LocateOptions { path: true, json: false };
-        assert_eq!(locate_cmd("pathfinder", &opts).expect("path"), format!("{}\n", repo.display()));
+        assert_eq!(
+            locate_cmd_with_sessions("pathfinder", &opts, &[]).expect("path"),
+            format!("{}\n", repo.display())
+        );
     }
 
     #[test]
