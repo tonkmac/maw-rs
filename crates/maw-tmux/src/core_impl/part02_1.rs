@@ -299,6 +299,18 @@ where
         Ok(raw.lines().next().unwrap_or_default().to_owned())
     }
 
+    /// Render an arbitrary tmux display-message format for the current client.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot render the format.
+    pub fn display_message(&mut self, format: &str) -> Result<String, TmuxError> {
+        self.runner.run(
+            "display-message",
+            &["-p".to_owned(), format.to_owned()],
+        )
+    }
+
     /// Return the current command for a pane through tmux `display-message`.
     ///
     /// This matches the safety lookup used by maw-js `cmdTmuxSend`.

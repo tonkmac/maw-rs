@@ -59,9 +59,10 @@ use maw_routing::{
 };
 use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
 use maw_tmux::{
-    decide_tmux_attach_action, mark_peer_targets_live, resolve_tmux_live_state,
-    resolve_tmux_attach_session, tmux_attach_spawn_command, DiscoverLivePane, PeerTargetWithLive,
-    TmuxAttachAction, TmuxAttachSessionResolution, TmuxClient, TmuxLiveStateResult, TmuxPane, TmuxSession,
+    decide_tmux_attach_action, mark_peer_targets_live, resolve_tmux_attach_session,
+    resolve_tmux_live_state, tmux_attach_spawn_command, DiscoverLivePane, PeerTargetWithLive,
+    TmuxAttachAction, TmuxAttachSessionResolution, TmuxClient, TmuxLiveStateResult, TmuxPane,
+    TmuxRunner, TmuxSession,
 };
 use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
