@@ -111,13 +111,22 @@ pub struct AuditEvent {
     pub duration_ms: u128,
 }
 
+
+#[derive(Debug, Clone)]
+struct FakeHostResponse {
+    output: String,
+    capability: Option<String>,
+    resource: Option<String>,
+    status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MawWasmHost {
     plugin_name: String,
     caps: CapabilitySet,
     fs_roots: BTreeMap<String, PathBuf>,
     secret_store: BTreeMap<String, String>,
-    fake_responses: BTreeMap<(String, String), String>,
+    fake_responses: BTreeMap<(String, String), FakeHostResponse>,
     audit: Arc<Mutex<Vec<AuditEvent>>>,
     http_timeout_ms: u64,
 }
@@ -150,13 +159,28 @@ impl MawWasmHost {
 
     #[must_use]
     pub fn with_fake_response(
-        mut self,
+        self,
         name: impl Into<String>,
         input: impl Into<String>,
         output: impl Into<String>,
     ) -> Self {
-        self.fake_responses
-            .insert((name.into(), input.into()), output.into());
+        self.with_audited_fake_response(name, input, output, None, None, None)
+    }
+
+    #[must_use]
+    pub fn with_audited_fake_response(
+        mut self,
+        name: impl Into<String>,
+        input: impl Into<String>,
+        output: impl Into<String>,
+        capability: Option<String>,
+        resource: Option<String>,
+        status: Option<String>,
+    ) -> Self {
+        self.fake_responses.insert(
+            (name.into(), input.into()),
+            FakeHostResponse { output: output.into(), capability, resource, status },
+        );
         self
     }
 
@@ -169,12 +193,23 @@ impl MawWasmHost {
 
     #[must_use]
     pub fn handle_json(&self, name: &str, input: &str) -> String {
-        if let Some(output) = self
-            .fake_responses
-            .get(&(name.to_owned(), input.to_owned()))
-            .cloned()
-        {
-            return output;
+        if let Some(fake) = self.fake_responses.get(&(name.to_owned(), input.to_owned())) {
+            if let Some(capability) = &fake.capability {
+                if !self.caps.caps.contains(capability) {
+                    return to_json(&HostResult::<Value>::err(
+                        HostErrorCode::CapabilityDenied,
+                        format!("capability denied: {capability}"),
+                    ));
+                }
+                self.audit(
+                    name,
+                    capability,
+                    fake.resource.as_deref().unwrap_or("seeded-host"),
+                    fake.status.as_deref().unwrap_or("ok"),
+                    Instant::now(),
+                );
+            }
+            return fake.output.clone();
         }
         match name {
             "maw.exec.run" => to_json(&self.exec_run(input)),
