@@ -18,6 +18,9 @@ fn golden_parity_trivial_bun_and_wasm_outputs_match_in_isolated_maw_home() {
         manifest_name: "trivial-parity",
         args: &["alpha", "beta"],
         expected_host_calls: None,
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+            "examples/wasm-parity/trivial/bun/index.ts",
+        ),
     });
 }
 
@@ -29,6 +32,9 @@ fn golden_parity_shellenv_bun_and_wasm_outputs_match_in_isolated_maw_home() {
             manifest_name: "shellenv-parity",
             args,
             expected_host_calls: Some(0),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/shellenv/src/index.ts",
+            ),
         });
     }
 }
@@ -48,6 +54,9 @@ fn golden_parity_learn_bun_and_wasm_outputs_match_in_isolated_maw_home() {
             manifest_name: "learn-parity",
             args,
             expected_host_calls: Some(0),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/learn/index.ts",
+            ),
         });
     }
 }
@@ -59,6 +68,7 @@ fn golden_parity_cross_team_queue_bun_and_wasm_outputs_match_in_isolated_maw_hom
         manifest_name: "cross-team-queue-parity",
         args: &[],
         expected_host_calls: Some(0),
+        real_maw_js_entry: RealMawJsEntry::CrossTeamQueueHandle,
     });
 }
 
@@ -68,15 +78,17 @@ struct ParityCase<'a> {
     manifest_name: &'a str,
     args: &'a [&'a str],
     expected_host_calls: Option<usize>,
+    real_maw_js_entry: RealMawJsEntry,
+}
+
+#[derive(Clone, Copy)]
+enum RealMawJsEntry {
+    DefaultHandler(&'static str),
+    CrossTeamQueueHandle,
 }
 
 fn run_parity_case(case: ParityCase<'_>) {
     let _guard = ENV_LOCK.lock().expect("env lock");
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("repo root")
-        .to_path_buf();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/wasm-parity")
         .join(case.plugin);
@@ -95,13 +107,9 @@ fn run_parity_case(case: ParityCase<'_>) {
         args: case.args.iter().map(|arg| (*arg).to_owned()).collect(),
     };
 
-    let bun_plugin = make_bun_plugin(
-        &repo
-            .join("examples/wasm-parity")
-            .join(case.plugin)
-            .join("bun"),
-        case.manifest_name,
-    );
+    let maw_js_ref = maw_js_ref_dir();
+    let bun_entry = real_maw_js_entry_path(&temp, &maw_js_ref, case.real_maw_js_entry);
+    let bun_plugin = make_bun_plugin(&bun_entry, case.manifest_name);
     let mut bun_runtime = BunInvokeRuntime::default();
     let bun = invoke_plugin(&bun_plugin, &ctx, &mut bun_runtime);
 
@@ -172,16 +180,58 @@ fn capture(result: &InvokeResult) -> Value {
     })
 }
 
-fn make_bun_plugin(dir: &Path, manifest_name: &str) -> LoadedPlugin {
+fn make_bun_plugin(entry_path: &Path, manifest_name: &str) -> LoadedPlugin {
     LoadedPlugin {
         manifest: manifest(manifest_name),
-        dir: dir.to_path_buf(),
+        dir: entry_path.parent().unwrap_or(entry_path).to_path_buf(),
         wasm_path: PathBuf::new(),
-        entry_path: Some(dir.join("index.ts")),
+        entry_path: Some(entry_path.to_path_buf()),
         wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled: false,
     }
+}
+
+fn maw_js_ref_dir() -> PathBuf {
+    std::env::var_os("MAW_JS_REF_DIR").map_or_else(
+        || PathBuf::from("/home/agent/github.com/Soul-Brews-Studio/maw-js"),
+        PathBuf::from,
+    )
+}
+
+fn real_maw_js_entry_path(temp: &Path, maw_js_ref: &Path, entry: RealMawJsEntry) -> PathBuf {
+    match entry {
+        RealMawJsEntry::DefaultHandler(relative) => {
+            if relative.starts_with("examples/") {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .ancestors()
+                    .nth(2)
+                    .expect("repo root")
+                    .join(relative)
+            } else {
+                maw_js_ref.join(relative)
+            }
+        }
+        RealMawJsEntry::CrossTeamQueueHandle => {
+            write_cross_team_queue_real_wrapper(temp, maw_js_ref)
+        }
+    }
+}
+
+fn write_cross_team_queue_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-cross-team-queue");
+    create_dir_all(&wrapper_dir).expect("cross-team-queue wrapper dir");
+    let real_path = maw_js_ref
+        .join("src/vendor/mpr-plugins/cross-team-queue/src/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let real = serde_json::to_string(&real_path).expect("real path json string");
+    let wrapper = format!(
+        "const real = await import({real});\nexport default async function handle(_ctx) {{\n  return {{ ok: true, output: JSON.stringify(await real.handle()) }};\n}}\n"
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("cross-team-queue wrapper");
+    path
 }
 
 fn load_wasm_fixture(dir: &Path, manifest_name: &str) -> LoadedPlugin {
