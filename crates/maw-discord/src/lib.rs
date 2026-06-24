@@ -1754,6 +1754,9 @@ async fn fetch_channels(
     token: &str,
     guild_id: &str,
 ) -> Result<Vec<Channel>, String> {
+    if !is_numeric_snowflake(guild_id) {
+        return Err(format!("invalid guild id '{guild_id}'"));
+    }
     let res = rest
         .get_json(&format!("/guilds/{guild_id}/channels"), token)
         .await?;
@@ -1766,6 +1769,10 @@ async fn fetch_channels(
 async fn resolve_user_list(rest: &dyn DiscordRest, token: &str, ids: &[String]) -> Vec<Value> {
     let mut out = Vec::new();
     for id in ids {
+        if !is_numeric_snowflake(id) {
+            out.push(json!({"id": id, "name": id, "invalid": true}));
+            continue;
+        }
         let path = format!("/users/{id}");
         let name = match rest.get_json(&path, token).await {
             Ok(res) if (200..300).contains(&res.status) => res
@@ -1779,6 +1786,10 @@ async fn resolve_user_list(rest: &dyn DiscordRest, token: &str, ids: &[String]) 
         out.push(json!({"id": id, "name": name}));
     }
     out
+}
+
+fn is_numeric_snowflake(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())
 }
 
 fn channel_type_label(kind: u8) -> String {

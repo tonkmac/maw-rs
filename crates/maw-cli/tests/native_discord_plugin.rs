@@ -7,12 +7,12 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::Mutex,
+    sync::{Mutex as StdMutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 struct MockRest {
-    calls: Mutex<Vec<String>>,
+    calls: StdMutex<Vec<String>>,
     responses: BTreeMap<String, DiscordHttpResponse>,
 }
 
@@ -32,6 +32,11 @@ impl DiscordRest for MockRest {
                 .ok_or_else(|| format!("missing mock response: {path}"))
         })
     }
+}
+
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -88,6 +93,52 @@ fn seed_bot(root: &std::path::Path, bot: &str) -> DiscordEnv {
     env
 }
 
+#[tokio::test]
+async fn discord_members_rejects_non_numeric_allow_from_without_rest_call() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+    let root = temp_dir("invalid-user-id");
+    let env = seed_bot(&root, "nova-oracle");
+    std::env::set_var("DISCORD_BOT_TOKEN", "mock-token-never-logged");
+    let access_path = env
+        .ghq_root
+        .join("github.com/Soul-Brews-Studio/nova-oracle/.discord/access.json");
+    fs::write(
+        access_path,
+        "{\n  \"dmPolicy\": \"allowlist\",\n  \"allowFrom\": [],\n  \"groups\": {\n    \"111\": { \"requireMention\": true, \"allowFrom\": [\"@me/guilds\"] }\n  },\n  \"pending\": {}\n}\n",
+    )
+    .expect("access with invalid id");
+    let rest = MockRest {
+        calls: StdMutex::new(Vec::new()),
+        responses: BTreeMap::new(),
+    };
+
+    let output = run_discord_command_with(
+        &[
+            "members".to_owned(),
+            "nova-oracle".to_owned(),
+            "general".to_owned(),
+            "--json".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
+
+    assert_eq!(output.code, 0);
+    assert!(
+        output.stdout.contains("\"invalid\": true"),
+        "{}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("@me/guilds"), "{}", output.stdout);
+    assert!(
+        rest.calls.lock().expect("calls").is_empty(),
+        "invalid allow_from id must not be interpolated into a Discord REST path"
+    );
+    std::env::remove_var("DISCORD_BOT_TOKEN");
+}
+
 #[test]
 fn discord_is_native_not_bun_fallback() {
     assert_eq!(dispatcher_status("discord"), DispatchKind::Native);
@@ -95,11 +146,12 @@ fn discord_is_native_not_bun_fallback() {
 
 #[tokio::test]
 async fn discord_version_committed_golden_without_ref_checkout() {
+    let _guard = env_lock().lock().await;
     std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
     let root = temp_dir("version");
     let env = env(&root);
     let rest = MockRest {
-        calls: Mutex::new(Vec::new()),
+        calls: StdMutex::new(Vec::new()),
         responses: BTreeMap::new(),
     };
 
@@ -115,6 +167,7 @@ async fn discord_version_committed_golden_without_ref_checkout() {
 
 #[tokio::test]
 async fn discord_access_list_and_inventory_use_mocked_rest_only() {
+    let _guard = env_lock().lock().await;
     std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
     let root = temp_dir("inventory");
     let env = seed_bot(&root, "nova-oracle");
@@ -124,15 +177,15 @@ async fn discord_access_list_and_inventory_use_mocked_rest_only() {
         "/users/@me/guilds".to_owned(),
         DiscordHttpResponse {
             status: 200,
-            body: json!([{ "id": "g1", "name": "Guild One" }]),
+            body: json!([{ "id": "999", "name": "Guild One" }]),
             retry_after: None,
         },
     );
     responses.insert(
-        "/guilds/g1/channels".to_owned(),
+        "/guilds/999/channels".to_owned(),
         DiscordHttpResponse {
             status: 200,
-            body: json!([{ "id": "111", "name": "general", "type": 0, "guild_id": "g1" }]),
+            body: json!([{ "id": "111", "name": "general", "type": 0, "guild_id": "999" }]),
             retry_after: None,
         },
     );
@@ -145,7 +198,7 @@ async fn discord_access_list_and_inventory_use_mocked_rest_only() {
         },
     );
     let rest = MockRest {
-        calls: Mutex::new(Vec::new()),
+        calls: StdMutex::new(Vec::new()),
         responses,
     };
 
@@ -170,11 +223,15 @@ async fn discord_access_list_and_inventory_use_mocked_rest_only() {
         &rest,
     )
     .await;
-    assert!(inventory.stdout.contains("📋 nova-oracle — full inventory"));
+    assert!(
+        inventory.stdout.contains("📋 nova-oracle — full inventory"),
+        "{}",
+        inventory.stdout
+    );
     assert!(inventory.stdout.contains("✓ #general"));
     let calls = rest.calls.lock().expect("calls");
     assert!(calls.iter().all(|path| path.starts_with('/')));
     assert!(calls.contains(&"/users/@me/guilds".to_owned()));
-    assert!(calls.contains(&"/guilds/g1/channels".to_owned()));
+    assert!(calls.contains(&"/guilds/999/channels".to_owned()));
     std::env::remove_var("DISCORD_BOT_TOKEN");
 }
