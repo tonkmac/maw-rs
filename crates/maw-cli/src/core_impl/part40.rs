@@ -308,7 +308,7 @@ fn overview_pane_title(target: &OverviewTarget, index: usize) -> String {
 fn overview_mirror_cmd(target: &OverviewTarget, port: u16) -> String {
     format!(
         "watch --color -t -n0.5 'curl -s \"http://localhost:{port}/api/mirror?target={}&lines=$(tput lines)\"'",
-        encode_uri_component(&format!("{}:{}", target.session, target.window))
+        overview_encode_uri_component(&format!("{}:{}", target.session, target.window))
     )
 }
 
@@ -376,7 +376,7 @@ fn validate_overview_tmux_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_uri_component(value: &str) -> String {
+fn overview_encode_uri_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         let keep = byte.is_ascii_alphanumeric()
