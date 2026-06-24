@@ -11,6 +11,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio.workspace = true
+twilight-gateway = { version = "0.17.1", default-features = false, features = ["rustls-webpki-roots"] }
+twilight-model = "0.17.1"
 
 [lints]
 workspace = true
