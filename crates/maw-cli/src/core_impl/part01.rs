@@ -61,7 +61,7 @@ use maw_split::{decide_split_policy, SplitPolicyDecision, SplitPolicyInput};
 use maw_tmux::{
     decide_tmux_attach_action, mark_peer_targets_live, resolve_tmux_live_state,
     resolve_tmux_attach_session, tmux_attach_spawn_command, DiscoverLivePane, PeerTargetWithLive,
-    TmuxAttachAction, TmuxAttachSessionResolution, TmuxClient, TmuxLiveStateResult, TmuxPane,
+    TmuxAttachAction, TmuxAttachSessionResolution, TmuxClient, TmuxLiveStateResult, TmuxPane, TmuxSession,
 };
 use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
@@ -134,6 +134,7 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "--help", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "-h", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "help", handler: Handler::Sync(usage_handler) },
+    DispatcherEntry { command: "activity", handler: Handler::Sync(run_activity_command) },
     DispatcherEntry { command: "auth", handler: Handler::Sync(run_auth_plan) },
     DispatcherEntry { command: "auto-wake", handler: Handler::Sync(run_auto_wake_plan) },
     DispatcherEntry { command: "hub", handler: Handler::Sync(run_hub_plan) },

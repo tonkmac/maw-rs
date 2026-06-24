@@ -31,3 +31,4 @@ include!("part30.rs");
 include!("part31.rs");
 include!("part32.rs");
 include!("part33.rs");
+include!("part34.rs");
