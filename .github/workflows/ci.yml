@@ -11,6 +11,7 @@ permissions:
 jobs:
   rust:
     name: Rust workspace
+    # Self-hosted runner deferred until TK's Linux test server is ready.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,19 +27,62 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Setup Node cache for WASM fixtures
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: packages/wasm-sdk/package-lock.json
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-workspace-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          cache-all-crates: true
+          cache-targets: true
 
       - name: Build deterministic AssemblyScript WASM fixtures
         run: |
           npm --prefix packages/wasm-sdk ci
           npm --prefix packages/wasm-sdk run check:fixtures
 
+      - name: Fetch Cargo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch --locked; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Build workspace tests
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo build --workspace --tests --locked; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
       - name: Test workspace
-        run: cargo test --workspace
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: cargo test --workspace --locked
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
