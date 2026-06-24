@@ -4,6 +4,8 @@
     clippy::too_many_lines
 )]
 
+pub mod gateway;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
