@@ -65,7 +65,7 @@ use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
     FederationStatus, PairStatus, PeerFederationStatus, PeerFederationStatusResult,
     SymmetricFederationStatus, Transport, TransportFailureReason, TransportResult, TransportRouter,
-    TransportTarget,
+    PeerSendRequest, ReqwestHttpTransportIo, TransportTarget,
 };
 use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
@@ -147,6 +147,7 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "run", handler: Handler::Sync(run_run_command) },
     DispatcherEntry { command: "send-enter", handler: Handler::Sync(run_send_enter_command) },
     DispatcherEntry { command: "feed", handler: Handler::Sync(run_feed_plan) },
+    DispatcherEntry { command: "hey", handler: Handler::Async(run_hey_async) },
     DispatcherEntry { command: "fuzzy", handler: Handler::Sync(run_fuzzy_plan) },
     DispatcherEntry { command: "resolve", handler: Handler::Sync(run_resolve_plan) },
     DispatcherEntry { command: "identity", handler: Handler::Sync(run_identity_plan) },
@@ -284,6 +285,14 @@ pub async fn run_cli_async(argv: &[String]) -> CliOutput {
 }
 
 fn run_async_handler_blocking(handler: AsyncHandler, args: &[String]) -> CliOutput {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return CliOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "cannot block_on inside runtime; call run_cli_async for async commands\n".to_owned(),
+        };
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
