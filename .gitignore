@@ -6,3 +6,6 @@ target/
 # codex coder runtime homes (worktree-local CODEX_HOME)
 .codex/
 .maw-engine/
+
+# nova builder worktrees
+agents/
