@@ -216,6 +216,12 @@ impl MawWasmHost {
             "maw.exec.spawn" => to_json(&self.exec_spawn(input)),
             "maw.config.get" => to_json(&self.config_get(input)),
             "maw.config.set" => to_json(&self.config_set(input)),
+            "maw.consent.read" => to_json(&self.consent_read(input)),
+            "maw.consent.approve" | "maw.consent.reject" | "maw.consent.trust"
+            | "maw.consent.untrust" | "maw.state.set" => to_json(&HostResult::<Value>::err(
+                HostErrorCode::CapabilityDenied,
+                "WASM plugins cannot approve, grant trust, pair, or mutate consent state; use a human-at-terminal command",
+            )),
             "maw.fs.read" => to_json(&self.fs_read(input)),
             "maw.fs.write" => to_json(&self.fs_write(input)),
             "maw.fs.list" => to_json(&self.fs_list(input)),
@@ -310,6 +316,28 @@ impl MawWasmHost {
             return err;
         }
         HostResult::ok(json!({"key": args.key, "written": true, "audit": "config-write", "finalValue": final_value}))
+    }
+
+    fn consent_read(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<ConsentReadArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let cap = match self.caps.require("sdk", "consent", Some("read")).or_else(|_| self.caps.require("sdk", "consent:read", None)) { Ok(cap) => cap, Err(err) => return err };
+        let view = args.view.as_deref().unwrap_or("pending");
+        let state_root = match self.consent_state_root() { Ok(path) => path, Err(err) => return err };
+        let result = match view {
+            "pending" | "list" => {
+                let rows = match read_consent_pending(&state_root) { Ok(rows) => rows, Err(err) => return err };
+                HostResult::ok(json!({"text": format_consent_pending(&rows), "pending": rows}))
+            }
+            "trust" | "list-trust" => {
+                let rows = match read_consent_trust(&state_root) { Ok(rows) => rows, Err(err) => return err };
+                HostResult::ok(json!({"text": format_consent_trust(&rows), "trust": rows}))
+            }
+            _ => HostResult::err(HostErrorCode::InvalidArgs, "view must be pending or trust"),
+        };
+        let resource = if matches!(view, "trust" | "list-trust") { "consent:trust" } else { "consent:pending" };
+        self.audit("maw.consent.read", &cap, resource, status_of(&result), start);
+        result
     }
 
     fn fs_read(&self, input: &str) -> HostResult<Value> {
@@ -541,6 +569,18 @@ impl MawWasmHost {
         let root = canonicalize_checked_path(&root)?;
         Ok(root.join("maw.config.json"))
     }
+
+    fn consent_state_root(&self) -> Result<PathBuf, HostResult<Value>> {
+        let root = self.fs_roots.get("state").cloned().unwrap_or_else(default_state_root);
+        if deny_special_path(&root) {
+            return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special consent state root denied"));
+        }
+        if root.exists() {
+            canonicalize_checked_path(&root)
+        } else {
+            Ok(root)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -574,7 +614,7 @@ impl PluginInvokeRuntime for ExtismWasmInvokeRuntime {
 }
 
 pub const HOST_FN_NAMES: &[&str] = &[
-    "maw.exec.run", "maw.exec.spawn", "maw.config.get", "maw.config.set", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
+    "maw.exec.run", "maw.exec.spawn", "maw.config.get", "maw.config.set", "maw.consent.read", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
 ];
 
 fn extism_host_call_named(
@@ -620,6 +660,9 @@ struct ConfigGetArgs { key: Option<String> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigSetArgs { key: String, value: Value }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsentReadArgs { view: Option<String> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HttpArgs { method: String, url: String, headers: Option<BTreeMap<String, String>>, body: Option<String>, timeout_ms: Option<u64>, follow_redirects: Option<bool> }
@@ -695,6 +738,18 @@ fn default_config_root() -> PathBuf {
     }
     std::env::var_os("HOME").map_or_else(|| PathBuf::from(".config").join("maw"), |home| PathBuf::from(home).join(".config").join("maw"))
 }
+fn default_state_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("MAW_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("MAW_HOME") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(path).join("maw");
+    }
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from(".local").join("state").join("maw"), |home| PathBuf::from(home).join(".local").join("state").join("maw"))
+}
 fn open_nofollow_existing(path: &Path) -> Result<File, HostResult<Value>> {
     let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW_FLAG).open(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("open failed: {error}")))?;
     let meta = file.metadata().map_err(|error| HostResult::err(HostErrorCode::IoError, format!("metadata failed: {error}")))?;
@@ -717,6 +772,138 @@ fn read_config_json(path: &Path) -> Result<Value, HostResult<Value>> {
         return Err(HostResult::err(HostErrorCode::IoError, "config exceeds maxBytes"));
     }
     serde_json::from_str(&raw).map_err(|error| HostResult::err(HostErrorCode::InvalidArgs, format!("config JSON parse failed: {error}")))
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsentPendingRow {
+    id: String,
+    from: String,
+    to: String,
+    action: String,
+    summary: String,
+    #[serde(rename = "pinHash", skip_serializing)]
+    _pin_hash: Option<String>,
+    created_at: String,
+    expires_at: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsentTrustRow {
+    from: String,
+    to: String,
+    action: String,
+    approved_at: String,
+    approved_by: Option<String>,
+    request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsentTrustFile {
+    #[serde(default)]
+    trust: BTreeMap<String, ConsentTrustRow>,
+}
+
+fn read_consent_pending(state_root: &Path) -> Result<Vec<ConsentPendingRow>, HostResult<Value>> {
+    let dir = state_root.join("consent-pending");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let dir = canonicalize_checked_path(&dir)?;
+    if deny_special_path(&dir) {
+        return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special consent pending path denied"));
+    }
+    let mut rows = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("read pending dir failed: {error}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| HostResult::err(HostErrorCode::IoError, format!("read pending entry failed: {error}")))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        let extension = Path::new(name).extension().and_then(|ext| ext.to_str());
+        if extension.is_none_or(|ext| !ext.eq_ignore_ascii_case("json"))
+            || extension.is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        {
+            continue;
+        }
+        if let Ok(value) = read_json_file(&path) {
+            if let Ok(row) = serde_json::from_value::<ConsentPendingRow>(value) {
+                rows.push(row);
+            }
+        }
+    }
+    rows.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(rows)
+}
+
+fn read_consent_trust(state_root: &Path) -> Result<Vec<ConsentTrustRow>, HostResult<Value>> {
+    let path = state_root.join("trust.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file: ConsentTrustFile = serde_json::from_value(read_json_file(&path)?)
+        .map_err(|error| HostResult::err(HostErrorCode::InvalidArgs, format!("trust JSON parse failed: {error}")))?;
+    let mut rows = file.trust.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.approved_at.cmp(&right.approved_at));
+    Ok(rows)
+}
+
+fn read_json_file(path: &Path) -> Result<Value, HostResult<Value>> {
+    let path = canonicalize_checked_path(path)?;
+    let file = open_nofollow_existing(&path)?;
+    verify_fd_path(&file, &path)?;
+    let mut raw = String::new();
+    if let Err(error) = file.take(MAX_READ_BYTES + 1).read_to_string(&mut raw) {
+        return Err(HostResult::err(HostErrorCode::IoError, format!("read JSON failed: {error}")));
+    }
+    if raw.len() as u64 > MAX_READ_BYTES {
+        return Err(HostResult::err(HostErrorCode::IoError, "JSON exceeds maxBytes"));
+    }
+    serde_json::from_str(&raw).map_err(|error| HostResult::err(HostErrorCode::InvalidArgs, format!("JSON parse failed: {error}")))
+}
+
+fn format_consent_pending(rows: &[ConsentPendingRow]) -> String {
+    if rows.is_empty() {
+        return "no pending consent requests".to_owned();
+    }
+    let mut lines = vec!["id                        from → to             action            status   summary".to_owned()];
+    for row in rows {
+        let id = pad(&row.id, 24);
+        let from_to = pad(&format!("{} → {}", row.from, row.to), 20);
+        let action = pad(&row.action, 16);
+        let status = pad(&row.status, 8);
+        let summary = truncate_summary(&row.summary);
+        lines.push(format!("{id}  {from_to}  {action}  {status}  {summary}"));
+    }
+    lines.join("\n")
+}
+
+fn format_consent_trust(rows: &[ConsentTrustRow]) -> String {
+    if rows.is_empty() {
+        return "no trust entries".to_owned();
+    }
+    let mut lines = vec!["from → to                action            approvedAt".to_owned()];
+    for row in rows {
+        let from_to = pad(&format!("{} → {}", row.from, row.to), 22);
+        let action = pad(&row.action, 16);
+        lines.push(format!("{from_to}  {action}  {}", row.approved_at));
+    }
+    lines.join("\n")
+}
+
+fn pad(value: &str, width: usize) -> String {
+    if value.chars().count() >= width {
+        value.to_owned()
+    } else {
+        format!("{value}{}", " ".repeat(width - value.chars().count()))
+    }
+}
+
+fn truncate_summary(value: &str) -> String {
+    if value.chars().count() <= 50 {
+        return value.to_owned();
+    }
+    format!("{}…", value.chars().take(47).collect::<String>())
 }
 fn write_config_json(path: &Path, config: &Value) -> Result<(), HostResult<Value>> {
     let parent = path.parent().ok_or_else(|| HostResult::err(HostErrorCode::InvalidArgs, "config path requires parent"))?;
