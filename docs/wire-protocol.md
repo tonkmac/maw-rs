@@ -1,12 +1,12 @@
 # maw-js Wire Protocol (E1)
 
-Pinned version: maw-js v26.5.21.
+Pinned version: maw-js v26.6.13.
 
 Reverse-engineered for Issue #7. This is a docs-only target for the Rust port; no production Rust behavior is changed here.
 
 ## Evidence and capture boundary
 
-Ground truth is maw-js v26.5.21 source under `/home/agent/.bun/install/cache/@GH@Soul-Brews-Studio-maw-js-d58ab40@@@1/src`. Safe capture was limited to localhost/temp state so no real fleet peer received writes.
+Ground truth is maw-js v26.6.13 source under `/home/agent/github.com/Soul-Brews-Studio/maw-js/src`. Safe capture was limited to localhost/temp state so no real fleet peer received writes.
 
 Captured evidence:
 
@@ -23,17 +23,19 @@ Unsafe/not captured:
 
 | Transport | Actual use | Evidence |
 |---|---:|---|
-| local tmux | yes, default local fast path for `hey`; no network envelope | `TmuxTransport` wraps `sendKeys`, connects by setting `_connected=true`, rejects non-local host, resolves target then `sendToTmux(tmuxTarget,message)` (`src/transports/tmux.ts:1-5`, `src/transports/tmux.ts:14-32`, `src/transports/tmux.ts:38-57`, `src/transports/tmux.ts:78-81`). The CLI `cmdSend` local branch resolves a pane, persists receiver inbox first, then calls `sendKeys(target,outboundMessage)` (`src/commands/shared/comm-send.ts:616-632`). |
-| HTTP federation | yes, primary cross-node `hey`/peer fallback | CLI remote branch posts JSON to `${peerUrl}/api/send` with `from:"auto"` signing (`src/commands/shared/comm-send.ts:657-660`). Discovery fallback does the same (`src/commands/shared/comm-send.ts:708-711`). Server remote branch does the same for forwarded `/api/send` (`src/api/sessions.ts:378-383`). `HttpTransport` is registered when `config.peers.length > 0` (`src/transports/index.ts:95-103`). |
-| HubTransport / workspace hub | yes, real cross-machine send path when workspace config exists | Router imports HubTransport and loads workspace configs, then registers `new HubTransport(config.node)` when at least one workspace config is present (`src/transports/index.ts:9`, `src/transports/index.ts:50-53`). The carried-transport union includes `"hub"` (`src/core/transport/transport.ts:53-60`). Hub sends WebSocket `{type:"message",to,body,from,timestamp}` frames to known workspace agents (`src/transports/hub-transport.ts:74-103`), while WS inbound message frames become `transport:"hub"` messages (`src/transports/hub-connection.ts:61-69`). |
-| Scout UDP discovery + HTTP auto-pair | yes by default unless disabled | Router registers `ScoutTransport` when discovery resolves to `scout` or `both` (`src/transports/index.ts:58-70`). Protocol is JSON over UDP multicast `224.0.0.224:31746` with Scout/Hello/Announce messages (`src/transports/scout-protocol.ts:1-8`, `src/transports/scout-protocol.ts:12-47`, `src/transports/scout-protocol.ts:57-88`). Auto-pair then POSTs HTTP `/api/pair/auto` (`src/transports/scout-pair.ts:1-5`, `src/transports/scout-pair.ts:42-83`). |
-| Zenoh full transport | implemented, opt-in only | Registered only when transport `zenoh` is enabled and `config.zenoh?.locator` is set (`src/transports/index.ts:83-92`). It opens zenoh-ts over a locator such as `ws://host:10000` (`src/transports/zenoh.ts:1-10`, `src/transports/zenoh.ts:57-63`). Topics are `maw/<node>/hey/<oracle>`, `maw/<node>/presence`, and `maw/<node>/feed` (`src/transports/zenoh.ts:149-180`). |
-| Zenoh scout | implemented, opt-in discovery/presence provider | Discovery resolver can choose `zenoh`; router registers plugin `zenoh-scout` only when discovery is `zenoh` or `both` (`src/transports/index.ts:18-33`, `src/transports/index.ts:72-80`). The shim imports plugin symbol `createZenohScoutTransport` (`src/transports/zenoh-scout.ts:1-15`). |
-| MQTT | **not used for `hey` delivery**; feed broadcast only when configured | The interface comment still mentions MQTT for remote targets (`src/core/transport/transport.ts:4-10`), but the concrete router registers tmux, scout, zenoh-scout, zenoh, http, nanoclaw; it does not register an MQTT transport (`src/transports/index.ts:45-109`). MQTT code publishes feed events only to `maw/v1/oracle/<oracle>/feed` and `maw/v1/node/<node>/feed` (`src/plugins/builtin/mqtt-publish.ts:2-3`, `src/plugins/builtin/mqtt-publish.ts:22-23`) through a broker at `config.mqttPublish.broker` (`src/core/transport/mqtt-publish.ts:1-8`, `src/core/transport/mqtt-publish.ts:14-31`). |
-| NanoClaw | external channels, not maw wire prerequisite | Router registers `NanoclawTransport` as optional transport (`src/transports/index.ts:105-106`). |
-| LoRaTransport | registered stub, not usable yet | Router imports and always registers `LoRaTransport` (`src/transports/index.ts:10`, `src/transports/index.ts:108-109`). The implementation stays disconnected and `canReach()` always returns false (`src/transports/lora.ts:21-31`, `src/transports/lora.ts:41-44`). |
+| local tmux | yes, default local fast path for `hey`; no network envelope | `TmuxTransport` wraps `sendKeys`, connects by setting `_connected=true`, rejects non-local host, resolves target then `sendToTmux(tmuxTarget,message)` (`src/transports/tmux.ts:1-5`, `src/transports/tmux.ts:14-32`, `src/transports/tmux.ts:38-57`, `src/transports/tmux.ts:78-81`). The CLI `cmdSend` local branch resolves a pane, persists receiver inbox first, then calls `sendKeys(target,outboundMessage)` (`src/commands/shared/comm-send.ts:857-886`). |
+| HTTP federation | yes, primary cross-node `hey`/peer fallback | CLI remote branch posts JSON to `${peerUrl}/api/send` with `from: senderIdentity.wireFrom` signing (`src/commands/shared/comm-send.ts:947-950`). Discovery fallback does the same (`src/commands/shared/comm-send.ts:1018-1021`). Server remote branch still forwards `/api/send` with `from:"auto"` (`src/api/sessions.ts:531-537`). `HttpTransport` is registered when `config.peers.length > 0` (`src/transports/index.ts:101-108`). |
+| Scout UDP discovery + HTTP auto-pair | yes by default unless disabled | Router registers `ScoutTransport` when discovery resolves to `scout` or `both` (`src/transports/index.ts:67-77`). Protocol is JSON over UDP multicast `224.0.0.224:31746` with Scout/Hello/Announce messages (`src/transports/scout-protocol.ts:1-8`, `src/transports/scout-protocol.ts:12-47`, `src/transports/scout-protocol.ts:57-88`). Auto-pair then POSTs HTTP `/api/pair/auto` (`src/transports/scout-pair.ts:1-5`, `src/transports/scout-pair.ts:42-83`). |
+| Zenoh full transport | implemented, opt-in only | Registered only when transport `zenoh` is enabled and `config.zenoh?.locator` is set (`src/transports/index.ts:90-97`). It opens zenoh-ts over a locator such as `ws://host:10000` (`src/transports/zenoh.ts:1-10`, `src/transports/zenoh.ts:57-63`). Topics are `maw/<node>/hey/<oracle>`, `maw/<node>/presence`, and `maw/<node>/feed` (`src/transports/zenoh.ts:149-180`). |
+| Zenoh scout | implemented, opt-in discovery/presence provider | Discovery resolver can choose `zenoh`; router registers plugin `zenoh-scout` only when discovery is `zenoh` or `both` (`src/transports/index.ts:23-38`, `src/transports/index.ts:83-86`). v26.6.13 wires it through `PluginTransportAdapter` and plugin symbol `createZenohScoutTransport` instead of importing the shim directly (`src/transports/index.ts:20-21`, `src/transports/index.ts:80-86`, `src/transports/index.ts:134-181`). |
+| MQTT | **not used for `hey` delivery**; feed broadcast only when configured | The interface comment still mentions MQTT for remote targets (`src/core/transport/transport.ts:4-10`), but the concrete router registers tmux, scout, zenoh-scout, zenoh, http, nanoclaw; it does not register an MQTT transport (`src/transports/index.ts:57-112`). MQTT code publishes feed events only to `maw/v1/oracle/<oracle>/feed` and `maw/v1/node/<node>/feed` (`src/plugins/builtin/mqtt-publish.ts:2-3`, `src/plugins/builtin/mqtt-publish.ts:22-23`) through a broker at `config.mqttPublish.broker` (`src/core/transport/mqtt-publish.ts:1-8`, `src/core/transport/mqtt-publish.ts:14-31`). |
+| NanoClaw | external channels, not maw wire prerequisite | Router registers `NanoclawTransport` as optional transport (`src/transports/index.ts:111-112`). |
 
 Conclusion for E6: do **not** implement MQTT as a `hey` transport target unless a new maw-js behavior appears; current maw-js uses MQTT only as optional feed publication. Conclusion for Zenoh: keep it as real but opt-in; do not cut it without an explicit port-vs-cut decision.
+
+### Version delta 26.5.21 → 26.6.13
+
+v26.5.21 `transports/index.ts` imported and registered `HubTransport` (workspace WebSocket, when workspace config exists), imported and always registered `LoRaTransport` (stub), and imported/exported `MdnsTransport` without registering it. v26.6.13 removed all three from `transports/index.ts` and moved zenoh-scout to a `PluginTransportAdapter` pattern (`src/transports/index.ts:5-14`, `src/transports/index.ts:57-112`, `src/transports/index.ts:134-181`). The carried-transport union still lists `"hub"` as vestigial (`src/core/transport/transport.ts:53-60`). maw-rs should target the v26.6.13 registered set; Hub-as-transport may return via plugin-adapter, so flag it for E5/E7.
 
 ## Serve/gateway wire
 
@@ -45,14 +47,14 @@ Conclusion for E6: do **not** implement MQTT as a `hey` transport target unless 
 
 | Path | Method | Request | Response | Auth |
 |---|---|---|---|---|
-| `/api/sessions` | GET | optional query `local=true` | array of sessions; local rows are `{name, windows, source:"local"}`; aggregate mode includes peer sessions | public/read. Source: `src/api/sessions.ts:184-201`. Captured `GET /api/sessions?local=true` returned HTTP 200 JSON. |
-| `/api/capture` | GET | query `target` | `{content}` or `{content:"", error, target?, validWindows?, hint?}` | public/read. Source: `src/api/sessions.ts:203-217`. |
+| `/api/sessions` | GET | optional query `local=true` | array of sessions; local rows are `{name, windows, source:"local"}`; aggregate mode includes peer sessions | public/read. Source: `src/api/sessions.ts:261-278`. Captured `GET /api/sessions?local=true` returned HTTP 200 JSON. |
+| `/api/capture` | GET | query `target` | `{content}` or `{content:"", error, target?, validWindows?, hint?}` | public/read. Source: `src/api/sessions.ts:299-339`. |
 | `/api/feed` | GET | `limit` query | `{events,total,active_oracles}` | public/read. Source: `src/api/feed.ts:43-56`. |
 | `/api/feed` | POST | feed event body | `{ok:true}` | protected for POST. Source: `src/api/feed.ts:59-78`, `src/lib/elysia-auth.ts:37-40`, `src/lib/elysia-auth.ts:46-56`. |
-| `/api/send` | POST | `{target,text,attachments?,inbox?}` | success `{ok:true,target,text,source,lastLine?,state,inbox?,reason?,wokeFor?}`; errors 404/500/502 with `{error,...}` | protected write. Source: `src/api/sessions.ts:234-237`, `src/api/sessions.ts:336-373`, `src/api/sessions.ts:378-414`, `src/api/sessions.ts:417-438`, `src/lib/elysia-auth.ts:22-35`. |
-| `/api/probe` | POST | optional `{target}` | no target: `{ok:true,transport:"local",source,sessions}`; local target: `{ok:true,target,transport:"local",source}`; peer target: `{ok:true,target,transport:"ssh",source,node}` | protected write because it walks send path. Source: `src/api/sessions.ts:554-623`. |
-| `/api/wake` | POST | `{target}` or `{oracle,task?}` | `{ok:true,target}` or error | protected write. Source: `src/api/sessions.ts:634-654`, `src/lib/elysia-auth.ts:22-35`. |
-| `/api/pane-keys` | POST | `{target,text,enter?}` | `{ok:true,target,enter}` | protected write. Source: `src/api/sessions.ts:527-543`, `src/lib/elysia-auth.ts:22-35`. |
+| `/api/send` | POST | `{target,text,attachments?,inbox?}` | success `{ok:true,target,text,source,lastLine?,state,receipt?,inbox?,warning?,reason?,wokeFor?}`; errors 404/500/502 with `{error,...}` | protected write. Source: `src/api/sessions.ts:356-359`, `src/api/sessions.ts:470-528`, `src/api/sessions.ts:531-577`, `src/api/sessions.ts:580-609`, `src/lib/elysia-auth.ts:22-35`. |
+| `/api/probe` | POST | optional `{target}` | no target: `{ok:true,transport:"local",source,sessions}`; local target: `{ok:true,target,transport:"local",source}`; peer target: `{ok:true,target,transport:"ssh",source,node}` | protected write because it walks send path. Source: `src/api/sessions.ts:736-805`. |
+| `/api/wake` | POST | `{target}` or `{oracle,task?}` | `{ok:true,target}` or error | protected write. Source: `src/api/sessions.ts:816-836`, `src/lib/elysia-auth.ts:22-35`. |
+| `/api/pane-keys` | POST | `{target,text,enter?}` | `{ok:true,target,enter}` | protected write. Source: `src/api/sessions.ts:709-725`, `src/lib/elysia-auth.ts:22-35`. |
 | `/api/transport/status` | GET | none | `{transports: [{name, connected}]}` | public/read. Source: `src/api/transport.ts:23-31`. |
 | `/api/transport/send` | POST | `{oracle,host?,message,from}` | `{ok,via,reason?,retryable}` | protected write. Source: `src/api/transport.ts:32-49`, `src/core/transport/transport.ts:154-174`. |
 | `/api/federation/status` | GET | none | `{localUrl,localReachable,localLatency?,peers,totalPeers,reachablePeers,clockHealth}` | public/read. Source: route `src/api/federation.ts:93-96`, shape builder `src/core/transport/peers.ts:190-241`. |
@@ -61,15 +63,15 @@ Conclusion for E6: do **not** implement MQTT as a `hey` transport target unless 
 
 ### WebSocket routes
 
-Serve exposes two direct WS paths in v26.5.21: `/ws/pty` and `/ws`. The server upgrade path runs before HTTP routing (`src/core/server.ts:226-247`). The default `/ws` dispatches to `MawEngine.handleOpen/handleMessage/handleClose`; `/ws/pty` dispatches PTY messages and close handling (`src/core/server.ts:201-214`, `src/core/server.ts:234-240`). No separate `/ws/tmux` route is wired in this pinned source.
+Serve exposes two direct WS paths in v26.6.13: `/ws/pty` and `/ws`. The server upgrade path runs before HTTP routing (`src/core/server.ts:226-247`). The default `/ws` dispatches to `MawEngine.handleOpen/handleMessage/handleClose`; `/ws/pty` dispatches PTY messages and close handling (`src/core/server.ts:201-214`, `src/core/server.ts:234-240`). No separate `/ws/tmux` route is wired in this pinned source.
 
 ## `hey` deliver path
 
 ### CLI to local tmux
 
-1. Sender display identity resolves from local config/tmux fallback (`resolveMyName`) and is used in the human body prefix; HTTP wire-from for v3 is resolved separately by `curlFetch(...,{from:"auto"})` (`src/commands/shared/comm-send.ts:72-81`, `src/core/transport/curl-fetch.ts:87-90`).
-2. `cmdSend` resolves the target via local sessions and `resolveTarget` (`src/commands/shared/comm-send.ts:576-711`). `resolveTarget` checks exact tmux address, fleet/session aliases, local findWindow, explicit `node:agent`, manifest, agents map, and peer alias in that order (`src/core/routing.ts:62-200`).
-3. Local/self-node branch formats a body prefix `[node:oracle]` unless command-like or already signed (`src/commands/shared/comm-send.ts:84-108`), resolves a specific pane, writes receiver inbox, calls `sendKeys`, verifies submit, logs feed, and reports `delivered` (`src/commands/shared/comm-send.ts:616-650`).
+1. Sender identity resolves from `--from`, `MAW_SENDER`, or local config/tmux fallback; human display form is `<node>:<oracle>`, and explicit wire-from form is `<oracle>:<node>` (`src/commands/shared/comm-send.ts:80-178`).
+2. `cmdSend` resolves the target via local sessions and `resolveTarget` (`src/commands/shared/comm-send.ts:521-1021`). `resolveTarget` checks exact tmux address, fleet/session aliases, local findWindow, explicit `node:agent`, manifest, agents map, and peer alias in that order (`src/core/routing.ts:62-200`).
+3. Local/self-node branch formats a body prefix `[node:oracle]` unless command-like or already signed (`src/commands/shared/comm-send.ts:193-218`), resolves a specific pane, writes receiver inbox, calls `sendKeys`, verifies submit, logs feed, and reports `delivered` (`src/commands/shared/comm-send.ts:857-942`).
 
 Wire: no HTTP/MQTT/Zenoh frame; this is local `tmux send-keys`.
 
@@ -87,11 +89,13 @@ Request body schema:
 }
 ```
 
-`inbox` is present only when requested. `cmdSend` constructs exactly this body and passes `from:"auto"` to `curlFetch()` for the configured-peer branch (`src/commands/shared/comm-send.ts:657-660`). Discovery fallback uses the same endpoint/body with the original query and also passes `from:"auto"` (`src/commands/shared/comm-send.ts:708-711`). `curlFetch()` resolves `"auto"` to the local `<oracle>:<node>` from-address before v3 signing (`src/core/transport/curl-fetch.ts:87-90`). Server-side forwarding from `/api/send` posts `{target,text,inbox?}` to another peer and uses `from:"auto"` (`src/api/sessions.ts:378-383`).
+`inbox` is present only when requested. `cmdSend` constructs exactly this body and passes `from: senderIdentity.wireFrom` to `curlFetch()` for the configured-peer branch (`src/commands/shared/comm-send.ts:947-950`). Discovery fallback uses the same endpoint/body with the original query and also passes `from: senderIdentity.wireFrom` (`src/commands/shared/comm-send.ts:1018-1021`). Explicit or `MAW_SENDER` identities parse human `<node>:<oracle>` into wire `<oracle>:<node>`; automatic local identity still uses `"auto"` internally and is resolved by `curlFetch()` (`src/commands/shared/comm-send.ts:118-178`, `src/core/transport/curl-fetch.ts:87-90`). Server-side forwarding from `/api/send` posts `{target,text,inbox?}` to another peer and uses `from:"auto"` (`src/api/sessions.ts:531-537`).
+
+Version delta: v26.5.21 used `from:"auto"`; v26.6.13 changed to `senderIdentity.wireFrom` — wire `X-Maw-From` value is the `oracle:node` either way; the difference is where it is resolved.
 
 Captured outbound peer send (local recorder): method `POST`, path `/api/send`, body `{"target":"remote-oracle","text":"E1 signed capture","inbox":true}`, headers included `content-type: application/json`, `x-maw-timestamp`, `x-maw-signature`, `x-maw-auth-version: v3`, `x-maw-from: sender-oracle:sender-node`, and `x-maw-signature-v3`.
 
-Response schema consumed by CLI: if `res.ok && res.data?.ok`, state is `delivered` only when `res.data.state === "delivered"`; otherwise it is treated as `queued`, with `target` and `lastLine` surfaced (`src/commands/shared/comm-send.ts:662-681`). Failure reports `Remote fetch failed` and exits (`src/commands/shared/comm-send.ts:684-700`). `/api/send` receiver returns delivered/queued local results or 502 for peer forwarding failure (`src/api/sessions.ts:336-373`, `src/api/sessions.ts:401-414`).
+Response schema consumed by CLI: if `res.ok && res.data?.ok`, state is `delivered` only when `res.data.state === "delivered"`; otherwise it is treated as `queued`, with `target` and `lastLine` surfaced (`src/commands/shared/comm-send.ts:952-991`). Failure reports `Remote fetch failed` and exits (`src/commands/shared/comm-send.ts:994-1010`). `/api/send` receiver returns delivered/queued local results or 502 for peer forwarding failure (`src/api/sessions.ts:470-528`, `src/api/sessions.ts:564-577`).
 
 Retry/error semantics:
 
@@ -219,10 +223,12 @@ Source: `src/plugins/builtin/mqtt-publish.ts:2-23`. There is no `maw hey` MQTT t
 
 ## Omissions / not-yet-mapped
 
-- HubTransport is now mapped above and must be treated as a real SEND transport: workspace configs cause router registration, and its WebSocket message frames carry cross-machine sends (`src/transports/index.ts:50-53`, `src/transports/hub-transport.ts:74-103`).
-- LoRaTransport is registered but remains a stub: connect keeps it disconnected, `send()` returns false, and `canReach()` always returns false (`src/transports/lora.ts:21-31`, `src/transports/lora.ts:41-44`).
-- MdnsTransport is exported but not wired into `createTransportRouter()`: the router imports it and re-exports it, but there is no `router.register(new MdnsTransport(...))` call in the registration flow (`src/transports/index.ts:12`, `src/transports/index.ts:45-109`, `src/transports/index.ts:127-132`).
+- HubTransport, LoRaTransport, and MdnsTransport are not registered transports in v26.6.13; see the version-delta note above. The `"hub"` transport discriminant remains in the carried-message union as vestigial (`src/core/transport/transport.ts:53-60`).
 - v3 verification also accepts a legacy newline-payload fallback using header `x-maw-signed-at`: `FROM\nSIGNED_AT\nMETHOD\nPATH\nBODY_HASH`. A Rust verifier that implements only the colon-delimited v3 payload will reject older alpha peers; E8 must implement this fallback (`src/lib/federation-auth.ts:419-427`, `src/lib/federation-auth.ts:535-537`).
+
+## Cross-version compatibility notes
+
+HMAC v1/v2/v3 (`src/lib/federation-auth.ts`) and pairing (`src/api/pair.ts`) are byte-identical across v26.5.21 and v26.6.13 (diff = 0 lines), so auth/pairing compatibility spans 26.5.21–26.6.13. Scout constants and message types remain the same across both versions: multicast `224.0.0.224:31746`, version `1`, and Scout/Hello/Announce shapes (`src/transports/scout-protocol.ts:12-47`). Keep the v3 legacy newline-payload fallback (`x-maw-signed-at`) because it is the backward-compat path that lets maw-rs interoperate with both fleet versions, including Mac 26.5.21 and VPS 26.6.13 (`src/lib/federation-auth.ts:419-427`, `src/lib/federation-auth.ts:488-537`).
 
 ## Mapping to maw-rs seams
 
@@ -236,15 +242,13 @@ Source: `src/plugins/builtin/mqtt-publish.ts:2-23`. There is no `maw hey` MQTT t
 | `federationAuth` + `fromSigningAuth` (`src/lib/elysia-auth.ts:236-330`, `src/lib/elysia-auth.ts:167-230`) | Inbound protected write auth | Rust server/auth crate should verify same HMAC payloads before dispatching protected routes. |
 | `ScoutTransport`/pair APIs (`src/transports/scout-protocol.ts:12-47`, `src/api/pair.ts:120-178`) | Discovery and pairing | Candidate separate Rust discovery/pairing module; not part of `HttpTransportIo` unless route handlers are integrated. |
 | `ZenohTransport` (`src/transports/zenoh.ts:57-180`) | Optional pub/sub transport | Candidate optional Rust transport implementation behind `Transport`; gate on config `zenoh.locator`. |
-| `HubTransport` (`src/transports/index.ts:50-53`, `src/transports/hub-transport.ts:74-103`) | Workspace WebSocket send/presence/feed transport | Candidate Rust `Transport::send` implementation backed by workspace config + persistent WS connection. |
-| `LoRaTransport` (`src/transports/index.ts:108-109`, `src/transports/lora.ts:21-44`) | Stub registered transport that cannot reach targets | Do not implement active send behavior yet; represent as disabled/stub unless hardware scope appears. |
 | MQTT feed plugin (`src/plugins/builtin/mqtt-publish.ts:22-23`) | Optional feed broadcast, not `hey` | Do not map to `Transport::send` for E6 unless scope changes; map to feed/event publisher if ported. |
 
 ## Rust port compatibility notes
 
-1. Preserve HTTP route paths exactly (`/api/send`, `/api/sessions?local=true`, `/api/identity`, `/api/federation/status`) because maw-js peers hard-code them in `curlFetch()` callers (`src/commands/shared/comm-send.ts:657-660`, `src/core/transport/peers.ts:76-165`, `src/commands/shared/federation-fetch.ts:11-23`).
+1. Preserve HTTP route paths exactly (`/api/send`, `/api/sessions?local=true`, `/api/identity`, `/api/federation/status`) because maw-js peers hard-code them in `curlFetch()` callers (`src/commands/shared/comm-send.ts:947-950`, `src/core/transport/peers.ts:76-165`, `src/commands/shared/federation-fetch.ts:11-23`).
 2. Preserve loopback bypass only if the Rust security decision explicitly accepts maw-js compatibility; maw-js currently trusts TCP loopback but not `X-Forwarded-For` (`src/lib/elysia-auth.ts:257-272`).
 3. Keep `X-Maw-Signature` v1/body-unsigned outbound compatibility for maw-js interop until a coordinated cutover; v3 from-signing is the body-bound layer currently emitted by `curlFetch()` (`src/core/transport/curl-fetch.ts:74-105`).
-4. Implement response parsing tolerant of queued vs delivered states; `queued` is a success state, not failure (`src/commands/shared/comm-send.ts:662-680`, `src/core/transport/peers.ts:416-435`).
+4. Implement response parsing tolerant of queued vs delivered states; `queued` is a success state, not failure (`src/commands/shared/comm-send.ts:952-970`, `src/core/transport/peers.ts:416-435`).
 5. Zenoh and MQTT are not equivalent: Zenoh is an optional message/presence/feed transport; MQTT is only optional feed publication in current source.
 6. E8 auth must accept the legacy newline v3 fallback (`FROM\nSIGNED_AT\nMETHOD\nPATH\nBODY_HASH` via `x-maw-signed-at`) as well as the current colon-delimited v3 payload, or older alpha maw-js peers will be rejected (`src/lib/federation-auth.ts:419-427`, `src/lib/federation-auth.ts:535-537`).
