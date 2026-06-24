@@ -47,7 +47,7 @@ function objectPatchAtPath(keyPath: string, valueJson: string): string {
 
 function isSecretKeyPath(key: string): bool {
   const lower = key.toLowerCase();
-  return lower.includes("secret") || lower.includes("token") || lower.includes("apikey") || lower.includes("api_key") || lower.includes("peerkey") || lower.includes("peer_key") || lower.endsWith(".key") || lower == "key";
+  return lower.includes("password") || lower.includes("passwd") || lower.includes("pwd") || lower.includes("credential") || lower.includes("private") || lower.includes("privatekey") || lower.includes("private_key") || lower.includes("passphrase") || lower.includes("cert") || lower.includes("pem") || lower.includes("secret") || lower.includes("token") || lower.includes("apikey") || lower.includes("api_key") || lower.includes("peerkey") || lower.includes("peer_key") || lower.includes("oauth") || lower.includes("auth_token") || lower.includes("auth-token") || lower.includes("authtoken") || lower.endsWith(".key") || lower.endsWith(".env") || lower == "key";
 }
 
 function hostError(response: string): string {

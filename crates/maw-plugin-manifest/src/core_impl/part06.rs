@@ -760,13 +760,32 @@ fn set_json_path(target: &mut Value, key_path: &str, value: Value) -> Result<(),
 }
 fn is_secret_config_key_path(key: &str) -> bool {
     let lower = key.to_lowercase();
-    lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("apikey")
-        || lower.contains("api_key")
-        || lower.contains("peerkey")
-        || lower.contains("peer_key")
+    [
+        "password",
+        "passwd",
+        "pwd",
+        "credential",
+        "private",
+        "privatekey",
+        "private_key",
+        "passphrase",
+        "cert",
+        "pem",
+        "secret",
+        "token",
+        "apikey",
+        "api_key",
+        "peerkey",
+        "peer_key",
+        "oauth",
+        "auth_token",
+        "auth-token",
+        "authtoken",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
         || Path::new(&lower).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("key"))
+        || Path::new(&lower).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("env"))
         || lower == "key"
 }
 fn value_contains_secret_config_key_path(prefix: &str, value: &Value) -> bool {
