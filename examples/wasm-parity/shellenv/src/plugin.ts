@@ -100,19 +100,15 @@ export function handle(): i32 {
   if (help) {
     output = HELP;
   } else if (shell == "") {
-    const msg = "Error: shell '' not supported. Available: zsh, bash";
     ok = false;
-    output = msg;
-    error = msg;
+    error = "missing shell argument";
   } else if (shell == "zsh") {
     output = ZSH_SNIPPET;
   } else if (shell == "bash") {
     output = BASH_SNIPPET;
   } else {
-    const msg = "Error: shell '" + shell + "' not supported. Available: zsh, bash";
     ok = false;
-    output = msg;
-    error = msg;
+    error = "unsupported shell: " + shell;
   }
   Host.outputString(resultJson(ok, output, error));
   return 0;
