@@ -134,6 +134,7 @@ fn loaded_plugin(dir: &Path, module_path: Option<&str>) -> LoadedPlugin {
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -157,6 +158,7 @@ fn loaded_plugin(dir: &Path, module_path: Option<&str>) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: PathBuf::new(),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled: false,
     }

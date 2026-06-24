@@ -368,6 +368,7 @@ pub struct PluginManifest {
     pub tier: Option<PluginTier>,
     pub wasm: Option<String>,
     pub entry: Option<String>,
+    pub entry_export: Option<String>,
     pub sdk: String,
     pub cli: Option<PluginCli>,
     pub api: Option<PluginApi>,
@@ -392,6 +393,7 @@ pub struct LoadedPlugin {
     pub dir: PathBuf,
     pub wasm_path: PathBuf,
     pub entry_path: Option<PathBuf>,
+    pub wasm_export: String,
     pub kind: LoadedPluginKind,
     pub disabled: bool,
 }
@@ -482,4 +484,3 @@ pub trait PluginInvokeRuntime {
         wasm_bytes: &[u8],
     ) -> InvokeResult;
 }
-

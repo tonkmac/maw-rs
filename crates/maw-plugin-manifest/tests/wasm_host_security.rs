@@ -42,6 +42,7 @@ fn host(dir: &Path, caps: &[&str]) -> MawWasmHost {
         dir: dir.to_path_buf(),
         wasm_path: dir.join("plugin.wasm"),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: maw_plugin_manifest::LoadedPluginKind::Wasm,
         disabled: false,
     };

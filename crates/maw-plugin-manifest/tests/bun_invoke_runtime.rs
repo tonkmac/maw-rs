@@ -135,6 +135,7 @@ fn make_ts_plugin(dir: &Path) -> LoadedPlugin {
             tier: None,
             wasm: None,
             entry: Some("index.ts".to_owned()),
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -155,6 +156,7 @@ fn make_ts_plugin(dir: &Path) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: PathBuf::new(),
         entry_path: Some(entry_path),
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled: false,
     }

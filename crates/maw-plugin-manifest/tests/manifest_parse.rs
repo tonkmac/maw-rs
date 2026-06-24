@@ -187,3 +187,30 @@ fn expect_manifest_error(json_text: &str, dir: &std::path::Path, expected: &str)
         "{error:?} did not contain {expected:?}"
     );
 }
+
+#[test]
+fn parse_manifest_accepts_wasm_entry_object_export() {
+    let root = make_temp_dir("entry-object-export");
+    write(root.join("plugin.wasm"), b"wasm").expect("wasm");
+    let manifest = parse_manifest(
+        r#"{"name":"entry-export","version":"1.0.0","sdk":"*","entry":{"kind":"wasm","path":"plugin.wasm","export":"run"}}"#,
+        &root,
+    )
+    .expect("manifest");
+    assert_eq!(manifest.entry.as_deref(), Some("plugin.wasm"));
+    assert_eq!(manifest.entry_export.as_deref(), Some("run"));
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn parse_manifest_rejects_empty_wasm_entry_export() {
+    let root = make_temp_dir("entry-object-bad-export");
+    write(root.join("plugin.wasm"), b"wasm").expect("wasm");
+    let err = parse_manifest(
+        r#"{"name":"entry-export","version":"1.0.0","sdk":"*","entry":{"kind":"wasm","path":"plugin.wasm","export":""}}"#,
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(err, "plugin.json: entry.export must be a non-empty string");
+    remove_dir_all(root).expect("cleanup");
+}
