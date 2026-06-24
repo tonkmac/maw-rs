@@ -94,11 +94,23 @@ fn parse_rename_windows(raw: &str) -> Vec<RenameWindow> {
 }
 
 fn find_rename_window<'a>(windows: &'a [RenameWindow], target: &str) -> Option<&'a RenameWindow> {
-    target
-        .parse::<i32>()
-        .ok()
+    parse_js_i32_prefix(target)
         .and_then(|index| windows.iter().find(|window| window.index == index))
         .or_else(|| windows.iter().find(|window| window.name == target))
+}
+
+fn parse_js_i32_prefix(value: &str) -> Option<i32> {
+    let trimmed = value.trim_start();
+    let (sign, digits) = trimmed
+        .strip_prefix('-')
+        .map_or((1_i32, trimmed), |tail| (-1_i32, tail));
+    let digits = digits
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty())
+        .then(|| digits.parse::<i32>().ok().and_then(|number| number.checked_mul(sign)))
+        .flatten()
 }
 
 fn rename_auto_prefix(session: &str, new_name: &str) -> String {
@@ -168,7 +180,7 @@ mod rename_tests {
             ..MockTmuxRunner::default()
         };
 
-        let stdout = rename_with_runner(&strings(&["1", "work"]), &mut runner).expect("rename");
+        let stdout = rename_with_runner(&strings(&["1abc", "work"]), &mut runner).expect("rename");
 
         assert_eq!(stdout, "\x1b[32m✓\x1b[0m tab 1 \x1b[33mold\x1b[0m → \x1b[33mneo-work\x1b[0m\n");
         assert_eq!(runner.calls[0], ("display-message".to_owned(), strings(&["-p", "#S"])));
