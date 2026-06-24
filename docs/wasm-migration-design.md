@@ -70,7 +70,7 @@ Examples:
 
 | Host function | Args | Return shape | Native reuse / implementation | Capability boundary |
 |---|---|---|---|---|
-| `maw.exec.run` | `{cmd:string,args?:string[],cwd?:string,env?:Record<string,string>,stdin?:string,timeoutMs?:number,allowNonZero?:boolean}` | `{status:number,stdout:string,stderr:string,durationMs:number}` | New wrapper around `std::process::Command`; use for non-interactive plugin subprocesses only. | Requires `proc:exec:<cmd>` or `shell:exec:<cmd>`; cwd must be inside declared fs read/write roots; env allowlist only. |
+| `maw.exec.run` | `{cmd:string,args?:string[],cwd?:string,env?:Record<string,string>,stdin?:string,timeoutMs?:number,allowNonZero?:boolean}` | `{status:number,stdout:string,stderr:string,durationMs:number}` | New wrapper around `std::process::Command`; use for non-interactive plugin subprocesses only. | Requires `proc:exec:<cmd>` or `shell:exec:<cmd>`; cwd must be inside declared fs read/write roots; env allowlist only. Generic argv values may legitimately start with `-` (for example `git --version`), so this primitive relies on the executable capability gate plus hard-denied privileged/interactive programs/options instead of blanket leading-dash rejection. |
 | `maw.exec.spawn` | `{cmd:string,args?:string[],cwd?:string,env?:Record<string,string>,stdin?:string,timeoutMs?:number,capture?:"none"|"stdout"|"stderr"|"both"}` | `{pid?:number,status?:number,stdout?:string,stderr?:string,detached:boolean}` | New non-interactive spawn wrapper; no PTY. Detached children must be supervised or short-lived. | Requires `proc:spawn:<cmd>`; deny interactive PTY, raw TTY, sudo, and undeclared cwd/env. |
 | `maw.fs.read` | `{path:string,encoding?:"utf8"|"base64",maxBytes?:number}` | `{path:string,bytes:number,content:string}` | New host wrapper over `std::fs::read`. | Requires `fs:read:<root>` matching normalized path; deny symlink escapes and device files. |
 | `maw.fs.write` | `{path:string,content:string,encoding?:"utf8"|"base64",mode?:"create"|"overwrite"|"append",mkdirp?:boolean}` | `{path:string,bytes:number}` | New host wrapper over `std::fs::{write,OpenOptions}`. | Requires `fs:write:<root>`; default deny overwrite unless capability or mode policy allows; no writes outside plugin artifacts/state/worktree roots. |
@@ -87,7 +87,7 @@ Examples:
 | `maw.tmux.send_enter` | `{target:string,count?:number}` | `{target:string,count:number}` | Reuse native `maw-rs send-enter` path and `TmuxClient::send_enter`. | Requires `tmux:send`; count capped. |
 | `maw.tmux.tags_read` | `{target:string}` | `{title:string,meta:Record<string,string>}` | Reuse `TmuxClient::read_pane_tags`. | Requires `tmux:read`. |
 | `maw.tmux.tags_write` | `{target:string,title?:string,meta?:Record<string,string>}` | `{target:string}` | Reuse `TmuxClient::tag_pane`. | Requires `tmux:write-tags`; restrict keys to `@maw-*` / approved namespace. |
-| `maw.ssh.exec` | `{host:string,cmd:string,args?:string[],stdin?:string,timeoutMs?:number}` | `{transport:"ssh",host:string,status:number,stdout:string,stderr:string}` | Shell out to `ssh` for non-interactive commands; matches maw-js `hostExec` remote transport behavior. | Requires `shell:ssh:<host>` plus `proc:exec:ssh`; deny interactive options, local forwards, agent forwarding unless declared. |
+| `maw.ssh.exec` | `{host:string,cmd:string,args?:string[],stdin?:string,timeoutMs?:number}` | `{transport:"ssh",host:string,status:number,stdout:string,stderr:string}` | Shell out to `ssh` for non-interactive commands; matches maw-js `hostExec` remote transport behavior. | Requires `shell:ssh:<host>` plus `proc:exec:ssh`; host must be an unpadded non-empty ASCII host/alias token that does not start with `-`, and the native command uses `ssh -T -- <host>` so guest host values cannot become ssh options. Deny interactive options, local forwards, agent forwarding unless declared. |
 | `maw.ssh.tmux_capture` | `{host:string,target:string,lines?:number}` | `{host:string,target:string,content:string}` | Shell out `ssh <host> tmux capture-pane ...`; no persistent session. | Requires `shell:ssh:<host>` and `tmux:capture:remote`. |
 | `maw.ssh.tmux_send_keys` | `{host:string,target:string,keys:string[],literal?:boolean,enter?:boolean}` | `{host:string,target:string,sent:boolean}` | Shell out `ssh <host> tmux send-keys ...`; no interactive PTY. | Requires `shell:ssh:<host>` and `tmux:send:remote`; same destructive-send gates. |
 | `maw.config.get` | `{keys?:string[]}` | `{config:unknown}` | Reuse maw-rs config/XDG loaders as they land; initial implementation may project maw-js-compatible config JSON. | Requires `sdk:config:read`; secrets omitted unless separate secret capability exists. |
@@ -245,6 +245,10 @@ return unwrap<...>(JSON.parse(response));
 WASI stays disabled for P0 unless a future capability review explicitly allows preopened directories. That keeps maw host-fns as the only I/O surface.
 
 ## 4. Security / capability gate
+
+### Option-injection rule
+
+Any guest, user, or manifest-controlled string that becomes a native process argument must either be rejected when it is empty, padded, or starts with `-`, or be placed after a tool-supported `--` end-of-options separator. Shape-known fields also use a narrow ASCII allowlist: ssh hosts/aliases allow letters, digits, `_`, `.`, `:`, `-`; tmux targets additionally allow `%`. Generic exec argv is the exception because leading-dash operands are normal CLI usage; it remains bounded by per-executable capabilities and hard-denied privileged/interactive option patterns.
 
 ### Declare
 

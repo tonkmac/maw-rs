@@ -249,6 +249,88 @@ fn batch3_host_direct_denies_ssrf_undeclared_exec_and_privileged_exec() {
 }
 
 #[test]
+fn ssh_exec_refuses_option_injection_host_before_ssh_spawn() {
+    let dir = temp("ssh-host-option-injection");
+    let payload = dir.join("proxycommand-payload");
+    let injected_host = format!("-oProxyCommand=touch+{}", payload.display());
+    let host = host(&dir, &["shell:ssh:*", "proc:exec:ssh"]);
+
+    let denied = call(
+        &host,
+        "maw.ssh.exec",
+        &json!({"host": injected_host, "cmd": "true", "args": [], "timeoutMs": 100}),
+    );
+
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["code"], "invalid_args", "{denied}");
+    assert!(
+        !payload.exists(),
+        "ssh option-injection payload must not run before rejection"
+    );
+}
+
+#[test]
+fn ssh_tmux_capture_refuses_option_injection_target_before_ssh_spawn() {
+    let dir = temp("ssh-tmux-capture-target-option-injection");
+    let payload = dir.join("tmux-capture-payload");
+    let host = host(&dir, &["shell:ssh:safe-host", "proc:exec:ssh"]);
+
+    let denied = call(
+        &host,
+        "maw.ssh.tmux_capture",
+        &json!({"host": "safe-host", "target": "-X", "lines": 5}),
+    );
+
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["code"], "invalid_args", "{denied}");
+    assert!(
+        !payload.exists(),
+        "tmux target option-injection payload sentinel must remain absent"
+    );
+}
+
+#[test]
+fn ssh_tmux_send_keys_refuses_option_injection_target_before_ssh_spawn() {
+    let dir = temp("ssh-tmux-send-target-option-injection");
+    let payload = dir.join("tmux-send-payload");
+    let host = host(&dir, &["shell:ssh:safe-host", "proc:exec:ssh"]);
+
+    let denied = call(
+        &host,
+        "maw.ssh.tmux_send_keys",
+        &json!({"host": "safe-host", "target": "-X", "keys": ["Enter"]}),
+    );
+
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["code"], "invalid_args", "{denied}");
+    assert!(
+        !payload.exists(),
+        "tmux target option-injection payload sentinel must remain absent"
+    );
+}
+
+#[test]
+fn exec_run_preserves_legitimate_leading_dash_args_for_generic_exec() {
+    let dir = temp("exec-generic-leading-dash-args");
+    let host = host(&dir, &["proc:exec:git", "fs:read:sandbox"]);
+
+    let result = call(
+        &host,
+        "maw.exec.run",
+        &json!({"cmd": "git", "args": ["--version"], "cwd": dir, "allowNonZero": true}),
+    );
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert!(
+        result["value"]["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("git version"),
+        "{result}"
+    );
+}
+
+#[test]
 fn exec_enforces_capability_and_env_allowlist() {
     let dir = temp("exec");
     let host = host(&dir, &["proc:exec:env", "fs:read:sandbox"]);

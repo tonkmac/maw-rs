@@ -1251,6 +1251,12 @@ impl MawWasmHost {
             Ok(args) => args,
             Err(err) => return err,
         };
+        if !is_safe_ssh_host_token(&args.host) {
+            return HostResult::err(
+                HostErrorCode::InvalidArgs,
+                "ssh host must be non-empty, unpadded, not start with '-', and contain only ASCII letters, digits, '_', '.', ':', or '-'",
+            );
+        }
         if !self.caps.contains("shell", "ssh", Some(&args.host))
             || !self.caps.contains("proc", "exec", Some("ssh"))
         {
@@ -1271,6 +1277,7 @@ impl MawWasmHost {
         }
         let mut cmd = Command::new("ssh");
         cmd.arg("-T")
+            .arg("--")
             .arg(&args.host)
             .arg(&args.cmd)
             .args(&args.args)
@@ -1296,6 +1303,12 @@ impl MawWasmHost {
             Ok(args) => args,
             Err(err) => return err,
         };
+        if !is_safe_tmux_target_token(&args.target) {
+            return HostResult::err(
+                HostErrorCode::InvalidArgs,
+                "tmux target must be non-empty, unpadded, not start with '-', and contain only ASCII letters, digits, '_', '.', ':', '%', or '-'",
+            );
+        }
         self.ssh_exec(
             &serde_json::to_string(&SshExecArgs {
                 host: args.host,
@@ -1320,6 +1333,12 @@ impl MawWasmHost {
             Ok(args) => args,
             Err(err) => return err,
         };
+        if !is_safe_tmux_target_token(&args.target) {
+            return HostResult::err(
+                HostErrorCode::InvalidArgs,
+                "tmux target must be non-empty, unpadded, not start with '-', and contain only ASCII letters, digits, '_', '.', ':', '%', or '-'",
+            );
+        }
         self.ssh_exec(
             &serde_json::to_string(&SshExecArgs {
                 host: args.host,
@@ -1857,6 +1876,24 @@ struct SshTmuxSendArgs {
     host: String,
     target: String,
     keys: Vec<String>,
+}
+
+fn is_safe_ssh_host_token(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '-'))
+}
+
+fn is_safe_tmux_target_token(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '%' | '-'))
 }
 
 fn protected_file(path: PathBuf) -> ProtectedPath {
