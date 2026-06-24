@@ -1,8 +1,15 @@
 #[derive(Debug, Clone, Default)]
-struct HeyArgs {
+struct SendArgs {
     target: String,
     text: String,
     inbox: Option<bool>,
+    from: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WakeArgs {
+    target: String,
+    task: Option<String>,
     from: Option<String>,
 }
 
@@ -14,45 +21,59 @@ struct HeyConfig {
 }
 
 fn run_hey_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
-    Box::pin(async move { run_hey_async_impl(&args).await })
+    Box::pin(async move { run_send_like_async_impl("hey", &args).await })
 }
 
-async fn run_hey_async_impl(raw_args: &[String]) -> CliOutput {
-    if std::env::var_os("MAW_RS_HEY_FALLBACK").is_some() {
-        let mut fallback_argv = vec!["hey".to_owned()];
+fn run_send_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move { run_send_like_async_impl("send", &args).await })
+}
+
+fn run_wake_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move { run_wake_async_impl(&args).await })
+}
+
+async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutput {
+    let fallback_env = format!("MAW_RS_{}_FALLBACK", command.to_ascii_uppercase());
+    if std::env::var_os(fallback_env).is_some() {
+        let mut fallback_argv = vec![command.to_owned()];
         fallback_argv.extend(raw_args.iter().cloned());
-        return dispatch_bun_fallback(&fallback_argv, "hey");
+        return dispatch_bun_fallback(&fallback_argv, command);
     }
 
-    let hey_args = match parse_hey_args(raw_args) {
+    let send_args = match parse_send_args(command, raw_args) {
         Ok(parsed) => parsed,
-        Err(message) => return hey_usage_error(&message),
+        Err(message) => return send_usage_error(command, &message),
     };
     let config = load_hey_config();
     let mut tmux = TmuxClient::local();
     let sessions = route_sessions_from_tmux(&mut tmux);
-    match resolve_route_target(&hey_args.target, &config.route, &sessions) {
-        RouteResult::Local { target } | RouteResult::SelfNode { target } => {
-            send_local_hey(&mut tmux, &target, &hey_args.text, &config, hey_args.from.as_deref())
-        }
+    match resolve_route_target(&send_args.target, &config.route, &sessions) {
+        RouteResult::Local { target } | RouteResult::SelfNode { target } => send_local_message(
+            command,
+            &mut tmux,
+            &target,
+            &send_args.text,
+            &config,
+            send_args.from.as_deref(),
+        ),
         RouteResult::Peer {
             peer_url,
             target,
             node: _,
-        } => send_peer_hey(&peer_url, &target, &hey_args, &config).await,
+        } => send_peer_message(command, &peer_url, &target, &send_args, &config).await,
         RouteResult::Error { detail, hint, .. } => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: if let Some(hint) = hint {
-                format!("hey: {detail}; {hint}\n")
+                format!("{command}: {detail}; {hint}\n")
             } else {
-                format!("hey: {detail}\n")
+                format!("{command}: {detail}\n")
             },
         },
     }
 }
 
-fn parse_hey_args(argv: &[String]) -> Result<HeyArgs, String> {
+fn parse_send_args(command: &str, argv: &[String]) -> Result<SendArgs, String> {
     let mut inbox = None;
     let mut from = None;
     let mut positional = Vec::new();
@@ -63,7 +84,7 @@ fn parse_hey_args(argv: &[String]) -> Result<HeyArgs, String> {
             "--no-inbox" => inbox = Some(false),
             "--from" => {
                 let Some(value) = argv.get(index + 1) else {
-                    return Err("hey: missing --from value".to_owned());
+                    return Err(format!("{command}: missing --from value"));
                 };
                 from = Some(value.clone());
                 index += 1;
@@ -71,15 +92,15 @@ fn parse_hey_args(argv: &[String]) -> Result<HeyArgs, String> {
             value if value.starts_with("--from=") => {
                 from = Some(value["--from=".len()..].to_owned());
             }
-            value if value.starts_with('-') => return Err(format!("hey: unknown argument {value}")),
+            value if value.starts_with('-') => return Err(format!("{command}: unknown argument {value}")),
             value => positional.push(value.to_owned()),
         }
         index += 1;
     }
     if positional.len() < 2 {
-        return Err("hey: target and message are required".to_owned());
+        return Err(format!("{command}: target and message are required"));
     }
-    Ok(HeyArgs {
+    Ok(SendArgs {
         target: positional[0].clone(),
         text: positional[1..].join(" "),
         inbox,
@@ -87,15 +108,28 @@ fn parse_hey_args(argv: &[String]) -> Result<HeyArgs, String> {
     })
 }
 
-fn hey_usage_error(message: &str) -> CliOutput {
+fn send_usage_error(command: &str, message: &str) -> CliOutput {
     CliOutput {
         code: 2,
         stdout: String::new(),
-        stderr: format!("{message}\nusage: maw-rs hey <target> <message> [--inbox|--no-inbox] [--from <oracle:node>]\n"),
+        stderr: format!(
+            "{message}\nusage: maw-rs {command} <target> <message> [--inbox|--no-inbox] [--from <oracle:node>]\n"
+        ),
     }
 }
 
-fn send_local_hey(
+fn wake_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs wake <target> [--task <task>] [--from <oracle:node>]\n"
+        ),
+    }
+}
+
+fn send_local_message(
+    command: &str,
     tmux: &mut TmuxClient<maw_tmux::CommandTmuxRunner>,
     target: &str,
     text: &str,
@@ -107,14 +141,14 @@ fn send_local_hey(
         return CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("hey: tmux send-keys failed: {error}\n"),
+            stderr: format!("{command}: tmux send-keys failed: {error}\n"),
         };
     }
     if let Err(error) = tmux.send_enter(target) {
         return CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("hey: tmux send-enter failed: {error}\n"),
+            stderr: format!("{command}: tmux send-enter failed: {error}\n"),
         };
     }
     CliOutput {
@@ -124,10 +158,11 @@ fn send_local_hey(
     }
 }
 
-async fn send_peer_hey(
+async fn send_peer_message(
+    command: &str,
     peer_url: &str,
     target: &str,
-    args: &HeyArgs,
+    args: &SendArgs,
     config: &HeyConfig,
 ) -> CliOutput {
     let from = match resolve_hey_wire_from(args.from.as_deref(), config) {
@@ -136,7 +171,7 @@ async fn send_peer_hey(
             return CliOutput {
                 code: 2,
                 stdout: String::new(),
-                stderr: format!("hey: {message}\n"),
+                stderr: format!("{command}: {message}\n"),
             }
         }
     };
@@ -146,7 +181,7 @@ async fn send_peer_hey(
             return CliOutput {
                 code: 1,
                 stdout: String::new(),
-                stderr: format!("hey: {message}\n"),
+                stderr: format!("{command}: {message}\n"),
             }
         }
     };
@@ -156,7 +191,7 @@ async fn send_peer_hey(
             return CliOutput {
                 code: 1,
                 stdout: String::new(),
-                stderr: format!("hey: {message}\n"),
+                stderr: format!("{command}: {message}\n"),
             }
         }
     };
@@ -182,7 +217,130 @@ async fn send_peer_hey(
         Err(message) => CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("hey: {message}\n"),
+            stderr: format!("{command}: {message}\n"),
+        },
+    }
+}
+
+
+async fn run_wake_async_impl(raw_args: &[String]) -> CliOutput {
+    let wake_args = match parse_wake_args(raw_args) {
+        Ok(parsed) => parsed,
+        Err(message) => return wake_usage_error(&message),
+    };
+    let config = load_hey_config();
+    let mut tmux = TmuxClient::local();
+    let sessions = route_sessions_from_tmux(&mut tmux);
+    match resolve_route_target(&wake_args.target, &config.route, &sessions) {
+        RouteResult::Peer {
+            peer_url,
+            target,
+            node: _,
+        } => wake_peer_target(&peer_url, &target, &wake_args, &config).await,
+        RouteResult::Local { .. } | RouteResult::SelfNode { .. } | RouteResult::Error { .. } => {
+            let mut fallback_argv = vec!["wake".to_owned()];
+            fallback_argv.extend(raw_args.iter().cloned());
+            dispatch_bun_fallback(&fallback_argv, "wake")
+        }
+    }
+}
+
+fn parse_wake_args(argv: &[String]) -> Result<WakeArgs, String> {
+    let mut from = None;
+    let mut task = None;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--from" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("wake: missing --from value".to_owned());
+                };
+                from = Some(value.clone());
+                index += 1;
+            }
+            value if value.starts_with("--from=") => {
+                from = Some(value["--from=".len()..].to_owned());
+            }
+            "--task" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("wake: missing --task value".to_owned());
+                };
+                task = Some(value.clone());
+                index += 1;
+            }
+            value if value.starts_with("--task=") => {
+                task = Some(value["--task=".len()..].to_owned());
+            }
+            value if value.starts_with('-') => return Err(format!("wake: unknown argument {value}")),
+            value => positional.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    if positional.len() != 1 {
+        return Err("wake: target is required".to_owned());
+    }
+    Ok(WakeArgs {
+        target: positional[0].clone(),
+        task,
+        from,
+    })
+}
+
+async fn wake_peer_target(
+    peer_url: &str,
+    target: &str,
+    args: &WakeArgs,
+    config: &HeyConfig,
+) -> CliOutput {
+    let from = match resolve_hey_wire_from(args.from.as_deref(), config) {
+        Ok(from) => from,
+        Err(message) => {
+            return CliOutput {
+                code: 2,
+                stdout: String::new(),
+                stderr: format!("wake: {message}\n"),
+            }
+        }
+    };
+    let peer_key = match load_peer_key() {
+        Ok(key) => key,
+        Err(message) => {
+            return CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("wake: {message}\n"),
+            }
+        }
+    };
+    let client = match ReqwestHttpTransportIo::new(5_000) {
+        Ok(client) => client,
+        Err(message) => {
+            return CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("wake: {message}\n"),
+            }
+        }
+    };
+    let request = PeerWakeRequest {
+        peer_url: peer_url.to_owned(),
+        target: target.to_owned(),
+        task: args.task.clone(),
+        from,
+        peer_key,
+        timestamp: i64::try_from(current_epoch_seconds()).unwrap_or(i64::MAX),
+    };
+    match client.wake_peer(&request).await {
+        Ok(response) => CliOutput {
+            code: 0,
+            stdout: format!("woke {}\n", response.target.as_deref().unwrap_or(target)),
+            stderr: String::new(),
+        },
+        Err(message) => CliOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("wake: {message}\n"),
         },
     }
 }
