@@ -106,7 +106,7 @@ fn parse_js_i32_prefix(value: &str) -> Option<i32> {
         .map_or((1_i32, trimmed), |tail| (-1_i32, tail));
     let digits = digits
         .chars()
-        .take_while(|ch| ch.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect::<String>();
     (!digits.is_empty())
         .then(|| digits.parse::<i32>().ok().and_then(|number| number.checked_mul(sign)))
