@@ -13,6 +13,7 @@ fn env_lock() -> &'static Mutex<()> {
 struct EnvRestore {
     maw_from_rs: Option<OsString>,
     maw_plugins_dir: Option<OsString>,
+    maw_rs_hey_fallback: Option<OsString>,
     path: Option<OsString>,
 }
 
@@ -21,6 +22,7 @@ impl EnvRestore {
         Self {
             maw_from_rs: std::env::var_os("MAW_FROM_RS"),
             maw_plugins_dir: std::env::var_os("MAW_PLUGINS_DIR"),
+            maw_rs_hey_fallback: std::env::var_os("MAW_RS_HEY_FALLBACK"),
             path: std::env::var_os("PATH"),
         }
     }
@@ -30,6 +32,7 @@ impl Drop for EnvRestore {
     fn drop(&mut self) {
         restore_env("MAW_FROM_RS", self.maw_from_rs.take());
         restore_env("MAW_PLUGINS_DIR", self.maw_plugins_dir.take());
+        restore_env("MAW_RS_HEY_FALLBACK", self.maw_rs_hey_fallback.take());
         restore_env("PATH", self.path.take());
     }
 }
@@ -83,8 +86,9 @@ fn write_maw_shim(dir: &Path, exit_code: u8) {
 #[test]
 fn dispatcher_table_marks_native_and_fallback_commands() {
     assert_eq!(dispatcher_status("ls"), DispatchKind::Native);
-    assert_eq!(dispatcher_status("hey"), DispatchKind::BunFallback);
+    assert_eq!(dispatcher_status("hey"), DispatchKind::Native);
     assert!(native_dispatch_commands().contains(&"ls"));
+    assert!(native_dispatch_commands().contains(&"hey"));
 }
 
 #[test]
@@ -112,7 +116,7 @@ fn native_command_stays_native_without_invoking_maw_fallback() {
 }
 
 #[test]
-fn unported_command_falls_through_to_maw_with_env_args_and_exit_code() {
+fn hey_can_still_fall_through_to_maw_when_safety_env_is_set() {
     let _guard = env_lock().lock().expect("env lock");
     let _restore = EnvRestore::capture();
     let root = temp_dir("fallback");
@@ -124,6 +128,7 @@ fn unported_command_falls_through_to_maw_with_env_args_and_exit_code() {
     std::env::set_var("PATH", &bin_dir);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
     std::env::remove_var("MAW_FROM_RS");
+    std::env::set_var("MAW_RS_HEY_FALLBACK", "1");
 
     let output = run_cli(&args(&["hey", "local:nova:claude", "ping"]));
 
@@ -135,6 +140,19 @@ fn unported_command_falls_through_to_maw_with_env_args_and_exit_code() {
     );
 
     remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn sync_async_handler_guard_refuses_to_block_inside_runtime() {
+    let output = run_cli(&args(&["hey", "local:nova:claude", "ping"]));
+
+    assert_ne!(output.code, 0);
+    assert!(output.stdout.is_empty(), "{}", output.stdout);
+    assert!(
+        output.stderr.contains("cannot block_on inside runtime"),
+        "{}",
+        output.stderr
+    );
 }
 
 #[test]
@@ -150,6 +168,7 @@ fn loop_guard_returns_unknown_command_instead_of_falling_through() {
     std::env::set_var("PATH", &bin_dir);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
     std::env::set_var("MAW_FROM_RS", "1");
+    std::env::set_var("MAW_RS_HEY_FALLBACK", "1");
 
     let output = run_cli(&args(&["hey", "local:nova:claude", "ping"]));
 
