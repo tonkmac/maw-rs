@@ -29,6 +29,11 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Build deterministic AssemblyScript WASM fixtures
+        run: |
+          npm --prefix packages/wasm-sdk ci
+          npm --prefix packages/wasm-sdk run check:fixtures
+
       - name: Format check
         run: cargo fmt --all -- --check
 

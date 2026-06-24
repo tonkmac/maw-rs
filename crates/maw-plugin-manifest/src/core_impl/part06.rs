@@ -117,6 +117,7 @@ pub struct MawWasmHost {
     caps: CapabilitySet,
     fs_roots: BTreeMap<String, PathBuf>,
     secret_store: BTreeMap<String, String>,
+    fake_responses: BTreeMap<(String, String), String>,
     audit: Arc<Mutex<Vec<AuditEvent>>>,
     http_timeout_ms: u64,
 }
@@ -129,6 +130,7 @@ impl MawWasmHost {
             caps: CapabilitySet::from_manifest(&plugin.manifest),
             fs_roots: BTreeMap::new(),
             secret_store: BTreeMap::new(),
+            fake_responses: BTreeMap::new(),
             audit: Arc::new(Mutex::new(Vec::new())),
             http_timeout_ms: 10_000,
         }
@@ -147,6 +149,18 @@ impl MawWasmHost {
     }
 
     #[must_use]
+    pub fn with_fake_response(
+        mut self,
+        name: impl Into<String>,
+        input: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        self.fake_responses
+            .insert((name.into(), input.into()), output.into());
+        self
+    }
+
+    #[must_use]
     pub fn audit_json_lines(&self) -> String {
         self.audit.lock().map_or_else(|_| String::new(), |events| {
             events.iter().map(|event| serde_json::to_string(event).unwrap_or_default()).collect::<Vec<_>>().join("\n")
@@ -155,6 +169,13 @@ impl MawWasmHost {
 
     #[must_use]
     pub fn handle_json(&self, name: &str, input: &str) -> String {
+        if let Some(output) = self
+            .fake_responses
+            .get(&(name.to_owned(), input.to_owned()))
+            .cloned()
+        {
+            return output;
+        }
         match name {
             "maw.exec.run" => to_json(&self.exec_run(input)),
             "maw.exec.spawn" => to_json(&self.exec_spawn(input)),
@@ -455,11 +476,11 @@ impl PluginInvokeRuntime for ExtismWasmInvokeRuntime {
         }
         let mut runtime = match builder.build() { Ok(plugin) => plugin, Err(error) => return InvokeResult::error(format!("wasm instantiation failed: {error}")) };
         let input = invoke_context_json(ctx);
-        match runtime.call::<&str, String>("handle", &input) { Ok(output) => parse_invoke_result_stdout(output.as_bytes()).unwrap_or_else(InvokeResult::error), Err(error) => InvokeResult::error(format!("wasm call failed: {error}")) }
+        match runtime.call::<&str, String>(&plugin.wasm_export, &input) { Ok(output) => parse_invoke_result_stdout(output.as_bytes()).unwrap_or_else(InvokeResult::error), Err(error) => InvokeResult::error(format!("wasm call failed: {error}")) }
     }
 }
 
-const HOST_FN_NAMES: &[&str] = &[
+pub const HOST_FN_NAMES: &[&str] = &[
     "maw.exec.run", "maw.exec.spawn", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
 ];
 

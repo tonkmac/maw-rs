@@ -257,6 +257,7 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
     let sdk = parse_manifest_sdk(object)?;
     let wasm = parse_declared_manifest_file(object, "wasm", dir)?;
     let entry = parse_declared_manifest_file(object, "entry", dir)?;
+    let entry_export = parse_entry_export(object)?;
 
     let capability_namespaces = parse_capability_namespaces(&raw)?;
     let extra_namespaces: Vec<&str> = capability_namespaces
@@ -276,6 +277,7 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
         tier: parse_tier(&raw)?,
         wasm,
         entry,
+        entry_export,
         sdk,
         cli: parse_cli(&raw)?,
         api: parse_api(&raw)?,
@@ -342,9 +344,12 @@ pub fn load_manifest_from_dir(dir: &Path) -> Result<Option<LoadedPlugin>, String
             .as_ref()
             .or_else(|| manifest.entry.as_ref().filter(|_| has_wasm_entry))
             .map_or_else(PathBuf::new, |wasm| resolve_dir_path(dir, wasm)),
-        entry_path: effective_entry
-            .filter(|_| !has_wasm_entry)
+        entry_path: effective_entry.filter(|_| !has_wasm_entry)
             .map(|entry| resolve_dir_path(dir, entry)),
+        wasm_export: manifest
+            .entry_export
+            .clone()
+            .unwrap_or_else(|| "handle".to_owned()),
         kind: if (has_entry && !has_wasm_entry) || has_artifact_js {
             LoadedPluginKind::Ts
         } else {

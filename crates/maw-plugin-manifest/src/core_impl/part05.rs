@@ -235,6 +235,19 @@ fn parse_declared_manifest_file(
     }
 }
 
+fn parse_entry_export(object: &Map<String, Value>) -> Result<Option<String>, String> {
+    let Some(entry) = object.get("entry").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(raw) = entry.get("export") else {
+        return Ok(Some("handle".to_owned()));
+    };
+    raw.as_str()
+        .filter(|value| !value.is_empty())
+        .map(|value| Some(value.to_owned()))
+        .ok_or_else(|| "plugin.json: entry.export must be a non-empty string".to_owned())
+}
+
 fn manifest_field_for_error(object: &Map<String, Value>, key: &str) -> String {
     object
         .get(key)
@@ -314,6 +327,7 @@ mod tests {
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -339,6 +353,7 @@ mod tests {
             dir,
             wasm_path: PathBuf::new(),
             entry_path: None,
+            wasm_export: "handle".to_owned(),
             kind: LoadedPluginKind::Wasm,
             disabled: false,
         }
