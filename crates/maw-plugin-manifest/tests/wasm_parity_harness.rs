@@ -37,6 +37,20 @@ const PROFILE_USE_ALL_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.write", "fs:write:config", "/config/profile-active"),
 ];
 
+const PEEK_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.tmux.list_sessions", "tmux:read", "tmux://sessions"),
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "wasm-parity-peek:0"),
+];
+const WORKSPACE_LS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.list", "fs:read:data", "/data/workspaces"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/workspaces/alpha.json"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/workspaces/beta.json"),
+];
+const SERVE_PEER_STARTUP_WARNINGS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.read", "fs:read:config", "/config/maw.config.json"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:state", "/state/peers.json"),
+];
+
 #[test]
 fn golden_parity_trivial_bun_and_wasm_outputs_match_in_isolated_maw_home() {
     run_parity_case(ParityCase {
@@ -163,6 +177,48 @@ fn golden_parity_profile_bun_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_peek_bun_and_wasm_outputs_match_seeded_host() {
+    run_parity_case(ParityCase {
+        plugin: "peek",
+        manifest_name: "peek-parity",
+        args: &["wasm-parity-peek:0"],
+        expected_host_calls: Some(PEEK_TRANSCRIPT.len()),
+        expected_host_transcript: Some(PEEK_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler("src/vendor/mpr-plugins/peek/index.ts"),
+    });
+}
+
+#[test]
+fn golden_parity_workspace_ls_bun_and_wasm_outputs_match_seeded_host() {
+    for args in [&[][..], &["ls"][..], &["list"][..]] {
+        run_parity_case(ParityCase {
+            plugin: "workspace",
+            manifest_name: "workspace-parity",
+            args,
+            expected_host_calls: Some(WORKSPACE_LS_TRANSCRIPT.len()),
+            expected_host_transcript: Some(WORKSPACE_LS_TRANSCRIPT),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/workspace/index.ts",
+            ),
+        });
+    }
+}
+
+#[test]
+fn golden_parity_serve_peer_startup_warnings_bun_and_wasm_outputs_match_seeded_host() {
+    run_parity_case(ParityCase {
+        plugin: "serve-peer-startup-warnings",
+        manifest_name: "serve-peer-startup-warnings-parity",
+        args: &[],
+        expected_host_calls: Some(SERVE_PEER_STARTUP_WARNINGS_TRANSCRIPT.len()),
+        expected_host_transcript: Some(SERVE_PEER_STARTUP_WARNINGS_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+            "src/vendor-plugins/serve-peer-startup-warnings/index.ts",
+        ),
+    });
+}
+
+#[test]
 #[ignore = "regenerates committed maw-js parity goldens; requires MAW_JS_REF_DIR"]
 fn generate_wasm_parity_goldens_from_real_maw_js() {
     for case in parity_cases() {
@@ -170,6 +226,7 @@ fn generate_wasm_parity_goldens_from_real_maw_js() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parity_cases() -> Vec<ParityCase<'static>> {
     let mut cases = vec![ParityCase {
         plugin: "trivial",
@@ -274,6 +331,39 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
             ),
         });
     }
+
+    cases.push(ParityCase {
+        plugin: "peek",
+        manifest_name: "peek-parity",
+        args: &["wasm-parity-peek:0"],
+        expected_host_calls: Some(PEEK_TRANSCRIPT.len()),
+        expected_host_transcript: Some(PEEK_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler("src/vendor/mpr-plugins/peek/index.ts"),
+    });
+
+    for args in [&[][..], &["ls"][..], &["list"][..]] {
+        cases.push(ParityCase {
+            plugin: "workspace",
+            manifest_name: "workspace-parity",
+            args,
+            expected_host_calls: Some(WORKSPACE_LS_TRANSCRIPT.len()),
+            expected_host_transcript: Some(WORKSPACE_LS_TRANSCRIPT),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/workspace/index.ts",
+            ),
+        });
+    }
+
+    cases.push(ParityCase {
+        plugin: "serve-peer-startup-warnings",
+        manifest_name: "serve-peer-startup-warnings-parity",
+        args: &[],
+        expected_host_calls: Some(SERVE_PEER_STARTUP_WARNINGS_TRANSCRIPT.len()),
+        expected_host_transcript: Some(SERVE_PEER_STARTUP_WARNINGS_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+            "src/vendor-plugins/serve-peer-startup-warnings/index.ts",
+        ),
+    });
 
     cases
 }
