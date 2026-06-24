@@ -1,3 +1,7 @@
+const DISPATCH_38: &[DispatcherEntry] = &[
+    DispatcherEntry { command: "rename", handler: Handler::Sync(run_rename_command) },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RenameWindow {
     index: i32,
