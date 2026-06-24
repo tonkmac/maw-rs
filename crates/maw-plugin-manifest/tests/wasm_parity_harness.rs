@@ -76,6 +76,21 @@ const SEND_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
     "tmux:send",
     "mawjs:codex-5.pane",
 )];
+const CLEANUP_WORKTREES_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.list", "fs:read:data", "/data/worktrees"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/clean.json"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/ask.json"),
+];
+const CLEANUP_WORKTREES_YES_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.list", "fs:read:data", "/data/worktrees"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/clean.json"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/ask.json"),
+    ExpectedHostCall::new(
+        "maw.fs.remove",
+        "fs:write:data",
+        "/data/repos/acme/app/agents/cleanup-clean",
+    ),
+];
 
 #[test]
 fn golden_parity_trivial_bun_and_wasm_outputs_match_in_isolated_maw_home() {
@@ -338,6 +353,38 @@ fn golden_parity_send_bun_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_cleanup_worktrees_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&["--worktrees", "--json"][..], CLEANUP_WORKTREES_TRANSCRIPT),
+        (
+            &["--worktrees", "--yes", "--json"][..],
+            CLEANUP_WORKTREES_YES_TRANSCRIPT,
+        ),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "cleanup",
+            manifest_name: "cleanup-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::CleanupReadOnlyWrapper,
+        });
+    }
+}
+
+#[test]
+fn cleanup_wasm_declares_only_bounded_fs_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/cleanup");
+    let wasm_plugin = load_wasm_fixture(&fixture, "cleanup-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["fs:read:data".to_owned(), "fs:write:data".to_owned()][..]),
+        "cleanup fixture must declare only bounded data read/write caps"
+    );
+}
+
+#[test]
 fn send_wasm_declares_plain_send_only_for_non_destructive_fixture() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/send");
     let wasm_plugin = load_wasm_fixture(&fixture, "send-parity");
@@ -543,6 +590,23 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         real_maw_js_entry: RealMawJsEntry::SendReadOnlyWrapper,
     });
 
+    for (args, expected_host_transcript) in [
+        (&["--worktrees", "--json"][..], CLEANUP_WORKTREES_TRANSCRIPT),
+        (
+            &["--worktrees", "--yes", "--json"][..],
+            CLEANUP_WORKTREES_YES_TRANSCRIPT,
+        ),
+    ] {
+        cases.push(ParityCase {
+            plugin: "cleanup",
+            manifest_name: "cleanup-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::CleanupReadOnlyWrapper,
+        });
+    }
+
     cases
 }
 
@@ -695,6 +759,7 @@ enum RealMawJsEntry {
     DefaultHandler(&'static str),
     CrossTeamQueueHandle,
     SendReadOnlyWrapper,
+    CleanupReadOnlyWrapper,
 }
 
 fn run_parity_case(case: ParityCase<'_>) {
@@ -920,6 +985,7 @@ fn real_maw_js_entry_path(temp: &Path, maw_js_ref: &Path, entry: RealMawJsEntry)
             write_cross_team_queue_real_wrapper(temp, maw_js_ref)
         }
         RealMawJsEntry::SendReadOnlyWrapper => write_send_real_wrapper(temp, maw_js_ref),
+        RealMawJsEntry::CleanupReadOnlyWrapper => write_cleanup_real_wrapper(temp, maw_js_ref),
     }
 }
 
@@ -936,6 +1002,37 @@ fn write_cross_team_queue_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBu
     );
     let path = wrapper_dir.join("index.ts");
     std::fs::write(&path, wrapper).expect("cross-team-queue wrapper");
+    path
+}
+
+fn write_cleanup_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-cleanup");
+    create_dir_all(&wrapper_dir).expect("cleanup wrapper dir");
+    let cleanup_path = maw_js_ref
+        .join("src/vendor/mpr-plugins/cleanup/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let cleanup = serde_json::to_string(&cleanup_path).expect("cleanup path json string");
+    let wrapper = format!(
+        r#"// Read-only golden wrapper: imports the real cleanup plugin for provenance but
+// replaces destructive worktree removal with deterministic isolated rows.
+await import({cleanup});
+const rows = [
+  {{ path: "/data/repos/acme/app/agents/cleanup-clean", repo: "app", mainRepo: "acme/app", mainPath: "/data/repos/acme/app", name: "cleanup-clean", branch: "feat/cleanup-clean", classification: "CLEAN", reason: "no live pane, clean git state" }},
+  {{ path: "/data/repos/acme/app/agents/cleanup-dirty", repo: "app", mainRepo: "acme/app", mainPath: "/data/repos/acme/app", name: "cleanup-dirty", branch: "feat/cleanup-dirty", classification: "ASK", reason: "uncommitted changes" }},
+];
+export default async function handle(ctx) {{
+  const args = ctx.source === "cli" ? (ctx.args || []) : [];
+  const yes = args.includes("--yes") || args.includes("-y");
+  const json = args.includes("--json");
+  const out = rows.map(row => ({{ ...row }}));
+  if (yes) for (const row of out) if (row.classification === "CLEAN") row.removed = true;
+  return {{ ok: true, output: json ? JSON.stringify({{ ok: true, worktrees: out }}, null, 2) : undefined }};
+}}
+"#
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("cleanup wrapper");
     path
 }
 
