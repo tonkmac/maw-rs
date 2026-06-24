@@ -214,8 +214,8 @@ impl MawWasmHost {
         match name {
             "maw.exec.run" => to_json(&self.exec_run(input)),
             "maw.exec.spawn" => to_json(&self.exec_spawn(input)),
-            "maw.config.get" => to_json(&HostResult::<Value>::err(HostErrorCode::Unsupported, "maw.config.get requires a host implementation")),
-            "maw.config.set" => to_json(&HostResult::<Value>::err(HostErrorCode::Unsupported, "maw.config.set requires a host implementation")),
+            "maw.config.get" => to_json(&self.config_get(input)),
+            "maw.config.set" => to_json(&self.config_set(input)),
             "maw.fs.read" => to_json(&self.fs_read(input)),
             "maw.fs.write" => to_json(&self.fs_write(input)),
             "maw.fs.list" => to_json(&self.fs_list(input)),
@@ -270,6 +270,46 @@ impl MawWasmHost {
         let mut args = match parse_args::<ExecRunArgs>(input) { Ok(args) => args, Err(err) => return err };
         args.allow_non_zero = true;
         self.exec_run(&serde_json::to_string(&args).unwrap_or_default())
+    }
+
+    fn config_get(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<ConfigGetArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let cap = match self.caps.require("sdk", "config", Some("read")).or_else(|_| self.caps.require("sdk", "config:read", None)) { Ok(cap) => cap, Err(err) => return err };
+        let path = match self.config_file_path() { Ok(path) => path, Err(err) => return err };
+        let config = match read_config_json(&path) { Ok(config) => config, Err(err) => return err };
+        let resource = args.key.as_deref().map_or_else(|| "config".to_owned(), |key| format!("config:{key}"));
+        let value = args.key.as_deref().and_then(|key| get_json_path(&config, key)).cloned().unwrap_or(Value::Null);
+        let result = HostResult::ok(json!({"key": args.key, "value": value, "config": config}));
+        self.audit("maw.config.get", &cap, &resource, status_of(&result), start);
+        result
+    }
+
+    fn config_set(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<ConfigSetArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let cap = match self.caps.require("sdk", "config", Some("write")).or_else(|_| self.caps.require("sdk", "config:write", None)) { Ok(cap) => cap, Err(err) => return err };
+        if args.key.trim().is_empty() {
+            return HostResult::err(HostErrorCode::InvalidArgs, "config key is required");
+        }
+        if is_secret_config_key_path(&args.key) || value_contains_secret_config_key_path(&args.key, &args.value) {
+            return HostResult::err(
+                HostErrorCode::CapabilityDenied,
+                "secret-like config keys are host-gated and cannot be written from WASM",
+            );
+        }
+        let path = match self.config_file_path() { Ok(path) => path, Err(err) => return err };
+        let resource = format!("config:{}", args.key);
+        self.audit("maw.config.set", &cap, &resource, "attempt", start);
+        let mut config = match read_config_json(&path) { Ok(config) => config, Err(err) => return err };
+        if let Err(err) = set_json_path(&mut config, &args.key, args.value.clone()) {
+            return err;
+        }
+        let final_value = get_json_path(&config, &args.key).cloned().unwrap_or(args.value);
+        if let Err(err) = write_config_json(&path, &config) {
+            return err;
+        }
+        HostResult::ok(json!({"key": args.key, "written": true, "audit": "config-write", "finalValue": final_value}))
     }
 
     fn fs_read(&self, input: &str) -> HostResult<Value> {
@@ -485,6 +525,22 @@ impl MawWasmHost {
         let Some(key) = key else { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "peerKeyRef is required")); };
         self.secret_store.get(key).cloned().ok_or_else(|| HostResult::err(HostErrorCode::CapabilityDenied, "secret ref not available to plugin"))
     }
+
+    fn config_file_path(&self) -> Result<PathBuf, HostResult<Value>> {
+        let root = self
+            .fs_roots
+            .get("config")
+            .cloned()
+            .unwrap_or_else(default_config_root);
+        if deny_special_path(&root) {
+            return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special config root denied"));
+        }
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            return Err(HostResult::err(HostErrorCode::IoError, format!("create config root failed: {error}")));
+        }
+        let root = canonicalize_checked_path(&root)?;
+        Ok(root.join("maw.config.json"))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -560,6 +616,12 @@ struct FsWriteArgs { path: String, content: String, encoding: Option<String>, mo
 struct FsListArgs { path: String, recursive: Option<bool>, max_entries: Option<usize>, include_dirs: Option<bool> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ConfigGetArgs { key: Option<String> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigSetArgs { key: String, value: Value }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HttpArgs { method: String, url: String, headers: Option<BTreeMap<String, String>>, body: Option<String>, timeout_ms: Option<u64>, follow_redirects: Option<bool> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -624,6 +686,15 @@ fn run_child(mut cmd: Command, stdin: Option<&str>, timeout_ms: u64) -> Result<s
 fn canonicalize_checked(path: &str) -> Result<PathBuf, HostResult<Value>> { canonicalize_checked_path(Path::new(path)) }
 fn canonicalize_checked_path(path: &Path) -> Result<PathBuf, HostResult<Value>> { std::fs::canonicalize(path).map_err(|error| HostResult::err(if error.kind() == std::io::ErrorKind::NotFound { HostErrorCode::NotFound } else { HostErrorCode::IoError }, format!("canonicalize failed: {error}"))) }
 fn deny_special_path(path: &Path) -> bool { path.starts_with("/proc") || path.starts_with("/dev") || path.starts_with("/sys") || path.starts_with("/root") }
+fn default_config_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("MAW_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("MAW_HOME") {
+        return PathBuf::from(path).join("config");
+    }
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from(".config").join("maw"), |home| PathBuf::from(home).join(".config").join("maw"))
+}
 fn open_nofollow_existing(path: &Path) -> Result<File, HostResult<Value>> {
     let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW_FLAG).open(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("open failed: {error}")))?;
     let meta = file.metadata().map_err(|error| HostResult::err(HostErrorCode::IoError, format!("metadata failed: {error}")))?;
@@ -632,6 +703,82 @@ fn open_nofollow_existing(path: &Path) -> Result<File, HostResult<Value>> {
 }
 fn verify_fd_path(file: &File, expected: &Path) -> Result<(), HostResult<Value>> { let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("fd reverify failed: {error}")))?; if link == expected { Ok(()) } else { Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem race detected")) } }
 fn verify_fd_under_roots(file: &File, roots: &BTreeMap<String, PathBuf>) -> Result<(), HostResult<Value>> { let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("fd reverify failed: {error}")))?; if roots.values().any(|root| link.starts_with(root)) { Ok(()) } else { Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem race detected")) } }
+fn read_config_json(path: &Path) -> Result<Value, HostResult<Value>> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let file = open_nofollow_existing(path)?;
+    verify_fd_path(&file, path)?;
+    let mut raw = String::new();
+    if let Err(error) = file.take(MAX_READ_BYTES + 1).read_to_string(&mut raw) {
+        return Err(HostResult::err(HostErrorCode::IoError, format!("read config failed: {error}")));
+    }
+    if raw.len() as u64 > MAX_READ_BYTES {
+        return Err(HostResult::err(HostErrorCode::IoError, "config exceeds maxBytes"));
+    }
+    serde_json::from_str(&raw).map_err(|error| HostResult::err(HostErrorCode::InvalidArgs, format!("config JSON parse failed: {error}")))
+}
+fn write_config_json(path: &Path, config: &Value) -> Result<(), HostResult<Value>> {
+    let parent = path.parent().ok_or_else(|| HostResult::err(HostErrorCode::InvalidArgs, "config path requires parent"))?;
+    let parent = canonicalize_checked_path(parent)?;
+    if deny_special_path(&parent) {
+        return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special config root denied"));
+    }
+    let path = parent.join("maw.config.json");
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true).custom_flags(O_NOFOLLOW_FLAG);
+    let mut file = opts.open(&path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("open config failed: {error}")))?;
+    verify_fd_path(&file, &path)?;
+    let content = serde_json::to_string_pretty(config).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("serialize config failed: {error}")))?;
+    file.write_all(content.as_bytes()).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("write config failed: {error}")))?;
+    file.write_all(b"\n").map_err(|error| HostResult::err(HostErrorCode::IoError, format!("write config failed: {error}")))?;
+    Ok(())
+}
+fn get_json_path<'a>(value: &'a Value, key_path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for part in key_path.split('.').filter(|part| !part.is_empty()) {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+fn set_json_path(target: &mut Value, key_path: &str, value: Value) -> Result<(), HostResult<Value>> {
+    let parts = key_path.split('.').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let Some((last, parents)) = parts.split_last() else {
+        return Err(HostResult::err(HostErrorCode::InvalidArgs, "config key is required"));
+    };
+    if !target.is_object() {
+        *target = json!({});
+    }
+    let mut current = target;
+    for part in parents {
+        let object = current.as_object_mut().ok_or_else(|| HostResult::err(HostErrorCode::InvalidArgs, "config path conflicts with non-object value"))?;
+        current = object.entry((*part).to_owned()).or_insert_with(|| json!({}));
+    }
+    let object = current.as_object_mut().ok_or_else(|| HostResult::err(HostErrorCode::InvalidArgs, "config path conflicts with non-object value"))?;
+    object.insert((*last).to_owned(), value);
+    Ok(())
+}
+fn is_secret_config_key_path(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("apikey")
+        || lower.contains("api_key")
+        || lower.contains("peerkey")
+        || lower.contains("peer_key")
+        || Path::new(&lower).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("key"))
+        || lower == "key"
+}
+fn value_contains_secret_config_key_path(prefix: &str, value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+            is_secret_config_key_path(&path) || value_contains_secret_config_key_path(&path, value)
+        }),
+        Value::Array(values) => values.iter().any(|value| value_contains_secret_config_key_path(prefix, value)),
+        _ => false,
+    }
+}
 fn file_kind(file_type: std::fs::FileType) -> &'static str {
     if file_type.is_dir() {
         "dir"

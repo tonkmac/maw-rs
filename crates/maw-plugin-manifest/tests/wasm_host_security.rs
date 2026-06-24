@@ -181,6 +181,93 @@ fn capability_denied_uses_error_envelope_and_private_net_hard_deny() {
 }
 
 #[test]
+fn config_set_writes_config_store_and_audits_key_before_mutate() {
+    let dir = temp("config-set");
+    let host = host(&dir, &["sdk:config:write", "sdk:config:read"]).with_fs_root("config", &dir);
+
+    let set = call(
+        &host,
+        "maw.config.set",
+        &json!({"key": "node", "value": "nova-node", "patch": {"node": "ignored"}}),
+    );
+    assert_eq!(set["ok"], true);
+    assert_eq!(set["value"]["finalValue"], "nova-node");
+    assert_eq!(set["value"]["audit"], "config-write");
+
+    let stored: Value =
+        serde_json::from_str(&read_to_string(dir.join("maw.config.json")).expect("written config"))
+            .expect("config json");
+    assert_eq!(stored["node"], "nova-node");
+
+    let get = call(&host, "maw.config.get", &json!({"key": "node"}));
+    assert_eq!(get["ok"], true);
+    assert_eq!(get["value"]["value"], "nova-node");
+
+    let audit = host.audit_json_lines();
+    assert!(audit.contains("\"host_fn\":\"maw.config.set\""), "{audit}");
+    assert!(
+        audit.contains("\"capability\":\"sdk:config:write\""),
+        "{audit}"
+    );
+    assert!(audit.contains("\"resource\":\"config:node\""), "{audit}");
+}
+
+#[test]
+fn config_set_secret_key_is_denied_by_host_even_without_guest_censor() {
+    let dir = temp("config-secret-deny");
+    let host = host(&dir, &["sdk:config:write"]).with_fs_root("config", &dir);
+
+    for key in [
+        "secret",
+        "federationToken",
+        "apikey",
+        "api_key",
+        "peerkey",
+        "peer_key",
+        "nested.key",
+        "key",
+    ] {
+        let denied = call(
+            &host,
+            "maw.config.set",
+            &json!({"key": key, "value": "must-not-write"}),
+        );
+        assert_eq!(denied["ok"], false, "{key}");
+        assert_eq!(denied["code"], "capability_denied", "{key}");
+    }
+
+    let nested_secret = call(
+        &host,
+        "maw.config.set",
+        &json!({"key": "env", "value": {"token": "must-not-write"}}),
+    );
+    assert_eq!(nested_secret["ok"], false);
+    assert_eq!(nested_secret["code"], "capability_denied");
+    assert!(
+        !dir.join("maw.config.json").exists(),
+        "denied secret writes must not create config"
+    );
+}
+
+#[test]
+fn config_set_without_write_capability_is_denied_by_host() {
+    let dir = temp("config-cap-deny");
+    let host = host(&dir, &["sdk:config:read"]).with_fs_root("config", &dir);
+
+    let denied = call(
+        &host,
+        "maw.config.set",
+        &json!({"key": "node", "value": "nova-node"}),
+    );
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["code"], "capability_denied");
+    assert!(
+        !dir.join("maw.config.json").exists(),
+        "cap-denied write must not create config"
+    );
+}
+
+#[test]
 fn ipv4_mapped_ipv6_private_hosts_are_denied() {
     let dir = temp("ipv4-mapped");
     let host = host(
