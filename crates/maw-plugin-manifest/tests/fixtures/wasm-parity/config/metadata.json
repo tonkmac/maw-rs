@@ -1,0 +1,9 @@
+{
+  "assemblyscript": "0.27.31",
+  "export": "handle",
+  "extismAsPdk": "1.0.0",
+  "mawJsCommit": "5560732fa3c0e194d2bdeb21abf59ade74b58617",
+  "mawJsVersion": "26.6.13-alpha.1921",
+  "wasmBytes": 18700,
+  "wasmSha256": "sha256:9b60fe835c3c53a84ae619112dd82c49808f00e02f7f08721ea10d690faf39e7"
+}

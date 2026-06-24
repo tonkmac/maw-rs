@@ -214,6 +214,8 @@ impl MawWasmHost {
         match name {
             "maw.exec.run" => to_json(&self.exec_run(input)),
             "maw.exec.spawn" => to_json(&self.exec_spawn(input)),
+            "maw.config.get" => to_json(&HostResult::<Value>::err(HostErrorCode::Unsupported, "maw.config.get requires a host implementation")),
+            "maw.config.set" => to_json(&HostResult::<Value>::err(HostErrorCode::Unsupported, "maw.config.set requires a host implementation")),
             "maw.fs.read" => to_json(&self.fs_read(input)),
             "maw.fs.write" => to_json(&self.fs_write(input)),
             "maw.fs.list" => to_json(&self.fs_list(input)),
@@ -516,7 +518,7 @@ impl PluginInvokeRuntime for ExtismWasmInvokeRuntime {
 }
 
 pub const HOST_FN_NAMES: &[&str] = &[
-    "maw.exec.run", "maw.exec.spawn", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
+    "maw.exec.run", "maw.exec.spawn", "maw.config.get", "maw.config.set", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
 ];
 
 fn extism_host_call_named(
