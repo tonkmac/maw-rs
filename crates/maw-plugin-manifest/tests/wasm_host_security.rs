@@ -180,16 +180,52 @@ fn capability_denied_uses_error_envelope_and_private_net_hard_deny() {
 }
 
 #[test]
+fn ipv4_mapped_ipv6_private_hosts_are_denied() {
+    let dir = temp("ipv4-mapped");
+    let host = host(
+        &dir,
+        &[
+            "net:http:::ffff:127.0.0.1",
+            "net:http:::ffff:169.254.169.254",
+        ],
+    );
+
+    for url in [
+        "http://[::ffff:127.0.0.1]/",
+        "http://[::ffff:169.254.169.254]/",
+    ] {
+        let result = call(
+            &host,
+            "maw.http.request",
+            &json!({"method": "GET", "url": url}),
+        );
+        assert_eq!(result["ok"], false, "{url}");
+        assert_eq!(result["code"], "capability_denied", "{url}");
+    }
+}
+
+#[test]
 fn hard_denies_sudo_independent_of_manifest() {
     let dir = temp("sudo");
-    let host = host(&dir, &["proc:exec:sudo", "fs:read:sandbox"]);
-    let result = call(
-        &host,
-        "maw.exec.run",
-        &json!({"cmd": "sudo", "args": ["id"], "cwd": dir}),
+    let host = host(
+        &dir,
+        &[
+            "proc:exec:sudo",
+            "proc:exec:su",
+            "proc:exec:doas",
+            "proc:exec:pkexec",
+            "fs:read:sandbox",
+        ],
     );
-    assert_eq!(result["ok"], false);
-    assert_eq!(result["code"], "capability_denied");
+    for cmd in ["sudo", "su", "doas", "pkexec"] {
+        let result = call(
+            &host,
+            "maw.exec.run",
+            &json!({"cmd": cmd, "args": ["id"], "cwd": dir}),
+        );
+        assert_eq!(result["ok"], false, "{cmd}");
+        assert_eq!(result["code"], "capability_denied", "{cmd}");
+    }
 }
 
 #[test]

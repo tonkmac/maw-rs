@@ -530,7 +530,10 @@ struct SshTmuxCaptureArgs { host: String, target: String, lines: Option<u32> }
 struct SshTmuxSendArgs { host: String, target: String, keys: Vec<String> }
 
 fn executable_basename(cmd: &str) -> String { Path::new(cmd).file_name().and_then(|s| s.to_str()).unwrap_or(cmd).to_owned() }
-fn is_hard_denied_exec(cmd: &str, args: &[String]) -> bool { executable_basename(cmd) == "sudo" || args.iter().any(|arg| matches!(arg.as_str(), "--pty" | "--ffi")) }
+fn is_hard_denied_exec(cmd: &str, args: &[String]) -> bool {
+    matches!(executable_basename(cmd).as_str(), "sudo" | "su" | "doas" | "pkexec")
+        || args.iter().any(|arg| matches!(arg.as_str(), "--pty" | "--ffi"))
+}
 fn sanitize_env(
     env: Option<&BTreeMap<String, String>>,
 ) -> Result<BTreeMap<String, String>, HostResult<Value>> {
@@ -608,7 +611,22 @@ fn list_dir(path: &Path, recursive: bool, include_dirs: bool, max: usize, out: &
         }
     }
 }
-fn redact_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String> { headers.into_iter().map(|(key, value)| { let lower = key.to_lowercase(); if lower.contains("authorization") || lower.contains("token") || lower.contains("secret") || lower.contains("peerkey") { (key, "[REDACTED]".to_owned()) } else { (key, value) } }).collect() }
+fn redact_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    headers
+        .into_iter()
+        .map(|(key, value)| {
+            let lower = key.to_lowercase();
+            if ["authorization", "token", "secret", "peerkey", "cookie", "api-key", "x-api-key", "bearer"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+            {
+                (key, "[REDACTED]".to_owned())
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
+}
 fn redact(value: &str) -> String {
     let mut out = value.to_owned();
     for marker in ["peerKey", "token", "secret", "authorization"] {
@@ -634,7 +652,7 @@ fn is_private_host(host: &str) -> bool {
 }
 
 fn private_ip(ip: IpAddr) -> bool {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
     }
