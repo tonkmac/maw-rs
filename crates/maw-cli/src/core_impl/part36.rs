@@ -3,17 +3,13 @@ const DISPATCH_36: &[DispatcherEntry] = &[
 ];
 
 fn run_whoami_command(argv: &[String]) -> CliOutput {
-    let mut client = TmuxClient::local();
-    run_whoami_command_with(argv, std::env::var_os("TMUX").is_some(), &mut client)
+    let mut runner = maw_tmux::CommandTmuxRunner::new();
+    run_whoami_command_with(argv, std::env::var_os("TMUX").is_some(), &mut runner)
 }
 
-fn run_whoami_command_with<R>(
-    argv: &[String],
-    in_tmux: bool,
-    client: &mut TmuxClient<R>,
-) -> CliOutput
+fn run_whoami_command_with<R>(argv: &[String], in_tmux: bool, runner: &mut R) -> CliOutput
 where
-    R: TmuxRunner,
+    R: maw_tmux::TmuxRunner,
 {
     if !in_tmux {
         return CliOutput {
@@ -27,7 +23,7 @@ where
     let json = argv.iter().any(|arg| arg == "--json");
 
     if short {
-        return match client.display_message("#S") {
+        return match display_message(runner, "#S") {
             Ok(raw) => CliOutput {
                 code: 0,
                 stdout: format!("{}\n", raw.trim()),
@@ -37,10 +33,17 @@ where
         };
     }
 
-    match client.display_message("#S\t#W\t#{window_id}\t#{pane_title}\t#{pane_id}") {
+    match display_message(runner, "#S\t#W\t#{window_id}\t#{pane_title}\t#{pane_id}") {
         Ok(raw) => render_whoami_address(raw.trim(), json),
         Err(error) => whoami_tmux_error(&error.to_string()),
     }
+}
+
+fn display_message<R>(runner: &mut R, format: &str) -> Result<String, maw_tmux::TmuxError>
+where
+    R: maw_tmux::TmuxRunner,
+{
+    runner.run("display-message", &["-p".to_owned(), format.to_owned()])
 }
 
 fn render_whoami_address(raw: &str, json: bool) -> CliOutput {
