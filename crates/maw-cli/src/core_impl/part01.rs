@@ -249,97 +249,29 @@ mod dispatcher_fragment_tests {
     use super::{dispatcher_entries, dispatcher_status, DispatchKind};
     use std::collections::BTreeSet;
 
-    const KNOWN_COMMANDS: &[&str] = &[
-        "--help",
-        "-h",
-        "help",
-        "activity",
-        "auth",
-        "auto-wake",
-        "hub",
-        "xdg",
-        "plugin",
-        "plugin-scaffold",
-        "plugin-manifest",
-        "bind-host",
-        "init",
-        "tmux",
-        "view",
-        "split",
+    const CORE_COMMANDS: &[&str] = &[
+        "hey", "send", "serve", "health", "ls", "wake", "hub", "tmux", "init", "reply", "run",
         "attach",
-        "a",
-        "attach-ssh",
-        "stream",
-        "bring",
-        "b",
-        "ls",
-        "run",
-        "send-enter",
-        "feed",
-        "hey",
-        "send",
-        "wake",
-        "serve",
-        "health",
-        "messages",
-        "reply",
-        "rp",
-        "fuzzy",
-        "resolve",
-        "identity",
-        "normalize",
-        "calver",
-        "worktree-window",
-        "route",
-        "discover",
-        "discord",
-        "federation-identity",
-        "federation-health",
-        "federation-sync",
-        "auto-pair-proof",
-        "consent-constants",
-        "consent-pin",
-        "consent-request",
-        "consent-approval",
-        "consent-store",
-        "consent-expiry",
-        "consent-cleanup",
-        "consent-trust-revoke",
-        "consent-trust-check",
-        "consent-pending-read",
-        "consent-pending-status",
-        "recent-hello",
-        "pair-code",
-        "pair-code-store",
-        "pair-api",
-        "pair-api-auto",
-        "peer-sources",
-        "peer-probe",
-        "policy",
-        "plugin-policy",
-        "split-policy",
-        "transport",
-        "scope",
-        "find",
-        "token",
-        "tokens",
-        "__async-dispatch-test",
     ];
 
     #[test]
-    fn generated_dispatcher_fragments_preserve_original_commands() {
+    fn generated_dispatcher_fragments_are_unique_reachable_and_keep_core_commands() {
+        // Exact command-list/count assertions made every new command edit this file.
+        // Post-codegen, silent-drop risk is covered by per-file DISPATCH_NN fragments:
+        // adding, deleting, or renaming a command is visible in that fragment's diff.
+        // This test instead protects invariants that do not create a per-port conflict point.
         let commands: Vec<&str> = dispatcher_entries().map(|entry| entry.command).collect();
-
-        assert_eq!(commands.len(), 74);
-        assert_eq!(commands, KNOWN_COMMANDS);
+        assert!(!commands.is_empty(), "dispatcher command registry is empty");
 
         let mut seen = BTreeSet::new();
-        for command in dispatcher_entries().map(|entry| entry.command) {
-            assert!(seen.insert(command), "duplicate dispatcher command: {command}");
-        }
-
-        for command in KNOWN_COMMANDS {
+        for command in &commands {
+            assert!(seen.insert(*command), "duplicate dispatcher command: {command}");
             assert_eq!(dispatcher_status(command), DispatchKind::Native, "{command}");
+        }
+        assert_eq!(commands.len(), seen.len(), "dispatcher command count drifted from unique set");
+
+        for command in CORE_COMMANDS {
+            assert!(seen.contains(*command), "missing core dispatcher command: {command}");
         }
     }
 }
