@@ -26,7 +26,13 @@ fn attach_run_with_runner<R: maw_tmux::TmuxRunner>(
     argv: &[String],
     runner: &mut R,
 ) -> Result<CliOutput, CliOutput> {
-    let mut opts = attach_parse_args(argv).map_err(|message| attach_port_usage_error(&message))?;
+    let mut opts = attach_parse_args(argv).map_err(|message| {
+        if message == attach_port_usage_text() {
+            attach_port_usage_ok()
+        } else {
+            attach_port_usage_error(&message)
+        }
+    })?;
     attach_validate_target(&opts.target).map_err(|message| command_target_error("attach", &message))?;
     if let Some(alias) = opts.ssh_alias.as_deref() {
         attach_validate_token(alias, "ssh alias").map_err(|message| command_target_error("attach", &message))?;
@@ -157,6 +163,11 @@ fn attach_port_ambiguous_error(target: &str, candidates: &[String]) -> CliOutput
             candidates.join(", ")
         ),
     }
+}
+
+
+fn attach_port_usage_ok() -> CliOutput {
+    CliOutput { code: 0, stdout: attach_port_usage_text(), stderr: String::new() }
 }
 
 fn attach_port_usage_error(message: &str) -> CliOutput {
