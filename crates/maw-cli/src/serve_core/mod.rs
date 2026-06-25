@@ -93,6 +93,7 @@ pub struct ServecoreSharedState {
     pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
     pub auth_workspace_key: Option<String>,
     pub auth_cached_pubkey: Option<String>,
+    pub auth_ed25519_pins: maw_auth::Ed25519TofuPins,
     pub auth_now_override: Option<i64>,
 }
 
@@ -107,6 +108,7 @@ impl Default for ServecoreSharedState {
             agents_snapshot: None,
             auth_workspace_key: None,
             auth_cached_pubkey: None,
+            auth_ed25519_pins: Arc::new(Mutex::new(maw_auth::Ed25519TofuStore::default())),
             auth_now_override: None,
         }
     }
@@ -508,6 +510,7 @@ async fn servecore_auth_default_deny(req: Request<Body>, next: Next) -> Response
         cached_pubkey: state
             .as_ref()
             .and_then(|state| state.auth_cached_pubkey.clone()),
+        ed25519_pins: state.as_ref().map(|state| state.auth_ed25519_pins.clone()),
         now: state
             .as_ref()
             .and_then(|state| state.auth_now_override)
@@ -547,6 +550,22 @@ fn servecore_auth_headers(headers: &axum::http::HeaderMap) -> maw_auth::Headers 
         (
             "x-maw-signature-ed25519",
             servecore_header_to_string(headers, "x-maw-signature-ed25519"),
+        ),
+        (
+            "x-maw-from-signature-ed25519",
+            servecore_header_to_string(headers, "x-maw-from-signature-ed25519"),
+        ),
+        (
+            "x-maw-ed25519-pubkey",
+            servecore_header_to_string(headers, "x-maw-ed25519-pubkey"),
+        ),
+        (
+            "x-maw-pubkey",
+            servecore_header_to_string(headers, "x-maw-pubkey"),
+        ),
+        (
+            "x-maw-peer-pubkey",
+            servecore_header_to_string(headers, "x-maw-peer-pubkey"),
         ),
     ])
 }
@@ -1043,6 +1062,42 @@ mod tests {
             .expect("request");
         let response = servecore_auth_request(state, request, peer).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn servecore_ed25519_from_sign_allows_nonloopback_and_pins_first_contact() {
+        let peer = SocketAddr::from(([198, 51, 100, 10], 49_152));
+        let body = br#"{"event":"agent-idle"}"#;
+        let state = ServecoreSharedState::default().servecore_with_auth_now(1_700_000_000);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/triggers/fire")
+            .header("x-maw-from", "mawjs:m5")
+            .header(
+                "x-maw-ed25519-signature",
+                concat!(
+                    "d232e00767facc77aca0eaaf2ebc18dc3c608639430f93167679805c7e3ccf69",
+                    "f15a856c7d8f4eddf64730cc61d4ccc0c28ca91b9a9df1a5016c628d737b3a0f"
+                ),
+            )
+            .header(
+                "x-maw-ed25519-pubkey",
+                "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+            )
+            .header("x-maw-timestamp", "1700000000")
+            .header("x-maw-auth-version", "ed25519")
+            .body(Body::from(body.as_slice().to_vec()))
+            .expect("request");
+        let response = servecore_auth_request(state.clone(), request, peer).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let pins = state
+            .auth_ed25519_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            pins.pinned("mawjs:m5"),
+            Some("79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664")
+        );
     }
 
     #[tokio::test]

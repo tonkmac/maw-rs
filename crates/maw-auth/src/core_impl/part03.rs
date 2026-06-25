@@ -107,6 +107,16 @@ fn ed25519_signature_header(headers: &Headers) -> Option<&str> {
     .find_map(|name| headers.get(name).map(str::trim).filter(|value| !value.is_empty()))
 }
 
+fn ed25519_pubkey_header(headers: &Headers) -> Option<&str> {
+    [
+        "x-maw-ed25519-pubkey",
+        "x-maw-pubkey",
+        "x-maw-peer-pubkey",
+    ]
+    .into_iter()
+    .find_map(|name| headers.get(name).map(str::trim).filter(|value| !value.is_empty()))
+}
+
 fn verify_from_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     let signed = signed_input(&args.headers);
     let cached = args
@@ -217,10 +227,7 @@ fn verify_serve_request(parts: &RequestAuthParts) -> RequestAuthDecision {
     let signed = signed_input(&parts.headers);
     if !signed.has_v3_sig {
         if !signed.from.is_empty() && ed25519_signature_header(&parts.headers).is_some() {
-            // TODO(#248): wire native ed25519 from-sign verification here.
-            return RequestAuthDecision::Reject {
-                reason: "ed25519-verify-not-yet-native".to_owned(),
-            };
+            return verify_ed25519_serve_request(parts, &signed);
         }
         return RequestAuthDecision::Reject {
             reason: if signed.signed {
@@ -291,6 +298,109 @@ fn verify_serve_request(parts: &RequestAuthParts) -> RequestAuthDecision {
         } else {
             "pin-missing".to_owned()
         },
+    }
+}
+
+
+fn verify_ed25519_serve_request(
+    parts: &RequestAuthParts,
+    signed: &SignedInput,
+) -> RequestAuthDecision {
+    let Some(signed_at_sec) = parse_unix_seconds(&signed.v3_timestamp) else {
+        return auth_reject("invalid-timestamp");
+    };
+    if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
+        return auth_reject("timestamp-out-of-window");
+    }
+    let Some(signature_hex) = ed25519_signature_header(&parts.headers) else {
+        return auth_reject("missing-credentials");
+    };
+    let key_hex = match ed25519_select_pubkey(parts, &signed.from) {
+        Ok(key) => key,
+        Err(reason) => return auth_reject(reason),
+    };
+    let body_hash = hash_body(parts.body.as_deref());
+    let payload = build_from_sign_payload(
+        &signed.from,
+        signed_at_sec,
+        &parts.method,
+        &parts.path,
+        &body_hash,
+    );
+    if !verify_ed25519_signature(&key_hex, payload.as_bytes(), signature_hex) {
+        return auth_reject("ed25519-signature-invalid");
+    }
+    if !ed25519_pin_verified_key(parts, &signed.from, &key_hex) {
+        return auth_reject("ed25519-pin-mismatch");
+    }
+    RequestAuthDecision::Accept {
+        who: format!("ed25519:{}", signed.from),
+    }
+}
+
+fn ed25519_select_pubkey(parts: &RequestAuthParts, from: &str) -> Result<String, &'static str> {
+    let observed = ed25519_pubkey_header(&parts.headers).map(str::to_owned);
+    if let Some(pins) = &parts.ed25519_pins {
+        let guard = pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pinned) = guard.pinned(from) {
+            if observed.as_deref().is_some_and(|key| key != pinned) {
+                return Err("ed25519-pin-mismatch");
+            }
+            return Ok(pinned.to_owned());
+        }
+        return observed.ok_or("ed25519-pin-missing");
+    }
+    parts
+        .cached_pubkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or("ed25519-pin-missing")
+}
+
+fn ed25519_pin_verified_key(parts: &RequestAuthParts, from: &str, key_hex: &str) -> bool {
+    let Some(pins) = &parts.ed25519_pins else {
+        return true;
+    };
+    let mut guard = pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match guard.pinned(from) {
+        Some(pinned) => pinned == key_hex,
+        None => guard.pin_first_contact(from, key_hex),
+    }
+}
+
+fn verify_ed25519_signature(key_hex: &str, payload: &[u8], signature_hex: &str) -> bool {
+    let Some(key_bytes) = hex_to_array::<32>(key_hex) else {
+        return false;
+    };
+    let Some(signature_bytes) = hex_to_array::<64>(signature_hex) else {
+        return false;
+    };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
+        return false;
+    };
+    let Ok(signature) = ed25519_dalek::Signature::try_from(signature_bytes.as_slice()) else {
+        return false;
+    };
+    key.verify_strict(payload, &signature).is_ok()
+}
+
+fn hex_to_array<const N: usize>(raw: &str) -> Option<[u8; N]> {
+    let value = raw.trim();
+    if value.len() != N * 2 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0_u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn auth_reject(reason: &str) -> RequestAuthDecision {
+    RequestAuthDecision::Reject {
+        reason: reason.to_owned(),
     }
 }
 

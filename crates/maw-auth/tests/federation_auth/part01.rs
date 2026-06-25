@@ -240,6 +240,7 @@ fn verify_request_accepts_loopback_real_ip_and_rejects_xff_spoof() {
         peer_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         workspace_key: None,
         cached_pubkey: None,
+        ed25519_pins: None,
         now: NOW,
     });
     assert_eq!(
@@ -257,6 +258,7 @@ fn verify_request_accepts_loopback_real_ip_and_rejects_xff_spoof() {
         peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
         workspace_key: None,
         cached_pubkey: None,
+        ed25519_pins: None,
         now: NOW,
     });
     assert_eq!(spoof.reason(), Some("missing-credentials"));
@@ -289,6 +291,7 @@ fn verify_request_hmac_v3_accepts_byte_exact_cross_oracle_vector_and_rejects_rep
         peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
         workspace_key: Some(PEER_KEY.to_owned()),
         cached_pubkey: None,
+        ed25519_pins: None,
         now: NOW,
     };
     let accepted = maw_auth::verify_request(&base);
@@ -327,29 +330,124 @@ fn verify_request_hmac_v3_accepts_byte_exact_cross_oracle_vector_and_rejects_rep
     assert_eq!(maw_auth::verify_request(&bad).reason(), Some("signature-invalid"));
 }
 
-#[test]
-fn verify_request_ed25519_headers_fail_closed_until_native_verifier_lands() {
-    use maw_auth::RequestAuthParts;
+const ED25519_PUBKEY_HEX: &str =
+    "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+const ED25519_SIG_HEX: &str = concat!(
+    "d232e00767facc77aca0eaaf2ebc18dc3c608639430f93167679805c7e3ccf69",
+    "f15a856c7d8f4eddf64730cc61d4ccc0c28ca91b9a9df1a5016c628d737b3a0f"
+);
+
+fn ed25519_request_parts(
+    signature: &str,
+    pubkey: Option<&str>,
+    pins: maw_auth::Ed25519TofuPins,
+) -> maw_auth::RequestAuthParts {
     use std::net::{IpAddr, Ipv4Addr};
 
-    let decision = maw_auth::verify_request(&RequestAuthParts {
+    let body = b"{\"event\":\"agent-idle\"}".to_vec();
+    let mut headers = vec![
+        ("x-maw-from".to_owned(), FROM.to_owned()),
+        ("x-maw-ed25519-signature".to_owned(), signature.to_owned()),
+        ("x-maw-timestamp".to_owned(), NOW.to_string()),
+        ("x-maw-auth-version".to_owned(), "ed25519".to_owned()),
+    ];
+    if let Some(pubkey) = pubkey {
+        headers.push(("x-maw-ed25519-pubkey".to_owned(), pubkey.to_owned()));
+    }
+    maw_auth::RequestAuthParts {
         method: "POST".to_owned(),
         path: "/triggers/fire".to_owned(),
-        headers: Headers::new([
-            ("x-maw-from", FROM),
-            ("x-maw-ed25519-signature", "base64-ed25519-placeholder"),
-            ("x-maw-timestamp", &NOW.to_string()),
-        ]),
-        body: None,
+        headers: Headers::new(headers),
+        body: Some(body),
         peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
-        workspace_key: Some(PEER_KEY.to_owned()),
-        cached_pubkey: Some(PEER_KEY.to_owned()),
+        workspace_key: None,
+        cached_pubkey: None,
+        ed25519_pins: Some(pins),
         now: NOW,
-    });
+    }
+}
+
+#[test]
+fn verify_request_ed25519_from_sign_accepts_byte_exact_804_vector_and_pins_tofu() {
+    use maw_auth::{build_from_sign_payload, hash_body, Ed25519TofuStore};
+    use std::sync::{Arc, Mutex};
+
+    let body = b"{\"event\":\"agent-idle\"}";
     assert_eq!(
-        decision.reason(),
-        Some("ed25519-verify-not-yet-native")
+        build_from_sign_payload(FROM, NOW, "POST", "/triggers/fire", &hash_body(Some(body))),
+        "POST:/triggers/fire:1700000000:98e31c8f0c5f043066b34e52684d8c0a9bbc61e0393e4dbba1d644b04abb8878:mawjs:m5"
     );
+    let pins = Arc::new(Mutex::new(Ed25519TofuStore::default()));
+    let decision = maw_auth::verify_request(&ed25519_request_parts(
+        ED25519_SIG_HEX,
+        Some(ED25519_PUBKEY_HEX),
+        pins.clone(),
+    ));
+    assert_eq!(
+        decision,
+        maw_auth::RequestAuthDecision::Accept {
+            who: format!("ed25519:{FROM}")
+        }
+    );
+    let guard = pins.lock().expect("test pin lock");
+    assert_eq!(guard.pinned(FROM), Some(ED25519_PUBKEY_HEX));
+}
+
+#[test]
+fn verify_request_ed25519_accepts_existing_pin_without_repin_header() {
+    use maw_auth::Ed25519TofuStore;
+    use std::sync::{Arc, Mutex};
+
+    let mut store = Ed25519TofuStore::default();
+    assert!(store.pin_first_contact(FROM, ED25519_PUBKEY_HEX));
+    let pins = Arc::new(Mutex::new(store));
+    let decision = maw_auth::verify_request(&ed25519_request_parts(
+        ED25519_SIG_HEX,
+        None,
+        pins,
+    ));
+    assert!(decision.is_accept(), "{decision:?}");
+}
+
+#[test]
+fn verify_request_ed25519_rejects_pin_mismatch_without_silent_repin() {
+    use maw_auth::Ed25519TofuStore;
+    use std::sync::{Arc, Mutex};
+
+    let other_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut store = Ed25519TofuStore::default();
+    assert!(store.pin_first_contact(FROM, other_key));
+    let pins = Arc::new(Mutex::new(store));
+    let decision = maw_auth::verify_request(&ed25519_request_parts(
+        ED25519_SIG_HEX,
+        Some(ED25519_PUBKEY_HEX),
+        pins.clone(),
+    ));
+    assert_eq!(decision.reason(), Some("ed25519-pin-mismatch"));
+    let guard = pins.lock().expect("test pin lock");
+    assert_eq!(guard.pinned(FROM), Some(other_key));
+}
+
+#[test]
+fn verify_request_ed25519_rejects_bad_sig_and_malformed_inputs_fail_closed() {
+    use maw_auth::Ed25519TofuStore;
+    use std::sync::{Arc, Mutex};
+
+    let pins = Arc::new(Mutex::new(Ed25519TofuStore::default()));
+    let bad = maw_auth::verify_request(&ed25519_request_parts(
+        &"0".repeat(128),
+        Some(ED25519_PUBKEY_HEX),
+        pins.clone(),
+    ));
+    assert_eq!(bad.reason(), Some("ed25519-signature-invalid"));
+    assert!(pins.lock().expect("test pin lock").is_empty());
+
+    let malformed = maw_auth::verify_request(&ed25519_request_parts(
+        "base64-ed25519-placeholder",
+        Some(ED25519_PUBKEY_HEX),
+        pins,
+    ));
+    assert_eq!(malformed.reason(), Some("ed25519-signature-invalid"));
 }
 
 // Ported from maw-js `test/scout-pair-proof.test.ts` and
