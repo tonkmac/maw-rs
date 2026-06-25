@@ -799,31 +799,6 @@ fn run_ssh_preflight(alias: &str) -> Result<(), String> {
     if status.success() { Ok(()) } else { Err(format!("ssh exited {}", status.code().map_or_else(|| "?".to_owned(), |code| code.to_string()))) }
 }
 
-fn run_run_command(argv: &[String]) -> CliOutput {
-    let (target, text) = match parse_run_command_args(argv) {
-        Ok(parsed) => parsed,
-        Err(message) => return run_usage_error(&message),
-    };
-    let mut client = TmuxClient::local();
-    let resolved = match resolve_local_tmux_command_target(&mut client, &target) {
-        Ok(target) => target,
-        Err(message) => return command_target_error("run", &message),
-    };
-    if !text.is_empty() {
-        if let Err(error) = client.send_keys_literal(&resolved, &text) {
-            return command_target_error("run", &format!("tmux send-keys failed: {error}"));
-        }
-    }
-    if let Err(error) = client.send_enter(&resolved) {
-        return command_target_error("run", &format!("tmux send-keys failed: {error}"));
-    }
-    CliOutput {
-        code: 0,
-        stdout: format!("\x1b[32mran\x1b[0m → {resolved}: {}\n", truncate_cli_text(&text, 200)),
-        stderr: String::new(),
-    }
-}
-
 fn run_send_enter_command(argv: &[String]) -> CliOutput {
     let (target, count) = match parse_send_enter_command_args(argv) {
         Ok(parsed) => parsed,
@@ -852,15 +827,6 @@ fn run_send_enter_command(argv: &[String]) -> CliOutput {
         stdout: format!("\x1b[32mdelivered\x1b[0m → {resolved}: {plural}\n"),
         stderr: String::new(),
     }
-}
-
-fn parse_run_command_args(argv: &[String]) -> Result<(String, String), String> {
-    let Some(target_index) = argv.iter().position(|arg| !arg.starts_with('-')) else {
-        return Err("usage: maw-rs run <target> \"<cmd>\"".to_owned());
-    };
-    let target = argv[target_index].clone();
-    let text = argv[target_index + 1..].join(" ");
-    Ok((target, text))
 }
 
 fn parse_send_enter_command_args(argv: &[String]) -> Result<(String, usize), String> {
@@ -950,14 +916,6 @@ fn command_target_error(command: &str, message: &str) -> CliOutput {
     }
 }
 
-fn run_usage_error(message: &str) -> CliOutput {
-    CliOutput {
-        code: 2,
-        stdout: String::new(),
-        stderr: format!("{message}\nusage: maw-rs run <target> \"<cmd>\"\n"),
-    }
-}
-
 fn send_enter_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
@@ -966,12 +924,3 @@ fn send_enter_usage_error(message: &str) -> CliOutput {
     }
 }
 
-fn truncate_cli_text(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
-}
