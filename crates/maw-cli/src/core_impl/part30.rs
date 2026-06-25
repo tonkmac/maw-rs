@@ -184,7 +184,9 @@ fn default_bind_host() -> String {
 
 fn serve_router(state: ServeState) -> Router {
     let state = Arc::new(state);
-    Router::new()
+    let router = Router::new();
+    let router = crate::serve_core::servecore_mount_core_routes(router);
+    let router = router
         .route("/ws", get(ws_relay))
         .route("/ws/pty", get(ws_relay))
         .route("/api/send", post(api_send))
@@ -213,7 +215,8 @@ fn serve_router(state: ServeState) -> Router {
         )
         .route("/api/workspace/:id/status", get(api_workspace_status))
         .route("/api/workspace/:id/feed", get(api_workspace_feed))
-        .route("/api/workspace/:id/message", post(api_workspace_message))
+        .route("/api/workspace/:id/message", post(api_workspace_message));
+    crate::serve_core::servecore_apply_pipeline(router)
         .fallback(api_not_found)
         .with_state(state)
 }
@@ -1151,6 +1154,30 @@ mod serve_tests {
         let _restore = EnvVarRestore::capture("MAW_HOST");
         std::env::set_var("MAW_HOST", "0.0.0.0");
         assert_eq!(default_bind_host(), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn serve_core_default_denies_protected_paths_on_real_router() {
+        let addr = spawn_test_server().await;
+        let client = reqwest::Client::builder().build().expect("client");
+        for path in [
+            "/api/triggers/fire",
+            "/api/worktrees/cleanup",
+            "/api/plugins/reload",
+        ] {
+            let response = client
+                .post(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .expect("protected request");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let public = client
+            .get(format!("http://{addr}/api/identity"))
+            .send()
+            .await
+            .expect("public request");
+        assert_eq!(public.status(), StatusCode::OK);
     }
 
     #[tokio::test]

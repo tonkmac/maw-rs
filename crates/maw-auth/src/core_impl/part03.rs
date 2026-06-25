@@ -177,6 +177,26 @@ pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
 }
 
 #[must_use]
+pub fn is_protected(path: &str, method: &str) -> bool {
+    let method = method.to_ascii_uppercase();
+    let normalized = auth_normalize_protected_path(path);
+    matches!(
+        (method.as_str(), normalized.as_str()),
+        ("POST", "/triggers/fire" | "/worktrees/cleanup")
+    ) || (method == "POST" && normalized.starts_with("/plugins/"))
+}
+
+fn auth_normalize_protected_path(path: &str) -> String {
+    let path_only = path.split('?').next().unwrap_or(path);
+    let normalized = path_only.strip_prefix("/api").unwrap_or(path_only);
+    if normalized.is_empty() {
+        "/".to_owned()
+    } else {
+        normalized.to_owned()
+    }
+}
+
+#[must_use]
 pub fn is_refuse_decision(decision: &FromVerifyDecision) -> bool {
     decision.kind().starts_with("refuse-")
 }
@@ -408,6 +428,17 @@ mod tests {
         sign_hmac_sig, timestamp_seconds, verify_auto_pair_proof, verify_hmac_sig, AutoPairIdentity,
         ConsentStatus,
     };
+
+    #[test]
+    fn auth_is_protected_matches_serve_daemon_surface() {
+        assert!(super::is_protected("/triggers/fire", "POST"));
+        assert!(super::is_protected("/api/triggers/fire", "post"));
+        assert!(super::is_protected("/api/worktrees/cleanup?dry=1", "POST"));
+        assert!(super::is_protected("/api/plugins/reload", "POST"));
+        assert!(!super::is_protected("/api/plugins", "GET"));
+        assert!(!super::is_protected("/api/identity", "GET"));
+        assert!(!super::is_protected("/api/triggers", "GET"));
+    }
 
     #[test]
     fn private_helpers_cover_unreachable_public_edges() {
