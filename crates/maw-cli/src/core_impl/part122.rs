@@ -3,7 +3,7 @@ const DISPATCH_122: &[DispatcherEntry] = &[
     DispatcherEntry { command: "t", handler: Handler::Sync(team_run_command) },
 ];
 
-const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|liveness>";
+const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|liveness|down>";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +69,7 @@ struct TeamCharter122 {
     name: String,
     description: String,
     goal: String,
+    session: Option<String>,
     members: Vec<TeamCharterMember122>,
     governance_requires_human_approval: bool,
 }
@@ -114,6 +115,7 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "bring" => team_t3_bring(argv),
         "apply" => team_t3_apply(argv),
         "liveness" | "live-check" => team_t3_liveness(argv),
+        "down" => team_down(argv),
         other if other.starts_with('-') => Err(format!("team: unknown argument {other}")),
         _ => Err(TEAM_USAGE.to_owned()),
     }
@@ -428,9 +430,10 @@ fn team_parse_charter(text: &str) -> Result<TeamCharter122, String> {
 fn team_parse_json_charter(text: &str) -> Result<TeamCharter122, String> {
     let value: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
     let name = value["name"].as_str().unwrap_or("").to_owned();
+    let session = value["session"].as_str().map(str::to_owned);
     let members = value["members"].as_array().map_or_else(Vec::new, |items| items.iter().map(team_member_from_json).collect());
     let governance = value["governance"]["requires_human_approval"].as_bool().unwrap_or(false);
-    team_charter_finish(&name, value["description"].as_str().unwrap_or("").to_owned(), value["goal"].as_str().unwrap_or("").to_owned(), members, governance)
+    team_charter_finish(&name, value["description"].as_str().unwrap_or("").to_owned(), value["goal"].as_str().unwrap_or("").to_owned(), session, members, governance)
 }
 
 fn team_member_from_json(value: &serde_json::Value) -> TeamCharterMember122 {
@@ -446,13 +449,14 @@ fn team_parse_yaml_charter(text: &str) -> Result<TeamCharter122, String> {
         team_yaml_line(line, &mut charter, &mut current);
     }
     if let Some(member) = current.take() { charter.members.push(member); }
-    team_charter_finish(&charter.name, charter.description, charter.goal, charter.members, charter.governance_requires_human_approval)
+    team_charter_finish(&charter.name, charter.description, charter.goal, charter.session, charter.members, charter.governance_requires_human_approval)
 }
 
 fn team_yaml_line(line: &str, charter: &mut TeamCharter122, current: &mut Option<TeamCharterMember122>) {
     if let Some(rest) = line.strip_prefix("name:") { charter.name = team_unquote(rest); return; }
     if let Some(rest) = line.strip_prefix("description:") { charter.description = team_unquote(rest); return; }
     if let Some(rest) = line.strip_prefix("goal:") { charter.goal = team_unquote(rest); return; }
+    if let Some(rest) = line.strip_prefix("session:") { charter.session = Some(team_unquote(rest)); return; }
     if line.trim() == "requires_human_approval: true" { charter.governance_requires_human_approval = true; return; }
     if let Some(rest) = line.trim_start().strip_prefix("- role:") { if let Some(member) = current.take() { charter.members.push(member); } *current = Some(TeamCharterMember122 { role: team_unquote(rest), ..Default::default() }); return; }
     if let Some(member) = current.as_mut() { team_yaml_member_line(line, member); }
@@ -468,10 +472,10 @@ fn team_unquote(raw: &str) -> String {
     raw.trim().trim_matches('"').trim_matches('\'').to_owned()
 }
 
-fn team_charter_finish(name: &str, description: String, goal: String, members: Vec<TeamCharterMember122>, governance_requires_human_approval: bool) -> Result<TeamCharter122, String> {
+fn team_charter_finish(name: &str, description: String, goal: String, session: Option<String>, members: Vec<TeamCharterMember122>, governance_requires_human_approval: bool) -> Result<TeamCharter122, String> {
     if name.trim().is_empty() { return Err("team charter requires name".to_owned()); }
     if members.is_empty() { return Err("team charter requires at least one member".to_owned()); }
-    Ok(TeamCharter122 { name: name.trim().to_owned(), description, goal, members, governance_requires_human_approval })
+    Ok(TeamCharter122 { name: name.trim().to_owned(), description, goal, session, members, governance_requires_human_approval })
 }
 
 fn team_format_plan(charter: &TeamCharter122) -> String {

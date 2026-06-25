@@ -144,7 +144,7 @@ fn team_t3_load_or_quick_charter(opts: &TeamT3Options124) -> Result<TeamCharter1
         if count == 0 { return Err("--quick must be a positive integer".to_owned()); }
         let team = opts.team.clone().unwrap_or_else(|| "quick".to_owned());
         let members = (1..=count).map(|number| TeamCharterMember122 { role: format!("builder-{number}"), name: Some(format!("builder-{number}")), engine: opts.engine.clone(), ..Default::default() }).collect();
-        return Ok(TeamCharter122 { name: team, description: String::new(), goal: String::new(), members, governance_requires_human_approval: false });
+        return Ok(TeamCharter122 { name: team, description: String::new(), goal: String::new(), session: opts.session.clone(), members, governance_requires_human_approval: false });
     }
     let team = opts.team.as_ref().ok_or_else(|| "team required".to_owned())?;
     let path = team_t3_resolve_charter_path(team, opts.charter_path.as_deref())?;
@@ -210,7 +210,7 @@ fn team_t3_render_liveness(charter: &TeamCharter122, opts: &TeamT3Options124) ->
 }
 
 fn team_t3_session(charter: &TeamCharter122, opts: &TeamT3Options124) -> String {
-    opts.session.clone().unwrap_or_else(|| charter.name.clone())
+    opts.session.clone().or_else(|| charter.session.clone()).unwrap_or_else(|| charter.name.clone())
 }
 
 fn team_t3_roster<F>(charter: &TeamCharter122, opts: &TeamT3Options124, session: &str, action: F) -> Vec<TeamRosterItem124>
