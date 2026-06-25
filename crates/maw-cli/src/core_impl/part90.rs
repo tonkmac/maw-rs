@@ -44,6 +44,17 @@ fn oracleworkon_run_command_with(argv: &[String], load_fleet: OracleworkonFleetL
 }
 
 fn oracleworkon_run(argv: &[String], load_fleet: OracleworkonFleetLoader) -> Result<String, String> {
+    let orchestrator = crate::serve_core::ServecoreCommandOrchestrator::servecore_with_root(
+        oracleworkon_orchestration_root(),
+    );
+    oracleworkon_run_with_orchestrator(argv, load_fleet, &orchestrator)
+}
+
+fn oracleworkon_run_with_orchestrator(
+    argv: &[String],
+    load_fleet: OracleworkonFleetLoader,
+    orchestrator: &dyn crate::serve_core::ServecoreOrchestrator,
+) -> Result<String, String> {
     let mut options = oracleworkon_parse_args(argv)?;
     if oracleworkon_has_flag(&options, ORACLEWORKON_FLAG_ALL) {
         options.targets = oracleworkon_all_targets(load_fleet())?;
@@ -51,6 +62,9 @@ fn oracleworkon_run(argv: &[String], load_fleet: OracleworkonFleetLoader) -> Res
     oracleworkon_validate_options(&options)?;
     if oracleworkon_has_flag(&options, ORACLEWORKON_FLAG_DRY_RUN) || oracleworkon_is_planning_only(&options) {
         return Ok(oracleworkon_render_plan(&options));
+    }
+    if oracleworkon_needs_orchestration(&options) {
+        return oracleworkon_spawn_with_orchestrator(&options, orchestrator);
     }
     oracleworkon_run_single_workon(&options)
 }
@@ -206,9 +220,11 @@ fn oracleworkon_all_targets(fleet: Vec<NativeFleetSession>) -> Result<Vec<String
 }
 
 fn oracleworkon_is_planning_only(options: &OracleworkonOptions) -> bool {
-    options.targets.len() != 1
-        || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_ALL)
-        || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_FORCE)
+    options.targets.len() != 1 || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_ALL)
+}
+
+fn oracleworkon_needs_orchestration(options: &OracleworkonOptions) -> bool {
+    oracleworkon_has_flag(options, ORACLEWORKON_FLAG_FORCE)
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_NO_ATTACH)
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_SPLIT)
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_TILED)
@@ -242,6 +258,46 @@ fn oracleworkon_workon_command(target: &str, task: Option<&str>) -> String {
     }
 }
 
+
+fn oracleworkon_spawn_with_orchestrator(
+    options: &OracleworkonOptions,
+    orchestrator: &dyn crate::serve_core::ServecoreOrchestrator,
+) -> Result<String, String> {
+    let target = options.targets.first().ok_or_else(|| ORACLEWORKON_USAGE.to_owned())?;
+    let request = crate::serve_core::ServecoreWorkonRequest {
+        repo: target.clone(),
+        task: options.task.clone(),
+        engine: options.engine.clone(),
+        target: (!oracleworkon_has_flag(options, ORACLEWORKON_FLAG_NO_ATTACH)).then(|| target.clone()),
+        prompt: options.prompt.clone(),
+        with_oracles: options.with.clone(),
+        attach: !oracleworkon_has_flag(options, ORACLEWORKON_FLAG_NO_ATTACH),
+        split: oracleworkon_has_flag(options, ORACLEWORKON_FLAG_SPLIT),
+        tiled: oracleworkon_has_flag(options, ORACLEWORKON_FLAG_TILED),
+    };
+    let handle = orchestrator.spawn_workon(
+        request,
+        std::sync::Arc::new(crate::serve_core::ServecoreStubEngine),
+    )?;
+    Ok(oracleworkon_render_spawn(&handle))
+}
+
+fn oracleworkon_render_spawn(handle: &crate::serve_core::ServecoreWorkonHandle) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "oracle-workon spawned:");
+    let _ = writeln!(out, "  repo: {}", handle.repo);
+    let _ = writeln!(out, "  cwd: {}", handle.cwd);
+    let _ = writeln!(out, "  engine: {}", handle.engine);
+    let _ = writeln!(out, "  argv: {}", handle.argv.join(" "));
+    out
+}
+
+fn oracleworkon_orchestration_root() -> std::path::PathBuf {
+    std::env::var_os("GHQ_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+}
+
 fn oracleworkon_run_single_workon(options: &OracleworkonOptions) -> Result<String, String> {
     let target = options.targets.first().ok_or_else(|| ORACLEWORKON_USAGE.to_owned())?;
     let mut args = vec![target.clone()];
@@ -260,6 +316,34 @@ fn oracleworkon_run_single_workon(options: &OracleworkonOptions) -> Result<Strin
 #[cfg(test)]
 mod oracleworkon_tests {
     use super::*;
+
+
+    #[derive(Default)]
+    struct OracleworkonFakeOrchestrator {
+        calls: std::sync::Mutex<Vec<crate::serve_core::ServecoreWorkonRequest>>,
+    }
+
+    impl crate::serve_core::ServecoreOrchestrator for OracleworkonFakeOrchestrator {
+        fn spawn_workon(
+            &self,
+            request: crate::serve_core::ServecoreWorkonRequest,
+            _engine: std::sync::Arc<dyn crate::serve_core::ServecoreEngine>,
+        ) -> Result<crate::serve_core::ServecoreWorkonHandle, String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            Ok(crate::serve_core::ServecoreWorkonHandle {
+                ok: true,
+                repo: request.repo,
+                cwd: "/tmp/fake".to_owned(),
+                engine: request.engine.unwrap_or_else(|| "stub".to_owned()),
+                target: request.target,
+                argv: vec!["workon".to_owned(), "demo".to_owned()],
+                status: "fake".to_owned(),
+            })
+        }
+    }
 
     struct OracleworkonEnvGuard {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
@@ -373,6 +457,35 @@ esac
         assert!(err.contains("looks like a flag"));
         let err = oracleworkon_run(&oracleworkon_strings(&["--all"]), oracleworkon_bad_fleet).expect_err("bad fleet");
         assert!(err.contains("project repo"));
+    }
+
+    #[test]
+    fn oracleworkon_advanced_flags_use_orchestrator_instead_of_plan_only() {
+        let fake = OracleworkonFakeOrchestrator::default();
+        let output = oracleworkon_run_with_orchestrator(
+            &oracleworkon_strings(&[
+                "demo",
+                "feat-219",
+                "--engine",
+                "codex-flex",
+                "--with",
+                "nova",
+                "--split",
+            ]),
+            oracleworkon_fleet,
+            &fake,
+        )
+        .expect("spawn");
+        assert!(output.contains("oracle-workon spawned"));
+        assert!(!output.contains("plan-only"));
+        let calls = fake
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].engine.as_deref(), Some("codex-flex"));
+        assert_eq!(calls[0].with_oracles, vec!["nova"]);
+        assert!(calls[0].split);
     }
 
     #[test]

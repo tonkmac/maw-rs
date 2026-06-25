@@ -410,7 +410,7 @@ pub fn is_protected(path: &str, method: &str) -> bool {
     let normalized = auth_normalize_protected_path(path);
     matches!(
         (method.as_str(), normalized.as_str()),
-        ("POST", "/triggers/fire" | "/worktrees/cleanup" | "/trust" | "/trust/revoke")
+        ("POST", "/triggers/fire" | "/worktrees/cleanup" | "/orchestration/workon" | "/trust" | "/trust/revoke")
             | ("GET", "/trust")
     ) || (method == "POST" && normalized.starts_with("/plugins/"))
 }
@@ -663,6 +663,7 @@ mod tests {
         assert!(super::is_protected("/triggers/fire", "POST"));
         assert!(super::is_protected("/api/triggers/fire", "post"));
         assert!(super::is_protected("/api/worktrees/cleanup?dry=1", "POST"));
+        assert!(super::is_protected("/api/orchestration/workon", "POST"));
         assert!(super::is_protected("/api/plugins/reload", "POST"));
         assert!(!super::is_protected("/api/plugins", "GET"));
         assert!(!super::is_protected("/api/identity", "GET"));

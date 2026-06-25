@@ -4,7 +4,7 @@ const DISPATCH_100: &[DispatcherEntry] = &[DispatcherEntry {
 }];
 
 const UI_USAGE: &str = "usage: maw ui [--install] [--source] [--tunnel] [--dev] [--3d] [--version]";
-const UI_TUNNEL_TODO: &str = "TODO#154: wire ui --tunnel to the live serve-daemon tunnel once the daemon orchestration contract is available";
+const UI_TUNNEL_NOTE: &str = "ui --tunnel uses protected serve orchestration route /api/orchestration/workon; execution remains behind D2 auth";
 
 const UI_FLAG_INSTALL: u8 = 1 << 0;
 const UI_FLAG_SOURCE: u8 = 1 << 1;
@@ -123,7 +123,7 @@ fn ui_build_plan(options: &UiOptions, context: &UiContext) -> Result<UiPlan, Str
     }
     if ui_has_flag(options, UI_FLAG_TUNNEL) {
         commands.push(ui_command(&["tunnel", context.serve_url.as_str()]));
-        notes.push(UI_TUNNEL_TODO.to_owned());
+        notes.push(UI_TUNNEL_NOTE.to_owned());
     }
     if ui_has_flag(options, UI_FLAG_THREE_D) {
         notes.push("3d UI mode requested".to_owned());
@@ -275,7 +275,7 @@ mod ui_tests {
     fn ui_tunnel_is_stubbed_until_live_daemon_contract() {
         let output = ui_run(&ui_strings(&["--tunnel"]), &ui_context()).expect("plan");
         assert!(output.contains("tunnel http://127.0.0.1:1977"));
-        assert!(output.contains("TODO#154"));
+        assert!(output.contains("/api/orchestration/workon"));
     }
 
     #[test]
