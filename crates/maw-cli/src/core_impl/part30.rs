@@ -1102,14 +1102,22 @@ mod serve_tests {
             .await
             .expect("protected request");
         assert_eq!(trigger.status(), StatusCode::OK, "/api/triggers/fire");
-        for path in ["/api/worktrees/cleanup", "/api/plugins/reload"] {
-            let response = client
-                .post(format!("http://{addr}{path}"))
-                .send()
-                .await
-                .expect("protected request");
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-        }
+        let plugins = client
+            .post(format!("http://{addr}/api/plugins/reload"))
+            .send()
+            .await
+            .expect("protected request");
+        assert_eq!(plugins.status(), StatusCode::OK, "/api/plugins/reload");
+        let cleanup = client
+            .post(format!("http://{addr}/api/worktrees/cleanup"))
+            .send()
+            .await
+            .expect("protected request");
+        assert_eq!(
+            cleanup.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "/api/worktrees/cleanup is live JSON route, not core stub"
+        );
         let public = client
             .get(format!("http://{addr}/api/agents"))
             .send()
