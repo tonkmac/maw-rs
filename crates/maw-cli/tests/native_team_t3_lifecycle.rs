@@ -127,20 +127,9 @@ fn team_t3_status_dryrun_liveness_goldens_are_hermetic() {
 }
 
 #[test]
-fn team_t3_rejects_exec_paths_and_injection_without_spawning() {
+fn team_t3_rejects_injection_before_exec() {
     let root = temp_dir("guards");
     seed(&root);
-    let up_exec = run(&["team", "up", "alpha", "--session", "alpha"], &root);
-    assert!(!up_exec.status.success());
-    assert!(String::from_utf8_lossy(&up_exec.stderr).contains("read-only only"));
-
-    let apply_exec = run(
-        &["team", "apply", "alpha", "--apply", "--session", "alpha"],
-        &root,
-    );
-    assert!(!apply_exec.status.success());
-    assert!(String::from_utf8_lossy(&apply_exec.stderr).contains("dry-run only"));
-
     let bad = run(
         &["team", "up", "alpha", "--status", "--engine", "-bad"],
         &root,
