@@ -9,6 +9,7 @@
 //! 5. Never mount after `servecore_apply_pipeline`; all module routers must pass through default-deny.
 
 pub mod agents;
+pub mod debug;
 pub mod triggers;
 
 use super::{ServecoreLifecycle, ServecoreLifecycleModule};
@@ -47,6 +48,7 @@ where
 {
     vec![
         agents::agents_registration(),
+        debug::debug_registration(),
         triggers::triggers_registration(),
     ]
 }
