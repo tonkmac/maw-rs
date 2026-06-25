@@ -114,8 +114,6 @@ fn talkto_native_local_thread_notification_sends_to_guarded_pane() {
     talkto_install_fake_tmux(&root);
     talkto_write_local_config(&root);
     let output = talkto_command(&root)
-        .env("MAW_RS_TALKTO_THREAD_ID", "7")
-        .env("MAW_RS_TALKTO_THREAD_COUNT", "1")
         .args(["talk-to", "local:nova", "hello", "there"])
         .output()
         .expect("run talk-to");
@@ -125,7 +123,7 @@ fn talkto_native_local_thread_notification_sends_to_guarded_pane() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("thread #7 + sent → %42"), "{stdout}");
+    assert!(stdout.contains("thread #1 + sent → %42"), "{stdout}");
     assert_eq!(dispatcher_status("talk-to"), DispatchKind::Native);
     assert_eq!(dispatcher_status("talkto"), DispatchKind::Native);
     let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
@@ -139,13 +137,20 @@ fn talkto_native_local_thread_notification_sends_to_guarded_pane() {
         "{log}"
     );
     assert!(
-        log.contains("send-keys -t %42 -l 💬 channel:local:nova (#7)"),
+        log.contains("send-keys -t %42 -l 💬 channel:local:nova (#1)"),
         "{log}"
     );
     assert!(log.contains("send-keys -t %42 Enter"), "{log}");
     let state_log =
         std::fs::read_to_string(root.join("home/.maw/maw-log.jsonl")).expect("state log");
-    assert!(state_log.contains(r#""ch":"thread:7""#), "{state_log}");
+    assert!(state_log.contains(r#""ch":"thread:1""#), "{state_log}");
+    let thread_file = root.join("home/.maw/threads/1.json");
+    let thread = std::fs::read_to_string(thread_file).expect("thread file");
+    assert!(
+        thread.contains(r#""title": "channel:local:nova""#),
+        "{thread}"
+    );
+    assert!(thread.contains(r#""content": "hello there""#), "{thread}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -155,7 +160,6 @@ fn talkto_native_peer_uses_fake_transport_without_tmux_injection() {
     talkto_install_fake_tmux(&root);
     talkto_write_peer_config(&root);
     let output = talkto_command(&root)
-        .env("MAW_RS_TALKTO_THREAD_ID", "9")
         .env("MAW_RS_TALKTO_FAKE_PEER_LOG", root.join("peer.jsonl"))
         .args(["talk-to", "remote:neo", "cross", "node", "--force"])
         .output()
@@ -166,7 +170,7 @@ fn talkto_native_peer_uses_fake_transport_without_tmux_injection() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("thread #9 + sent → remote:neo"), "{stdout}");
+    assert!(stdout.contains("thread #1 + sent → remote:neo"), "{stdout}");
     let peer = std::fs::read_to_string(root.join("peer.jsonl")).expect("peer log");
     assert!(
         peer.contains(r#""peerUrl":"http://remote.invalid""#),
@@ -174,6 +178,12 @@ fn talkto_native_peer_uses_fake_transport_without_tmux_injection() {
     );
     assert!(peer.contains(r#""target":"neo""#), "{peer}");
     assert!(peer.contains("cross node"), "{peer}");
+    let thread =
+        std::fs::read_to_string(root.join("home/.maw/threads/1.json")).expect("thread file");
+    assert!(
+        thread.contains(r#""title": "channel:remote:neo""#),
+        "{thread}"
+    );
     let tmux = std::fs::read_to_string(root.join("tmux.log")).unwrap_or_default();
     assert!(
         !tmux.contains("send-keys"),
@@ -196,6 +206,7 @@ fn talkto_native_guard_rejects_separator_before_transport() {
     assert!(String::from_utf8(output.stderr)
         .expect("stderr")
         .contains("-- separator is not supported"));
+    assert!(!root.join("home/.maw/threads/1.json").exists());
     let tmux = std::fs::read_to_string(root.join("tmux.log")).unwrap_or_default();
     assert!(
         !tmux.contains("send-keys"),

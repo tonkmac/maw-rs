@@ -1,3 +1,5 @@
+use crate::serve_core::ServecoreThreadStore;
+
 const DISPATCH_85: &[DispatcherEntry] = &[
     DispatcherEntry { command: "talk-to", handler: Handler::Async(run_talkto_async) },
     DispatcherEntry { command: "talkto", handler: Handler::Async(run_talkto_async) },
@@ -34,7 +36,7 @@ async fn talkto_run_async_impl(raw_args: &[String]) -> CliOutput {
         Err(message) => return talkto_usage_error(&message),
     };
     let config = load_hey_config();
-    let thread = talkto_stub_thread(&args.recipient, &args.message);
+    let thread = talkto_persist_thread(&args.recipient, &args.message);
     let notification = talkto_notification(&args, thread.as_ref());
     let mut tmux = TmuxClient::local();
     let sessions = route_sessions_from_tmux(&mut tmux);
@@ -87,17 +89,25 @@ fn talkto_validate_message(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-fn talkto_stub_thread(recipient: &str, message: &str) -> Option<TalktoThreadResult> {
+fn talkto_persist_thread(recipient: &str, message: &str) -> Option<TalktoThreadResult> {
     if std::env::var_os("MAW_RS_TALKTO_NO_THREAD").is_some() { return None; }
-    if let Ok(raw) = std::env::var("MAW_RS_TALKTO_THREAD_ID") {
-        let id = raw.parse::<u64>().unwrap_or(0);
-        if id > 0 { return Some(TalktoThreadResult { id, count: std::env::var("MAW_RS_TALKTO_THREAD_COUNT").ok().and_then(|value| value.parse().ok()) }); }
-    }
-    // TODO(#83): wire this to the oracle_thread/serve daemon once the native runtime owns
-    // a stable, hermetic thread client. Until then, talk-to keeps delivery functional and
-    // reports that the persistent thread layer was skipped.
-    let _ = (recipient, message);
-    None
+    let store = ServecoreThreadStore::servecore_default();
+    talkto_persist_thread_with_store(&store, recipient, message)
+}
+
+fn talkto_persist_thread_with_store(
+    store: &ServecoreThreadStore,
+    recipient: &str,
+    message: &str,
+) -> Option<TalktoThreadResult> {
+    let title = format!("channel:{recipient}");
+    let Ok((result, record)) = store.servecore_post_channel(&title, "claude", message) else {
+        return None;
+    };
+    Some(TalktoThreadResult {
+        id: result.thread_id,
+        count: Some(record.messages.len()),
+    })
 }
 
 fn talkto_notification(args: &TalktoArgs, thread: Option<&TalktoThreadResult>) -> String {
@@ -255,9 +265,7 @@ fn talkto_now_iso() -> String {
     format!("epoch-ms:{ms}")
 }
 
-fn talkto_thread_stub_warning(thread: Option<&TalktoThreadResult>) -> String {
-    if thread.is_some() { String::new() } else { "warn: native talk-to thread persistence not wired yet; delivered notification only (TODO #83)\n".to_owned() }
-}
+fn talkto_thread_stub_warning(_thread: Option<&TalktoThreadResult>) -> String { String::new() }
 
 fn talkto_usage_error(message: &str) -> CliOutput {
     let detail = if message.is_empty() { String::new() } else { format!("{message}\n") };
@@ -284,5 +292,26 @@ mod talkto_tests {
         assert!(talkto_parse_args(&talkto_strings(&["-alpha", "msg"])).unwrap_err().contains("unknown argument"));
         assert!(talkto_parse_args(&talkto_strings(&["alpha/../../x", "msg"])).unwrap_err().contains("invalid recipient"));
         assert!(talkto_parse_args(&talkto_strings(&["alpha"])).unwrap_err().contains("message is required"));
+    }
+
+    #[test]
+    fn talkto_consumer_persists_real_thread_store() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        root.push(format!("maw-rs-talkto-thread-{}-{nanos}", std::process::id()));
+        root.push("consumer");
+        let store = ServecoreThreadStore::servecore_with_root(root);
+        let first = talkto_persist_thread_with_store(&store, "alpha", "hello").expect("first");
+        let second = talkto_persist_thread_with_store(&store, "alpha", "again").expect("second");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.count, Some(1));
+        assert_eq!(second.count, Some(2));
+        let record = store.read(first.id).expect("read");
+        assert_eq!(record.thread.title, "channel:alpha");
+        assert_eq!(record.messages[0].content, "hello");
+        assert_eq!(record.messages[1].content, "again");
+        assert_eq!(talkto_thread_stub_warning(Some(&second)), "");
     }
 }
