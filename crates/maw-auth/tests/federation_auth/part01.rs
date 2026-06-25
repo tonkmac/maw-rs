@@ -485,15 +485,38 @@ fn ed25519_tofu_reloaded_pin_rejects_mismatch_without_silent_repin() {
 }
 
 #[test]
-fn ed25519_tofu_corrupt_file_loads_empty_but_still_pins_securely() {
+fn ed25519_tofu_corrupt_file_poison_rejects_without_auto_pin() {
     use maw_auth::Ed25519TofuStore;
+    use std::sync::{Arc, Mutex};
 
     let path = ed25519_tofu_test_path("corrupt");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("test dir");
     std::fs::write(&path, b"{not-json").expect("corrupt fixture");
 
     let mut store = Ed25519TofuStore::file_backed(&path);
-    assert!(store.is_empty());
+    assert!(store.is_poisoned());
+    assert!(!store.pin_first_contact(FROM, ED25519_PUBKEY_HEX));
+
+    let pins = Arc::new(Mutex::new(store));
+    let decision = maw_auth::verify_request(&ed25519_request_parts(
+        ED25519_SIG_HEX,
+        Some(ED25519_PUBKEY_HEX),
+        pins.clone(),
+    ));
+    assert_eq!(decision.reason(), Some("tofu-store-corrupt"));
+    let guard = pins.lock().expect("test pin lock");
+    assert!(guard.is_empty());
+    assert!(guard.is_poisoned());
+}
+
+#[test]
+fn ed25519_tofu_missing_file_still_allows_first_use_pin() {
+    use maw_auth::Ed25519TofuStore;
+
+    let path = ed25519_tofu_test_path("missing");
+    assert!(!path.exists());
+    let mut store = Ed25519TofuStore::file_backed(&path);
+    assert!(!store.is_poisoned());
     assert!(store.pin_first_contact(FROM, ED25519_PUBKEY_HEX));
 
     let reloaded = Ed25519TofuStore::file_backed(&path);
@@ -528,7 +551,7 @@ fn ed25519_tofu_atomic_concurrent_pins_survive_reload() {
 }
 
 #[test]
-fn ed25519_tofu_traversal_path_fails_closed_without_pin() {
+fn ed25519_tofu_traversal_path_poisons_without_pin() {
     use maw_auth::Ed25519TofuStore;
 
     let path = ed25519_tofu_test_path("traversal")
@@ -537,6 +560,7 @@ fn ed25519_tofu_traversal_path_fails_closed_without_pin() {
         .join("..")
         .join("escaped.json");
     let mut store = Ed25519TofuStore::file_backed(path);
+    assert!(store.is_poisoned());
     assert!(!store.pin_first_contact(FROM, ED25519_PUBKEY_HEX));
     assert!(store.is_empty());
 }

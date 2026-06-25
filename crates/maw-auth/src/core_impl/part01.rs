@@ -471,15 +471,29 @@ impl RequestAuthDecision {
 pub struct Ed25519TofuStore {
     pins: BTreeMap<String, String>,
     backing_file: Option<std::path::PathBuf>,
+    poisoned: bool,
 }
 
 impl Ed25519TofuStore {
     #[must_use]
     pub fn file_backed(path: impl Into<std::path::PathBuf>) -> Self {
         let path = path.into();
-        Self {
-            pins: ed25519_tofu_load_pins(&path).unwrap_or_default(),
-            backing_file: Some(path),
+        match ed25519_tofu_load_pins(&path) {
+            Ed25519TofuLoad::Ok(pins) => Self {
+                pins,
+                backing_file: Some(path),
+                poisoned: false,
+            },
+            Ed25519TofuLoad::NotFound => Self {
+                pins: BTreeMap::new(),
+                backing_file: Some(path),
+                poisoned: false,
+            },
+            Ed25519TofuLoad::Corrupt => Self {
+                pins: BTreeMap::new(),
+                backing_file: Some(path),
+                poisoned: true,
+            },
         }
     }
 
@@ -498,8 +512,16 @@ impl Ed25519TofuStore {
         self.pins.is_empty()
     }
 
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn pin_first_contact(&mut self, from: &str, pubkey_hex: &str) -> bool {
-        if self.pins.contains_key(from) || !ed25519_tofu_valid_pin(from, pubkey_hex) {
+        if self.poisoned
+            || self.pins.contains_key(from)
+            || !ed25519_tofu_valid_pin(from, pubkey_hex)
+        {
             return false;
         }
         self.pins.insert(from.to_owned(), pubkey_hex.to_owned());
@@ -518,14 +540,34 @@ impl Ed25519TofuStore {
     }
 }
 
-fn ed25519_tofu_load_pins(path: &std::path::Path) -> Option<BTreeMap<String, String>> {
-    let path = ed25519_tofu_safe_path(path).ok()?;
-    let bytes = std::fs::read(path).ok()?;
-    let parsed = serde_json::from_slice::<BTreeMap<String, String>>(&bytes).ok()?;
-    parsed
+enum Ed25519TofuLoad {
+    Ok(BTreeMap<String, String>),
+    NotFound,
+    Corrupt,
+}
+
+fn ed25519_tofu_load_pins(path: &std::path::Path) -> Ed25519TofuLoad {
+    let Ok(path) = ed25519_tofu_safe_path(path) else {
+        return Ed25519TofuLoad::Corrupt;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ed25519TofuLoad::NotFound;
+        }
+        Err(_) => return Ed25519TofuLoad::Corrupt,
+    };
+    let Ok(parsed) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) else {
+        return Ed25519TofuLoad::Corrupt;
+    };
+    if parsed
         .iter()
         .all(|(from, pubkey)| ed25519_tofu_valid_pin(from, pubkey))
-        .then_some(parsed)
+    {
+        Ed25519TofuLoad::Ok(parsed)
+    } else {
+        Ed25519TofuLoad::Corrupt
+    }
 }
 
 fn ed25519_tofu_valid_pin(from: &str, pubkey_hex: &str) -> bool {
