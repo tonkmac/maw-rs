@@ -14,6 +14,7 @@ pub mod debug;
 pub mod federation;
 pub mod identity;
 pub mod pair;
+pub mod thread_store;
 pub mod triggers;
 pub mod triggers_mutate;
 pub mod views;
@@ -59,6 +60,7 @@ where
         federation::federation_registration(),
         identity::identity_registration(),
         pair::pair_registration(),
+        thread_store::threadstore_registration(),
         triggers::triggers_registration(),
         triggers_mutate::triggersmutate_registration(),
         views::views_registration(),
