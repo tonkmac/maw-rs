@@ -153,5 +153,36 @@ pub use types::{
     GatewayStatus, GatewayToken,
 };
 
+/// Observe mock gateway events through [`GatewayHandle::subscribe`].
+///
+/// This is a hermetic downstream seam for CLI surfaces that need to prove they
+/// consume the gateway fanout without opening a live Discord websocket.
+pub async fn observe_mock_gateway_events(events: &[String]) -> usize {
+    use tokio::time::{timeout, Duration};
+    use twilight_model::gateway::event::Event;
+
+    let mocked = events
+        .iter()
+        .map(|event| match event.as_str() {
+            "heartbeat-ack" | "GatewayHeartbeatAck" => Ok(Some(Event::GatewayHeartbeatAck)),
+            _ => Ok(Some(Event::GatewayHeartbeat)),
+        })
+        .collect::<Vec<_>>();
+    let handle = spawn_gateway_with_source(
+        GatewayConfig::new("mock-gateway", twilight_model::gateway::Intents::GUILDS)
+            .backoff(Duration::from_millis(1), Duration::from_millis(1)),
+        MockGatewaySource::new(mocked),
+    );
+    let mut rx = handle.subscribe();
+    let mut count = 0usize;
+    for _ in events {
+        if timeout(Duration::from_millis(50), rx.recv()).await.is_ok() {
+            count = count.saturating_add(1);
+        }
+    }
+    let _ = handle.shutdown().await;
+    count
+}
+
 #[cfg(test)]
 mod tests;

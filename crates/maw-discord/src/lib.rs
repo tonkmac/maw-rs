@@ -1790,7 +1790,8 @@ async fn resolve_user_list(rest: &dyn DiscordRest, token: &str, ids: &[String]) 
     out
 }
 
-fn is_numeric_snowflake(id: &str) -> bool {
+#[must_use]
+pub fn is_numeric_snowflake(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())
 }
 
