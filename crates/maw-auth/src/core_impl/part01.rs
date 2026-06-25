@@ -470,9 +470,19 @@ impl RequestAuthDecision {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ed25519TofuStore {
     pins: BTreeMap<String, String>,
+    backing_file: Option<std::path::PathBuf>,
 }
 
 impl Ed25519TofuStore {
+    #[must_use]
+    pub fn file_backed(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        Self {
+            pins: ed25519_tofu_load_pins(&path).unwrap_or_default(),
+            backing_file: Some(path),
+        }
+    }
+
     #[must_use]
     pub fn pinned(&self, from: &str) -> Option<&str> {
         self.pins.get(from).map(String::as_str)
@@ -489,12 +499,104 @@ impl Ed25519TofuStore {
     }
 
     pub fn pin_first_contact(&mut self, from: &str, pubkey_hex: &str) -> bool {
-        if self.pins.contains_key(from) {
+        if self.pins.contains_key(from) || !ed25519_tofu_valid_pin(from, pubkey_hex) {
             return false;
         }
         self.pins.insert(from.to_owned(), pubkey_hex.to_owned());
+        if self.ed25519_tofu_persist().is_err() {
+            self.pins.remove(from);
+            return false;
+        }
         true
     }
+
+    fn ed25519_tofu_persist(&self) -> Result<(), std::io::Error> {
+        let Some(path) = &self.backing_file else {
+            return Ok(());
+        };
+        ed25519_tofu_write_atomic(path, &self.pins)
+    }
+}
+
+fn ed25519_tofu_load_pins(path: &std::path::Path) -> Option<BTreeMap<String, String>> {
+    let path = ed25519_tofu_safe_path(path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    let parsed = serde_json::from_slice::<BTreeMap<String, String>>(&bytes).ok()?;
+    parsed
+        .iter()
+        .all(|(from, pubkey)| ed25519_tofu_valid_pin(from, pubkey))
+        .then_some(parsed)
+}
+
+fn ed25519_tofu_valid_pin(from: &str, pubkey_hex: &str) -> bool {
+    ed25519_tofu_valid_from(from) && ed25519_tofu_valid_pubkey(pubkey_hex)
+}
+
+fn ed25519_tofu_valid_from(from: &str) -> bool {
+    let value = from.trim();
+    !value.is_empty()
+        && value == from
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value.chars().all(|ch| !ch.is_control())
+}
+
+fn ed25519_tofu_valid_pubkey(pubkey_hex: &str) -> bool {
+    pubkey_hex.len() == 64 && pubkey_hex.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn ed25519_tofu_write_atomic(
+    path: &std::path::Path,
+    pins: &BTreeMap<String, String>,
+) -> Result<(), std::io::Error> {
+    let final_path = ed25519_tofu_safe_path(path)?;
+    let tmp_path = final_path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(pins).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(tmp_path, final_path)
+}
+
+fn ed25519_tofu_safe_path(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+    if ed25519_tofu_has_traversal(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path traversal",
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path missing parent",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path missing file name",
+        ));
+    };
+    let final_path = parent.join(name);
+    if final_path.starts_with(&parent) {
+        Ok(final_path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path escapes parent",
+        ))
+    }
+}
+
+fn ed25519_tofu_has_traversal(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    })
 }
 
 pub type Ed25519TofuPins = Arc<Mutex<Ed25519TofuStore>>;
