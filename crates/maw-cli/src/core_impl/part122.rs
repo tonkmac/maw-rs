@@ -3,7 +3,7 @@ const DISPATCH_122: &[DispatcherEntry] = &[
     DispatcherEntry { command: "t", handler: Handler::Sync(team_run_command) },
 ];
 
-const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox>";
+const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|liveness>";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +106,10 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "send" | "msg" => team_send(argv),
         "broadcast" => team_broadcast(argv),
         "inbox" => team_inbox(argv),
+        "up" => team_t3_up(argv),
+        "bring" => team_t3_bring(argv),
+        "apply" => team_t3_apply(argv),
+        "liveness" | "live-check" => team_t3_liveness(argv),
         other if other.starts_with('-') => Err(format!("team: unknown argument {other}")),
         _ => Err(TEAM_USAGE.to_owned()),
     }
