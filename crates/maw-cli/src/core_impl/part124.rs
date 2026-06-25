@@ -18,6 +18,7 @@ struct TeamRosterItem124 {
     pane: Option<TeamPane124>,
 }
 
+#[allow(dead_code)]
 fn team_t3_up(argv: &[String]) -> Result<String, String> {
     let opts = team_t3_parse_flags(argv, "usage: maw team up <team> [--session <name>] [--members <roles>] [--only <a,b>] [--dry-run] [--status] [-e <engine>]")?;
     if !(team_t3_has(&opts, TEAM_T3_STATUS) || team_t3_has(&opts, TEAM_T3_DRY_RUN)) {
@@ -27,6 +28,7 @@ fn team_t3_up(argv: &[String]) -> Result<String, String> {
     Ok(team_t3_render_up(&charter, &opts))
 }
 
+#[allow(dead_code)]
 fn team_t3_bring(argv: &[String]) -> Result<String, String> {
     let opts = team_t3_parse_flags(argv, "usage: maw team bring <team> [--session <session>] [--split] [--gather] [--dry-run] [-e <engine>]")?;
     if !team_t3_has(&opts, TEAM_T3_DRY_RUN) {
@@ -37,6 +39,7 @@ fn team_t3_bring(argv: &[String]) -> Result<String, String> {
     Ok(team_t3_render_bring(team, &opts))
 }
 
+#[allow(dead_code)]
 fn team_t3_apply(argv: &[String]) -> Result<String, String> {
     let opts = team_t3_parse_flags(argv, "usage: maw team apply <team|team.yaml> [--charter <path>] [--session <name]")?;
     if team_t3_has(&opts, TEAM_T3_APPLY) {
