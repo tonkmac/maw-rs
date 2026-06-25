@@ -3,7 +3,7 @@ const DISPATCH_122: &[DispatcherEntry] = &[
     DispatcherEntry { command: "t", handler: Handler::Sync(team_run_command) },
 ];
 
-const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|reassign|liveness|down|remove|delete|rm|prune>";
+const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|reassign|liveness|invite|down|remove|delete|rm|prune>";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -87,9 +87,14 @@ struct TeamCharterMember122 {
 }
 
 fn team_run_command(argv: &[String]) -> CliOutput {
-    match team_run(argv) {
+    team_output_from_result(team_run(argv))
+}
+
+fn team_output_from_result(result: Result<String, String>) -> CliOutput {
+    match result {
         Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
         Err(message) if message == TEAM_USAGE => CliOutput { code: 0, stdout: format!("{TEAM_USAGE}\n"), stderr: String::new() },
+        Err(message) if message.starts_with("__TEAM_INVITE_EXIT2__") => CliOutput { code: 2, stdout: String::new(), stderr: format!("{}\n", message.trim_start_matches("__TEAM_INVITE_EXIT2__")) },
         Err(message) => CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") },
     }
 }
@@ -112,6 +117,7 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "send" | "msg" => team_send(argv),
         "broadcast" => team_broadcast(argv),
         "inbox" => team_inbox(argv),
+        "invite" => team_invite(argv),
         "up" => team_t5b_up(argv),
         "bring" => team_t5b_bring(argv),
         "apply" => team_t5b_apply(argv),
