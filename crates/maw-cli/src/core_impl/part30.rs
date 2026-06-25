@@ -215,15 +215,12 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/pane-keys", post(api_pane_keys))
         .route("/api/transport/status", get(api_transport_status))
         .route("/api/transport/send", post(api_transport_send))
-        .route("/api/federation/status", get(api_federation_status))
         .route("/api/health", get(api_health))
         .route("/api/message-ledger", get(api_message_ledger))
         .route("/api/requests", get(api_requests))
         .route("/api/request", post(api_request_create))
         .route("/api/reply/:correlation_id", post(api_reply))
         .route("/api/identity", get(api_identity))
-        .route("/api/peers/discoveries", get(api_peers_discoveries))
-        .route("/api/peers/discovered", get(api_peers_discoveries))
         .route("/api/workspace/create", post(api_workspace_create))
         .route("/api/workspace/join", post(api_workspace_join))
         .route(
@@ -407,10 +404,6 @@ async fn api_transport_send(
     }
 }
 
-async fn api_federation_status() -> impl IntoResponse {
-    Json(json!({"localUrl": null, "localReachable": true, "peers": [], "totalPeers": 0, "reachablePeers": 0, "clockHealth": "ok"}))
-}
-
 async fn api_health() -> impl IntoResponse {
     Json(json!({"ok": true, "source": "maw-rs", "server": "local", "port": DEFAULT_SERVE_PORT}))
 }
@@ -451,10 +444,6 @@ async fn api_reply(
 async fn api_identity() -> impl IntoResponse {
     let config = load_hey_config();
     Json(json!({"ok": true, "node": config.node, "oracle": config.oracle, "agents": []}))
-}
-
-async fn api_peers_discoveries() -> impl IntoResponse {
-    Json(json!({"ok": true, "total": 0, "shown": 0, "filtered": 0, "peers": []}))
 }
 
 async fn api_workspace_create(

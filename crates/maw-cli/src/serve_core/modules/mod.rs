@@ -10,6 +10,7 @@
 
 pub mod agents;
 pub mod debug;
+pub mod federation;
 pub mod triggers;
 
 use super::{ServecoreLifecycle, ServecoreLifecycleModule};
@@ -49,6 +50,7 @@ where
     vec![
         agents::agents_registration(),
         debug::debug_registration(),
+        federation::federation_registration(),
         triggers::triggers_registration(),
     ]
 }
