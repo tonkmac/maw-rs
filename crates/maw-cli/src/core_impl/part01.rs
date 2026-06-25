@@ -223,8 +223,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "plugin-policy", handler: Handler::Sync(run_policy_plan) },
     DispatcherEntry { command: "split-policy", handler: Handler::Sync(run_split_policy_plan) },
     DispatcherEntry { command: "transport", handler: Handler::Sync(run_transport_plan) },
-    DispatcherEntry { command: "token", handler: Handler::Sync(run_token_command) },
-    DispatcherEntry { command: "tokens", handler: Handler::Sync(run_tokens_alias_command) },
     #[cfg(test)]
     DispatcherEntry { command: "__async-dispatch-test", handler: Handler::Async(run_async_dispatch_test) },
 ];
