@@ -63,6 +63,16 @@ fn channel_empty_repo(root: &Path) -> PathBuf {
     repo
 }
 
+fn channel_install_official_plugins(root: &Path) {
+    for provider in ["discord", "telegram", "imessage"] {
+        fs::create_dir_all(
+            root.join("home/.claude/plugins/cache/claude-plugins-official")
+                .join(provider),
+        )
+        .expect("plugin cache");
+    }
+}
+
 fn channel_command(root: &Path, cwd: &Path, args: &[&str]) -> Output {
     fs::create_dir_all(root.join("maw-home")).expect("maw home");
     fs::create_dir_all(root.join("maw-plugins")).expect("maw plugins");
@@ -75,6 +85,45 @@ fn channel_command(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("MAW_JS_REF_DIR", "/nonexistent")
         .output()
         .expect("run maw-rs")
+}
+
+fn channel_command_with_env(
+    root: &Path,
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(channel_bin());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", root.join("home"))
+        .env("MAW_HOME", root.join("maw-home"))
+        .env("MAW_PLUGINS_DIR", root.join("maw-plugins"))
+        .env("MAW_JS_REF_DIR", "/nonexistent");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run maw-rs")
+}
+
+fn channel_assert_golden_with_env(
+    root: &Path,
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    golden: &str,
+) {
+    let output = channel_command_with_env(root, cwd, args, envs);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert_eq!(stdout, golden);
+    assert!(!stdout.contains(SECRET_VALUE));
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
 }
 
 fn channel_assert_golden(root: &Path, cwd: &Path, args: &[&str], golden: &str) {
@@ -254,6 +303,205 @@ fn channel_add_repo_mode_writes_repo_config_and_gitignore_only() {
     assert!(!root
         .join("home/.claude/channels/hermes-discord/config.json")
         .exists());
+}
+
+#[test]
+fn channel_setup_discord_pass_matches_golden_and_preserves_valid_access() {
+    let root = channel_temp_dir("setup-discord");
+    let repo = channel_empty_repo(&root);
+    channel_install_official_plugins(&root);
+    let state = root.join("home/.claude/channels/hermes-discord");
+    fs::create_dir_all(&state).expect("state");
+    fs::write(
+        state.join("access.json"),
+        r#"{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["111111111111111111", "222222222222222222"],
+  "groups": {"humans":["111111111111111111"]},
+  "pending": {"keep":"human-approved"}
+}
+"#,
+    )
+    .expect("access");
+
+    channel_assert_golden_with_env(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-discord",
+            "discord",
+            "--pass",
+            "discord/hermes-token",
+            "--guild",
+            "999999999999999999",
+        ],
+        &[
+            (
+                "MAW_RS_CHANNEL_FAKE_PASS_TOKEN",
+                "MTIzNDU2Nzg5MDEyMzQ1Njc4.secret.tail",
+            ),
+            (
+                "MAW_RS_CHANNEL_FAKE_DISCORD_GUILDS",
+                "999999999999999999:Ops Guild;888888888888888888:Other Guild",
+            ),
+        ],
+        include_str!("fixtures/native-channel/channel-setup-discord.stdout"),
+    );
+    let access = fs::read_to_string(state.join("access.json")).expect("access after");
+    assert!(access.contains("111111111111111111"));
+    assert!(access.contains("human-approved"));
+    assert!(!access.contains("691531480689541170"));
+    let config = fs::read_to_string(state.join("config.json")).expect("config");
+    assert!(config.contains("pass:discord/hermes-token"));
+    assert!(config.contains("DISCORD_STATE_DIR"));
+}
+
+#[test]
+fn channel_setup_discord_wrong_guild_matches_maw_js_soft_parity_and_resets_malformed_access() {
+    let root = channel_temp_dir("setup-discord-wrong-guild");
+    let repo = channel_empty_repo(&root);
+    channel_install_official_plugins(&root);
+    let state = root.join("home/.claude/channels/hermes-discord");
+    fs::create_dir_all(&state).expect("state");
+    fs::write(state.join("access.json"), "not-json-secret-free").expect("malformed access");
+
+    channel_assert_golden_with_env(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-discord",
+            "discord",
+            "--pass",
+            "discord/hermes-token",
+            "--guild",
+            "777777777777777777",
+        ],
+        &[
+            (
+                "MAW_RS_CHANNEL_FAKE_PASS_TOKEN",
+                "MTIzNDU2Nzg5MDEyMzQ1Njc4.secret.tail",
+            ),
+            (
+                "MAW_RS_CHANNEL_FAKE_DISCORD_GUILDS",
+                "999999999999999999:Ops Guild",
+            ),
+        ],
+        include_str!("fixtures/native-channel/channel-setup-discord-wrong-guild.stdout"),
+    );
+    let access: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(state.join("access.json")).expect("access after reset"),
+    )
+    .expect("json");
+    assert_eq!(access["dmPolicy"], "allowlist");
+    assert_eq!(access["allowFrom"][0], "691531480689541170");
+    assert!(
+        fs::read_dir(state.join("archive"))
+            .expect("archive")
+            .count()
+            >= 1
+    );
+}
+
+#[test]
+fn channel_setup_telegram_pass_matches_golden_without_real_rest() {
+    let root = channel_temp_dir("setup-telegram");
+    let repo = channel_empty_repo(&root);
+    channel_install_official_plugins(&root);
+    channel_assert_golden_with_env(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-telegram",
+            "telegram",
+            "--pass",
+            "telegram/hermes-token",
+        ],
+        &[("MAW_RS_CHANNEL_FAKE_PASS_TOKEN", SECRET_VALUE)],
+        include_str!("fixtures/native-channel/channel-setup-telegram.stdout"),
+    );
+}
+
+#[test]
+fn channel_setup_imessage_matches_golden_with_fake_darwin() {
+    let root = channel_temp_dir("setup-imessage");
+    let repo = channel_empty_repo(&root);
+    channel_install_official_plugins(&root);
+    channel_assert_golden_with_env(
+        &root,
+        &repo,
+        &["channel", "setup", "hermes-imessage", "imessage"],
+        &[("MAW_RS_CHANNEL_FAKE_PLATFORM", "darwin")],
+        include_str!("fixtures/native-channel/channel-setup-imessage.stdout"),
+    );
+}
+
+#[test]
+fn channel_setup_github_is_plan_only_stub_no_external_tools() {
+    let root = channel_temp_dir("setup-github");
+    let repo = channel_empty_repo(&root);
+    channel_assert_golden(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-git",
+            "github:ARRA-01/claude-channel-relay",
+        ],
+        include_str!("fixtures/native-channel/channel-setup-github-stub.stdout"),
+    );
+    assert!(!root
+        .join("home/.claude/channels/hermes-git/config.json")
+        .exists());
+}
+
+#[test]
+fn channel_setup_secret_and_snowflake_guards_fail_before_io() {
+    let root = channel_temp_dir("setup-guards");
+    let repo = channel_empty_repo(&root);
+    channel_install_official_plugins(&root);
+    let output = channel_command_with_env(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-discord",
+            "discord",
+            "--pass",
+            "discord/hermes-token",
+        ],
+        &[("MAW_RS_CHANNEL_FAKE_PASS_TOKEN", "")],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("pass key 'discord/hermes-token' not found"));
+    assert!(!stdout.contains(SECRET_VALUE));
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+
+    for args in [
+        ["channel", "setup", "../secret", "discord"].as_slice(),
+        [
+            "channel",
+            "setup",
+            "hermes-discord",
+            "discord",
+            "--guild",
+            "abc",
+        ]
+        .as_slice(),
+        ["channel", "setup", "hermes-discord", "github:../bad"].as_slice(),
+        ["channel", "setup", "hermes-discord", "unknown"].as_slice(),
+    ] {
+        let output = channel_command(&root, &repo, args);
+        assert!(!output.status.success(), "args={args:?}");
+    }
 }
 
 #[test]
