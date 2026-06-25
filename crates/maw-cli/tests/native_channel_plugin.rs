@@ -57,6 +57,12 @@ fn channel_seed(root: &Path) -> PathBuf {
     repo
 }
 
+fn channel_empty_repo(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    repo
+}
+
 fn channel_command(root: &Path, cwd: &Path, args: &[&str]) -> Output {
     fs::create_dir_all(root.join("maw-home")).expect("maw home");
     fs::create_dir_all(root.join("maw-plugins")).expect("maw plugins");
@@ -139,27 +145,115 @@ fn channel_test_matches_committed_golden_without_real_discord_or_pass() {
 }
 
 #[test]
-fn channel_read_only_slice_rejects_mutations_before_writes() {
-    let root = channel_temp_dir("readonly");
-    let repo = channel_seed(&root);
-    let before = fs::read_to_string(root.join("home/.claude/channels/hermes-discord/config.json"))
-        .expect("before config");
+fn channel_add_and_rm_plugin_match_committed_goldens_and_archive_previous_config() {
+    let root = channel_temp_dir("add-rm");
+    let repo = channel_empty_repo(&root);
+    channel_assert_golden(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "add",
+            "hermes-discord",
+            "discord",
+            "--env",
+            "DISCORD_BOT_TOKEN=super-secret-channel-token",
+            "--pass",
+            "discord/hermes-token",
+        ],
+        include_str!("fixtures/native-channel/channel-add.stdout"),
+    );
+    let config_path = root.join("home/.claude/channels/hermes-discord/config.json");
+    let config = fs::read_to_string(&config_path).expect("config");
+    assert!(
+        config.contains(SECRET_VALUE),
+        "secret is stored only in hermetic temp config"
+    );
+
+    channel_assert_golden(
+        &root,
+        &repo,
+        &["channel", "rm", "hermes-discord", "discord"],
+        include_str!("fixtures/native-channel/channel-rm-plugin.stdout"),
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).expect("config after rm"))
+            .expect("json");
+    assert_eq!(after["plugins"].as_array().expect("plugins").len(), 0);
+    let archives = fs::read_dir(root.join("home/.claude/channels/hermes-discord/archive"))
+        .expect("archive dir")
+        .count();
+    assert!(archives >= 1, "rm preserves previous config in archive");
+}
+
+#[test]
+fn channel_add_multiple_then_rm_all_preserves_maw_js_no_confirm_parity() {
+    let root = channel_temp_dir("rm-all");
+    let repo = channel_empty_repo(&root);
+    channel_assert_golden(
+        &root,
+        &repo,
+        &["channel", "add", "hermes-discord", "fakechat"],
+        include_str!("fixtures/native-channel/channel-add-fakechat.stdout"),
+    );
+    channel_assert_golden(
+        &root,
+        &repo,
+        &["channel", "add", "hermes-discord", "telegram"],
+        include_str!("fixtures/native-channel/channel-add-telegram.stdout"),
+    );
+    channel_assert_golden(
+        &root,
+        &repo,
+        &["channel", "remove", "hermes-discord"],
+        include_str!("fixtures/native-channel/channel-rm-all.stdout"),
+    );
+    let after: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("home/.claude/channels/hermes-discord/config.json"))
+            .expect("config after rm all"),
+    )
+    .expect("json");
+    assert_eq!(after["plugins"].as_array().expect("plugins").len(), 0);
+}
+
+#[test]
+fn channel_add_repo_mode_writes_repo_config_and_gitignore_only() {
+    let root = channel_temp_dir("repo-mode");
+    let repo = channel_empty_repo(&root);
+    let repo_target = repo.join("repo-target");
+    fs::create_dir_all(&repo_target).expect("repo target");
 
     let output = channel_command(
         &root,
         &repo,
-        &["channel", "add", "hermes-discord", "discord"],
+        &[
+            "channel",
+            "add",
+            "hermes-discord",
+            "discord",
+            "--repo",
+            "repo-target",
+            "--env",
+            "DISCORD_BOT_TOKEN=super-secret-channel-token",
+        ],
     );
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)
-        .expect("stderr")
-        .contains("not part of read-only native slice"));
-    assert_eq!(
-        fs::read_to_string(root.join("home/.claude/channels/hermes-discord/config.json"))
-            .expect("after config"),
-        before
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("repo mode"));
+    assert!(!stdout.contains(SECRET_VALUE));
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+    assert!(repo_target.join(".claude/channel.json").exists());
+    assert!(fs::read_to_string(repo_target.join(".gitignore"))
+        .expect("gitignore")
+        .contains(".claude/.env"));
+    assert!(!root
+        .join("home/.claude/channels/hermes-discord/config.json")
+        .exists());
 }
 
 #[test]
@@ -172,6 +266,18 @@ fn channel_number_67_guards_reject_traversal_and_flag_values_before_io() {
         ["channel", "test", "-bad"].as_slice(),
         ["channel", "ls", "hermes/discord"].as_slice(),
         ["channel", "providers", "extra"].as_slice(),
+        ["channel", "add", "-bad", "discord"].as_slice(),
+        ["channel", "add", "hermes-discord", "../discord"].as_slice(),
+        [
+            "channel",
+            "add",
+            "hermes-discord",
+            "discord",
+            "--repo",
+            "../repo",
+        ]
+        .as_slice(),
+        ["channel", "rm", "hermes/discord"].as_slice(),
     ] {
         let output = channel_command(&root, &repo, args);
         assert!(!output.status.success(), "args={args:?}");
