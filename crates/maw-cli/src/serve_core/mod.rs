@@ -22,6 +22,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -40,6 +41,7 @@ const SERVECORE_PIPELINE_ORDER: &[&str] = &[
     "fallback-views",
 ];
 static SERVECORE_WS_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+const SERVECORE_ORCHESTRATION_BODY_LIMIT: usize = 64 * 1024;
 
 pub trait ServecoreEngine: Send + Sync {
     fn servecore_engine_name(&self) -> &'static str;
@@ -92,6 +94,7 @@ pub struct ServecoreSharedState {
     pub engine: Arc<dyn ServecoreEngine>,
     pub trigger_bus: ServecoreTriggerBus,
     pub thread_store: ServecoreThreadStore,
+    pub orchestrator: Arc<dyn ServecoreOrchestrator>,
     pub lifecycle: ServecoreLifecycle,
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
     pub agents_node: Option<String>,
@@ -108,6 +111,7 @@ impl Default for ServecoreSharedState {
             engine: Arc::new(ServecoreStubEngine),
             trigger_bus: ServecoreTriggerBus::default(),
             thread_store: ServecoreThreadStore::servecore_default(),
+            orchestrator: Arc::new(ServecoreCommandOrchestrator::servecore_default()),
             lifecycle: ServecoreLifecycle::default(),
             hub_workspaces: Arc::new(Vec::new()),
             agents_node: None,
@@ -154,6 +158,15 @@ impl ServecoreSharedState {
     #[must_use]
     pub fn servecore_with_thread_store(mut self, thread_store: ServecoreThreadStore) -> Self {
         self.thread_store = thread_store;
+        self
+    }
+
+    #[must_use]
+    pub fn servecore_with_orchestrator(
+        mut self,
+        orchestrator: Arc<dyn ServecoreOrchestrator>,
+    ) -> Self {
+        self.orchestrator = orchestrator;
         self
     }
 
@@ -228,6 +241,243 @@ impl ServecoreTriggerBus {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.iter().cloned().collect()
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServecoreWorkonRequest {
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, rename = "with")]
+    pub with_oracles: Vec<String>,
+    #[serde(default)]
+    pub attach: bool,
+    #[serde(default)]
+    pub split: bool,
+    #[serde(default)]
+    pub tiled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServecoreWorkonHandle {
+    pub ok: bool,
+    pub repo: String,
+    pub cwd: String,
+    pub engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub argv: Vec<String>,
+    pub status: String,
+}
+
+pub trait ServecoreOrchestrator: Send + Sync {
+    /// Spawn a native workon orchestration using argv vectors only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request validation fails, the repo escapes the configured
+    /// root, or the child process exits unsuccessfully.
+    fn spawn_workon(
+        &self,
+        request: ServecoreWorkonRequest,
+        engine: Arc<dyn ServecoreEngine>,
+    ) -> Result<ServecoreWorkonHandle, String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct ServecoreCommandOrchestrator {
+    root: Arc<PathBuf>,
+}
+
+impl ServecoreCommandOrchestrator {
+    #[must_use]
+    pub fn servecore_default() -> Self {
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::servecore_with_root(root)
+    }
+
+    #[must_use]
+    pub fn servecore_with_root(root: PathBuf) -> Self {
+        Self {
+            root: Arc::new(root),
+        }
+    }
+}
+
+impl ServecoreOrchestrator for ServecoreCommandOrchestrator {
+    fn spawn_workon(
+        &self,
+        request: ServecoreWorkonRequest,
+        engine: Arc<dyn ServecoreEngine>,
+    ) -> Result<ServecoreWorkonHandle, String> {
+        let plan = servecore_prepare_workon(&self.root, request, engine.servecore_engine_name())?;
+        let output = Command::new("maw")
+            .args(&plan.argv)
+            .current_dir(&plan.repo_path)
+            .output()
+            .map_err(|error| format!("serve-orchestration: spawn failed: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let trimmed = stderr.trim();
+            return Err(if trimmed.is_empty() {
+                "serve-orchestration: workon failed".to_owned()
+            } else {
+                format!("serve-orchestration: workon failed: {trimmed}")
+            });
+        }
+        Ok(plan.into_handle("spawned"))
+    }
+}
+
+struct ServecorePreparedWorkon {
+    request: ServecoreWorkonRequest,
+    repo_path: PathBuf,
+    engine: String,
+    argv: Vec<String>,
+}
+
+impl ServecorePreparedWorkon {
+    fn into_handle(self, status: &str) -> ServecoreWorkonHandle {
+        ServecoreWorkonHandle {
+            ok: true,
+            repo: self.request.repo,
+            cwd: self.repo_path.to_string_lossy().into_owned(),
+            engine: self.engine,
+            target: self.request.target,
+            argv: self.argv,
+            status: status.to_owned(),
+        }
+    }
+}
+
+fn servecore_prepare_workon(
+    root: &Path,
+    request: ServecoreWorkonRequest,
+    default_engine: &str,
+) -> Result<ServecorePreparedWorkon, String> {
+    servecore_validate_path_text(&request.repo, "repo")?;
+    if let Some(task) = &request.task {
+        servecore_validate_engine_token(task, "task")?;
+    }
+    if let Some(target) = &request.target {
+        servecore_validate_engine_token(target, "target")?;
+    }
+    if let Some(prompt) = &request.prompt {
+        servecore_validate_prompt_text(prompt)?;
+    }
+    for oracle in &request.with_oracles {
+        servecore_validate_engine_token(oracle, "with")?;
+    }
+    let engine = request
+        .engine
+        .clone()
+        .unwrap_or_else(|| default_engine.to_owned());
+    servecore_validate_engine_token(&engine, "engine")?;
+    let repo_path = servecore_resolve_workon_repo(root, &request.repo)?;
+    let mut argv = vec!["workon".to_owned(), request.repo.clone()];
+    if let Some(task) = &request.task {
+        argv.push(task.clone());
+    }
+    argv.extend(["--layout".to_owned(), "nested".to_owned()]);
+    Ok(ServecorePreparedWorkon {
+        request,
+        repo_path,
+        engine,
+        argv,
+    })
+}
+
+fn servecore_resolve_workon_repo(root: &Path, repo: &str) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("serve-orchestration: root invalid: {error}"))?;
+    let direct = PathBuf::from(repo);
+    let first = if direct.is_absolute() {
+        direct
+    } else {
+        root.join(repo)
+    };
+    if first.exists() {
+        return servecore_worktree_inside_root(&root, &first);
+    }
+    let Some(found) = servecore_find_repo_under_root(&root, repo, 5) else {
+        return Err("serve-orchestration: repo not found under root".to_owned());
+    };
+    servecore_worktree_inside_root(&root, &found)
+}
+
+fn servecore_find_repo_under_root(root: &Path, repo: &str, max_depth: usize) -> Option<PathBuf> {
+    fn walk(root: &Path, repo: &Path, depth: usize, max_depth: usize) -> Option<PathBuf> {
+        if depth > max_depth {
+            return None;
+        }
+        let entries = fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.ends_with(repo) {
+                return Some(path);
+            }
+            if path.is_dir() {
+                if let Some(found) = walk(&path, repo, depth + 1, max_depth) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(root, Path::new(repo), 0, max_depth)
+}
+
+fn servecore_worktree_inside_root(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("serve-orchestration: repo invalid: {error}"))?;
+    if !canonical.starts_with(root) {
+        return Err("serve-orchestration: repo escapes root".to_owned());
+    }
+    Ok(canonical)
+}
+
+fn servecore_validate_path_text(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value || value.starts_with('-') || value == "--" {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    if value.chars().any(|ch| ch.is_control() || ch == '\0') {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    if Path::new(value)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    Ok(())
+}
+
+fn servecore_validate_engine_token(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value || value.starts_with('-') || value == "--" {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\0')
+    {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    Ok(())
+}
+
+fn servecore_validate_prompt_text(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.chars().any(|ch| ch.is_control() || ch == '\0') {
+        return Err("serve-orchestration prompt must be safe".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -712,6 +962,10 @@ where
 {
     router
         .route("/api/serve-core/pipeline", get(servecore_pipeline_handler))
+        .route(
+            "/api/orchestration/workon",
+            post(servecore_orchestration_workon),
+        )
         .route("/api/triggers/fire", post(servecore_protected_stub))
         .route("/api/plugins/*plugin_path", post(servecore_protected_stub))
 }
@@ -950,6 +1204,29 @@ fn servecore_api_auth_path(path: &str) -> String {
 
 async fn servecore_pipeline_handler() -> impl IntoResponse {
     Json(json!({"pipeline": servecore_pipeline_order()}))
+}
+
+async fn servecore_orchestration_workon(req: Request<Body>) -> Response {
+    let Some(state) = req.extensions().get::<Arc<ServecoreSharedState>>().cloned() else {
+        return servecore_bad_request("missing-state");
+    };
+    let Ok(body) = to_bytes(req.into_body(), SERVECORE_ORCHESTRATION_BODY_LIMIT).await else {
+        return servecore_bad_request("body-too-large");
+    };
+    let Ok(payload) = serde_json::from_slice::<ServecoreWorkonRequest>(&body) else {
+        return servecore_bad_request("body must be valid json");
+    };
+    match state
+        .orchestrator
+        .spawn_workon(payload, state.engine.clone())
+    {
+        Ok(handle) => Json(handle).into_response(),
+        Err(error) => servecore_bad_request(&error),
+    }
+}
+
+fn servecore_bad_request(reason: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
 }
 
 async fn servecore_protected_stub() -> impl IntoResponse {
@@ -1219,6 +1496,85 @@ mod tests {
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::sync::oneshot;
     use tower::ServiceExt;
+
+    #[derive(Default)]
+    struct FakeOrchestrator {
+        calls: Mutex<Vec<ServecoreWorkonRequest>>,
+    }
+
+    impl ServecoreOrchestrator for FakeOrchestrator {
+        fn spawn_workon(
+            &self,
+            request: ServecoreWorkonRequest,
+            engine: Arc<dyn ServecoreEngine>,
+        ) -> Result<ServecoreWorkonHandle, String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            Ok(ServecoreWorkonHandle {
+                ok: true,
+                repo: request.repo,
+                cwd: "/tmp/fake-worktree".to_owned(),
+                engine: request
+                    .engine
+                    .unwrap_or_else(|| engine.servecore_engine_name().to_owned()),
+                target: request.target,
+                argv: vec!["workon".to_owned(), "demo".to_owned()],
+                status: "fake-spawned".to_owned(),
+            })
+        }
+    }
+
+    fn servecore_test_root(name: &str) -> PathBuf {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        root.push(format!(
+            "maw-rs-core-orchestrator-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        root
+    }
+
+    #[test]
+    fn servecore_orchestrator_validates_engine_and_repo_bounds() {
+        let root = servecore_test_root("bounds");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let valid = ServecoreWorkonRequest {
+            repo: "acme/demo".to_owned(),
+            task: Some("feat-219".to_owned()),
+            engine: Some("codex-anything".to_owned()),
+            target: Some("nova:1".to_owned()),
+            prompt: Some("ship it".to_owned()),
+            with_oracles: vec!["wish".to_owned()],
+            attach: true,
+            split: true,
+            tiled: false,
+        };
+        let plan = servecore_prepare_workon(&root, valid, "stub").expect("plan");
+        assert_eq!(plan.engine, "codex-anything");
+        assert_eq!(
+            plan.argv,
+            vec!["workon", "acme/demo", "feat-219", "--layout", "nested"]
+        );
+        assert_eq!(plan.repo_path, repo.canonicalize().expect("canon"));
+
+        let bad_engine = ServecoreWorkonRequest {
+            repo: "acme/demo".to_owned(),
+            engine: Some("-shell".to_owned()),
+            ..ServecoreWorkonRequest::default()
+        };
+        assert!(servecore_prepare_workon(&root, bad_engine, "stub").is_err());
+
+        let escaped = ServecoreWorkonRequest {
+            repo: "../demo".to_owned(),
+            ..ServecoreWorkonRequest::default()
+        };
+        assert!(servecore_prepare_workon(&root, escaped, "stub").is_err());
+    }
 
     async fn servecore_spawn_test_server() -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1522,6 +1878,38 @@ mod tests {
             pins.pinned("mawjs:m5"),
             Some("79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664")
         );
+    }
+
+    #[tokio::test]
+    async fn servecore_orchestration_workon_is_auth_gated_and_loopback_can_spawn_fake() {
+        let peer = SocketAddr::from(([198, 51, 100, 10], 49_152));
+        let payload = r#"{"repo":"demo","engine":"any-engine","target":"nova:1"}"#;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/orchestration/workon")
+            .body(Body::from(payload))
+            .expect("request");
+        let response = servecore_auth_request(ServecoreSharedState::default(), request, peer).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let orchestrator = Arc::new(FakeOrchestrator::default());
+        let state =
+            ServecoreSharedState::default().servecore_with_orchestrator(orchestrator.clone());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/orchestration/workon")
+            .body(Body::from(payload))
+            .expect("request");
+        let response =
+            servecore_auth_request(state, request, SocketAddr::from(([127, 0, 0, 1], 49_152)))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = orchestrator
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].engine.as_deref(), Some("any-engine"));
     }
 
     #[tokio::test]
