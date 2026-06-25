@@ -1,7 +1,13 @@
 use super::ServecoreModuleRegistration;
 use crate::serve_core::ServecoreLifecycleModule;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
-use serde::Serialize;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
@@ -36,7 +42,9 @@ where
 }
 
 fn worktrees_router() -> Router<Arc<WorktreesModuleState>> {
-    Router::new().route("/api/worktrees", get(worktrees_get))
+    Router::new()
+        .route("/api/worktrees", get(worktrees_get))
+        .route("/api/worktrees/cleanup", post(worktrees_cleanup))
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +67,70 @@ async fn worktrees_get(State(state): State<Arc<WorktreesModuleState>>) -> impl I
         )
             .into_response(),
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WorktreesCleanupRequest {
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WorktreesCleanupResponse {
+    ok: bool,
+    path: String,
+    log: Vec<String>,
+}
+
+async fn worktrees_cleanup(
+    State(state): State<Arc<WorktreesModuleState>>,
+    Json(body): Json<WorktreesCleanupRequest>,
+) -> impl IntoResponse {
+    match worktrees_cleanup_live(&state.root, Path::new(&body.path)) {
+        Ok(response) => Json(response).into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response(),
+    }
+}
+
+fn worktrees_cleanup_live(root: &Path, path: &Path) -> Result<WorktreesCleanupResponse, String> {
+    let target = worktrees_validate_cleanup_path(path, root)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("worktree")
+        .arg("remove")
+        .arg("--")
+        .arg(&target)
+        .output()
+        .map_err(|error| format!("serve-worktrees: git worktree remove: {error}"))?;
+    if !output.status.success() {
+        let message = worktrees_stderr_message(&output.stderr);
+        return Err(format!(
+            "serve-worktrees: git worktree remove failed{message}"
+        ));
+    }
+    Ok(WorktreesCleanupResponse {
+        ok: true,
+        path: target.to_string_lossy().into_owned(),
+        log: worktrees_cleanup_log(&output.stdout, &output.stderr),
+    })
+}
+
+fn worktrees_stderr_message(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(": {trimmed}")
+    }
+}
+
+fn worktrees_cleanup_log(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+    [stdout, stderr]
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -211,7 +283,6 @@ fn worktrees_valid_text(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-#[cfg(test)]
 fn worktrees_validate_cleanup_path(path: &Path, root: &Path) -> Result<PathBuf, String> {
     let raw = path.to_string_lossy();
     if raw.is_empty() || raw.contains('\0') || raw.contains('\n') || raw.contains('\r') {
@@ -219,7 +290,7 @@ fn worktrees_validate_cleanup_path(path: &Path, root: &Path) -> Result<PathBuf, 
     }
     if raw
         .split('/')
-        .any(|segment| segment == "--" || segment.starts_with('-'))
+        .any(|segment| segment == ".." || segment == "--" || segment.starts_with('-'))
     {
         return Err("serve-worktrees: cleanup path segment is rejected".to_owned());
     }
@@ -230,10 +301,22 @@ fn worktrees_validate_cleanup_path(path: &Path, root: &Path) -> Result<PathBuf, 
         .canonicalize()
         .map_err(|error| format!("serve-worktrees: cleanup root: {error}"))?;
     let allowed_root = canonical_root.parent().unwrap_or(&canonical_root);
-    if !canonical.starts_with(allowed_root) || !canonical.join(".git").exists() {
+    if !canonical.starts_with(allowed_root)
+        || canonical == canonical_root
+        || !canonical.join(".git").exists()
+        || !worktrees_registered_target(root, &canonical)?
+    {
         return Err("serve-worktrees: cleanup target must be a git worktree near root".to_owned());
     }
     Ok(canonical)
+}
+
+fn worktrees_registered_target(root: &Path, target: &Path) -> Result<bool, String> {
+    let output = worktrees_git(root, &["worktree", "list", "--porcelain"])?;
+    Ok(worktrees_parse_porcelain(&output)
+        .into_iter()
+        .map(|entry| worktrees_canonical_or_original(&entry.path))
+        .any(|path| path == target))
 }
 
 #[cfg(test)]
@@ -241,6 +324,7 @@ mod tests {
     use super::*;
     use crate::serve_core::{
         modules::servecore_mount_modules, servecore_apply_pipeline, servecore_mount_core_routes,
+        servecore_with_shared_state, ServecoreSharedState,
     };
     use axum::http::StatusCode;
     use std::{
@@ -339,10 +423,104 @@ mod tests {
         assert!(valid.ends_with("main.wt-feature"));
         let rejected = worktrees_validate_cleanup_path(Path::new("--bad"), &root).expect_err("bad");
         assert!(rejected.contains("rejected"));
+        let traversal = root.join("../main.wt-feature");
+        let traversal_error =
+            worktrees_validate_cleanup_path(&traversal, &root).expect_err("traversal");
+        assert!(traversal_error.contains("segment"));
+        let main_error = worktrees_validate_cleanup_path(&root, &root).expect_err("main");
+        assert!(main_error.contains("git worktree near root"));
         let outside = worktrees_temp("outside");
         assert!(worktrees_validate_cleanup_path(&outside, &root).is_err());
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    fn worktrees_signed_post(
+        client: &reqwest::Client,
+        addr: std::net::SocketAddr,
+        body: String,
+    ) -> reqwest::RequestBuilder {
+        const KEY: &str = "worktrees-test-secret";
+        const NOW: i64 = 1_700_000_000;
+        let headers = maw_auth::sign_headers_v3_at(
+            KEY,
+            "gm-bo:test",
+            "POST",
+            "/worktrees/cleanup",
+            Some(body.as_bytes()),
+            NOW,
+        )
+        .expect("headers");
+        let mut request = client
+            .post(format!("http://{addr}/api/worktrees/cleanup"))
+            .header("content-type", "application/json")
+            .body(body);
+        for (name, value) in headers.to_btree_map() {
+            request = request.header(name.as_str(), value);
+        }
+        request
+    }
+
+    async fn worktrees_spawn_authed_module(root: &Path) -> std::net::SocketAddr {
+        const KEY: &str = "worktrees-test-secret";
+        const NOW: i64 = 1_700_000_000;
+        let router: Router<()> = worktrees_router().with_state(Arc::new(WorktreesModuleState {
+            root: root.to_path_buf(),
+        }));
+        let state = ServecoreSharedState::default()
+            .servecore_with_auth(Some(KEY.to_owned()), None)
+            .servecore_with_auth_now(NOW);
+        worktrees_spawn_router_with_shared_state(router, state).await
+    }
+
+    async fn worktrees_spawn_router_with_shared_state(
+        router: Router<()>,
+        state: ServecoreSharedState,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = servecore_with_shared_state(servecore_apply_pipeline(router), state);
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = rx.await;
+            });
+            server.await.expect("server");
+        });
+        std::mem::forget(tx);
+        addr
+    }
+
+    #[tokio::test]
+    async fn worktrees_cleanup_live_removes_only_signed_valid_worktree() {
+        let (root, wt) = worktrees_seed_repo();
+        let addr = worktrees_spawn_authed_module(&root).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let bad_body =
+            json!({"path": root.join("../main.wt-feature").to_string_lossy()}).to_string();
+        let bad = worktrees_signed_post(&client, addr, bad_body)
+            .send()
+            .await
+            .expect("bad cleanup");
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(wt.exists());
+        let body = json!({"path": wt.to_string_lossy()}).to_string();
+        let cleanup = worktrees_signed_post(&client, addr, body)
+            .send()
+            .await
+            .expect("cleanup");
+        assert_eq!(cleanup.status(), StatusCode::OK);
+        let payload = cleanup.json::<serde_json::Value>().await.expect("json");
+        assert_eq!(payload["ok"], true);
+        assert!(!wt.exists(), "validated worktree should be removed");
+        let list = worktrees_git(&root, &["worktree", "list", "--porcelain"]).expect("list");
+        assert!(!list.contains("main.wt-feature"), "{list}");
+        let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
 
     #[tokio::test]

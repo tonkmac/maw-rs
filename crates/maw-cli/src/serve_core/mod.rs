@@ -360,7 +360,6 @@ where
     router
         .route("/api/serve-core/pipeline", get(servecore_pipeline_handler))
         .route("/api/triggers/fire", post(servecore_protected_stub))
-        .route("/api/worktrees/cleanup", post(servecore_protected_stub))
         .route("/api/plugins/*plugin_path", post(servecore_protected_stub))
 }
 
@@ -972,12 +971,6 @@ mod tests {
             .await
             .expect("plugins");
         assert_eq!(plugins.status(), StatusCode::OK);
-        let cleanup = client
-            .post(format!("http://{addr}/api/worktrees/cleanup"))
-            .send()
-            .await
-            .expect("cleanup");
-        assert_eq!(cleanup.status(), StatusCode::OK);
         let public = client
             .get(format!("http://{addr}/api/serve-core/pipeline"))
             .send()
