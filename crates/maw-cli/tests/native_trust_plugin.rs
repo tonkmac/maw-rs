@@ -73,23 +73,77 @@ fn trust_native_lists_seeded_fake_store_only() {
 }
 
 #[test]
-fn trust_native_add_and_remove_are_plan_only_stubs() {
-    let root = trust_temp("plan");
+fn trust_native_add_list_and_revoke_mutate_fake_store_live_without_key_echo() {
+    let root = trust_temp("live");
     let fake_store = root.join("fake-trust.json");
+    let peer_key = "ed25519:integration-secret-peer-key";
     trust_write(
         &fake_store,
         r#"[{"sender":"alpha","target":"beta","addedAt":"2026-06-09T00:00:00.000Z"}]"#,
     );
-    let add = trust_command(&root)
+
+    let missing_key = trust_command(&root)
         .env("MAW_RS_TRUST_FAKE_STORE", &fake_store)
         .args(["trust", "add", "gamma", "delta"])
         .output()
+        .expect("run trust add without key");
+    assert!(!missing_key.status.success());
+    assert!(String::from_utf8(missing_key.stderr)
+        .expect("missing key stderr")
+        .contains("expected --peer-key"));
+
+    let add = trust_command(&root)
+        .env("MAW_RS_TRUST_FAKE_STORE", &fake_store)
+        .args(["trust", "add", "gamma", "delta", "--peer-key", peer_key])
+        .output()
         .expect("run trust add");
-    assert!(add.status.success());
+    assert!(
+        add.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&add.stderr)
+    );
     let add_stdout = String::from_utf8(add.stdout).expect("add stdout");
     let add_stderr = String::from_utf8(add.stderr).expect("add stderr");
-    assert!(add_stdout.contains("plan: would trust"), "{add_stdout}");
-    assert!(add_stderr.contains("TODO(#115)"), "{add_stderr}");
+    assert!(add_stdout.contains("trusted:"), "{add_stdout}");
+    assert!(add_stdout.contains("redacted"), "{add_stdout}");
+    assert!(!add_stdout.contains(peer_key), "{add_stdout}");
+    assert!(!add_stderr.contains(peer_key), "{add_stderr}");
+    let body = std::fs::read_to_string(&fake_store).expect("fake store after add");
+    assert!(body.contains(peer_key), "{body}");
+
+    let list = trust_command(&root)
+        .env("MAW_RS_TRUST_FAKE_STORE", &fake_store)
+        .args(["trust", "list"])
+        .output()
+        .expect("run trust list");
+    assert!(list.status.success());
+    let list_stdout = String::from_utf8(list.stdout).expect("list stdout");
+    assert!(list_stdout.contains("gamma ↔ delta"), "{list_stdout}");
+    assert!(list_stdout.contains("redacted"), "{list_stdout}");
+    assert!(!list_stdout.contains(peer_key), "{list_stdout}");
+
+    let mismatch = trust_command(&root)
+        .env("MAW_RS_TRUST_FAKE_STORE", &fake_store)
+        .args([
+            "trust",
+            "pin",
+            "delta",
+            "gamma",
+            "--peer-key",
+            "ed25519:different-secret-peer-key",
+        ])
+        .output()
+        .expect("run trust mismatch");
+    assert!(!mismatch.status.success());
+    let mismatch_stderr = String::from_utf8(mismatch.stderr).expect("mismatch stderr");
+    assert!(
+        mismatch_stderr.contains("peer-key mismatch"),
+        "{mismatch_stderr}"
+    );
+    assert!(
+        !mismatch_stderr.contains("different-secret-peer-key"),
+        "{mismatch_stderr}"
+    );
 
     let no_yes = trust_command(&root)
         .env("MAW_RS_TRUST_FAKE_STORE", &fake_store)
@@ -106,12 +160,17 @@ fn trust_native_add_and_remove_are_plan_only_stubs() {
         .args(["trust", "remove", "beta", "alpha", "--yes"])
         .output()
         .expect("run trust remove yes");
-    assert!(remove.status.success());
+    assert!(
+        remove.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
     assert!(String::from_utf8(remove.stdout)
         .expect("remove stdout")
-        .contains("plan: would remove"));
-    let body = std::fs::read_to_string(&fake_store).expect("fake store unchanged");
-    assert!(body.contains("alpha"));
+        .contains("removed trust relationship"));
+    let body = std::fs::read_to_string(&fake_store).expect("fake store after remove");
+    assert!(!body.contains("alpha"), "{body}");
+    assert!(body.contains(peer_key), "{body}");
     assert!(root.join("home/.maw/state/trust.json").read_dir().is_err());
     let _ = std::fs::remove_dir_all(root);
 }

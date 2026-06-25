@@ -9,9 +9,8 @@ const DISPATCH_98: &[DispatcherEntry] = &[
     },
 ];
 
-const TRUST_USAGE: &str = "usage: maw trust <list|add|remove> [...]\n  list                            — list all trust entries (sorted by addedAt)\n  add      <sender> <target>      — plan adding a trust relationship (no store write)\n  remove   <sender> <target> [--yes]\n                                  — plan removing a trust relationship (confirms unless --yes)\n\nstorage: plan-only; native trust-store writes are stubbed pending design";
+const TRUST_USAGE: &str = "usage: maw trust <list|add|pin|trust|remove|revoke> [...]\n  list                                      — list all trust entries (sorted by addedAt)\n  add|pin|trust <sender> <target> --peer-key <key>\n                                            — trust/pin a peer key (explicit human step)\n  remove|revoke <sender> <target> [--yes]  — revoke a trust relationship\n\nstorage: live native trust-store; writes use tmp+rename and never echo peer keys";
 const TRUST_FAKE_STORE_ENV: &str = "MAW_RS_TRUST_FAKE_STORE";
-const TRUST_STUB_WARNING: &str = "warn: trust native store mutation is plan-only pending native trust-store design; TODO(#115)\n";
 const TRUST_AUTO_REFUSE: &str =
     "trust: consent mutation requires explicit human flow; no auto-trust surface is exposed";
 const TRUST_AUTO_BLOCKLIST: &[&str] = &[
@@ -29,11 +28,21 @@ const TRUST_AUTO_BLOCKLIST: &[&str] = &[
     "allowlist-all",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct TrustEntryPlan {
     sender: String,
     target: String,
+    #[serde(rename = "peerKey", skip_serializing_if = "Option::is_none")]
+    peer_key: Option<String>,
+    #[serde(rename = "addedAt")]
     added_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustWriteOutcome {
+    Added,
+    AlreadyTrusted,
+    UpdatedPin,
 }
 
 fn trust_run_command(argv: &[String]) -> CliOutput {
@@ -57,10 +66,10 @@ fn trust_parse_command(argv: &[String]) -> Result<TrustCommandPlan, String> {
     }
     match subcommand.as_str() {
         "list" | "ls" => trust_parse_list(argv),
-        "add" => trust_parse_add(argv),
-        "remove" | "rm" | "delete" => trust_parse_remove(argv),
+        "add" | "pin" | "trust" => trust_parse_add(argv),
+        "remove" | "rm" | "delete" | "revoke" => trust_parse_remove(argv),
         _ => Err(format!(
-            "maw trust: unknown subcommand \"{subcommand}\" (expected list|add|remove)"
+            "maw trust: unknown subcommand \"{subcommand}\" (expected list|add|pin|trust|remove|revoke)"
         )),
     }
 }
@@ -68,7 +77,11 @@ fn trust_parse_command(argv: &[String]) -> Result<TrustCommandPlan, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrustCommandPlan {
     List,
-    Add { sender: String, target: String },
+    Add {
+        sender: String,
+        target: String,
+        peer_key: String,
+    },
     Remove {
         sender: String,
         target: String,
@@ -85,13 +98,50 @@ fn trust_parse_list(argv: &[String]) -> Result<TrustCommandPlan, String> {
 }
 
 fn trust_parse_add(argv: &[String]) -> Result<TrustCommandPlan, String> {
-    if argv.len() != 3 {
-        return Err("trust add: expected <sender> <target>".to_owned());
+    if argv.len() < 3 {
+        return Err("trust add: expected <sender> <target> --peer-key <key>".to_owned());
     }
     let sender = trust_validate_actor("sender", &argv[1])?;
     let target = trust_validate_actor("target", &argv[2])?;
     trust_validate_not_self(&sender, &target)?;
-    Ok(TrustCommandPlan::Add { sender, target })
+    if argv.len() < 5 {
+        return Err("trust add: expected --peer-key <key>".to_owned());
+    }
+    let peer_key = trust_parse_peer_key_flag(&argv[3..])?;
+    Ok(TrustCommandPlan::Add {
+        sender,
+        target,
+        peer_key,
+    })
+}
+
+fn trust_parse_peer_key_flag(argv: &[String]) -> Result<String, String> {
+    let mut peer_key = None;
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if arg == "--peer-key" || arg == "--pubkey" || arg == "--key" {
+            let Some(value) = argv.get(index + 1) else {
+                return Err("trust add: missing peer-key value".to_owned());
+            };
+            peer_key = Some(trust_validate_peer_key(value)?);
+            index += 2;
+        } else if let Some(value) = arg.strip_prefix("--peer-key=") {
+            peer_key = Some(trust_validate_peer_key(value)?);
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--pubkey=") {
+            peer_key = Some(trust_validate_peer_key(value)?);
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--key=") {
+            peer_key = Some(trust_validate_peer_key(value)?);
+            index += 1;
+        } else if arg.starts_with('-') {
+            return Err("trust add: unknown flag".to_owned());
+        } else {
+            return Err("trust add: unexpected argument".to_owned());
+        }
+    }
+    peer_key.ok_or_else(|| "trust add: expected --peer-key <key>".to_owned())
 }
 
 fn trust_parse_remove(argv: &[String]) -> Result<TrustCommandPlan, String> {
@@ -114,8 +164,15 @@ fn trust_parse_remove(argv: &[String]) -> Result<TrustCommandPlan, String> {
 
 fn trust_execute_command(command: &TrustCommandPlan) -> CliOutput {
     match command {
-        TrustCommandPlan::List => trust_ok(&trust_format_list(&trust_load_fake_entries())),
-        TrustCommandPlan::Add { sender, target } => trust_execute_add(sender, target),
+        TrustCommandPlan::List => match trust_read_store(&trust_store_path()) {
+            Ok(entries) => trust_ok(&trust_format_list(&entries)),
+            Err(message) => trust_error(&message),
+        },
+        TrustCommandPlan::Add {
+            sender,
+            target,
+            peer_key,
+        } => trust_execute_add(sender, target, peer_key),
         TrustCommandPlan::Remove {
             sender,
             target,
@@ -124,18 +181,15 @@ fn trust_execute_command(command: &TrustCommandPlan) -> CliOutput {
     }
 }
 
-fn trust_execute_add(sender: &str, target: &str) -> CliOutput {
-    let entries = trust_load_fake_entries();
-    if let Some(entry) = trust_find_entry(&entries, sender, target) {
-        return trust_ok(&format!(
-            "already trusted: \"{}\" ↔ \"{}\" (added {})",
-            entry.sender, entry.target, entry.added_at
-        ));
-    }
-    CliOutput {
-        code: 0,
-        stdout: format!("plan: would trust \"{sender}\" ↔ \"{target}\"\n"),
-        stderr: TRUST_STUB_WARNING.to_owned(),
+fn trust_execute_add(sender: &str, target: &str, peer_key: &str) -> CliOutput {
+    match trust_store_add(&trust_store_path(), sender, target, peer_key, trust_now_ms()) {
+        Ok(TrustWriteOutcome::Added | TrustWriteOutcome::UpdatedPin) => trust_ok(&format!(
+            "trusted: \"{sender}\" ↔ \"{target}\" (peer key received redacted)"
+        )),
+        Ok(TrustWriteOutcome::AlreadyTrusted) => trust_ok(&format!(
+            "already trusted: \"{sender}\" ↔ \"{target}\" (peer key matched redacted)"
+        )),
+        Err(message) => trust_error(&message),
     }
 }
 
@@ -149,15 +203,136 @@ fn trust_execute_remove(sender: &str, target: &str, yes: bool) -> CliOutput {
             ),
         };
     }
-    let entries = trust_load_fake_entries();
-    if trust_find_entry(&entries, sender, target).is_none() {
-        return trust_error("trust remove: no entry found for requested sender/target");
+    match trust_store_remove(&trust_store_path(), sender, target) {
+        Ok(true) => trust_ok(&format!("removed trust relationship \"{sender}\" ↔ \"{target}\"")),
+        Ok(false) => trust_error("trust remove: no entry found for requested sender/target"),
+        Err(message) => trust_error(&message),
     }
-    CliOutput {
-        code: 0,
-        stdout: format!("plan: would remove trust relationship \"{sender}\" ↔ \"{target}\"\n"),
-        stderr: TRUST_STUB_WARNING.to_owned(),
+}
+
+fn trust_store_add(
+    path: &Path,
+    sender: &str,
+    target: &str,
+    peer_key: &str,
+    now_ms: i64,
+) -> Result<TrustWriteOutcome, String> {
+    let sender = trust_validate_actor("sender", sender)?;
+    let target = trust_validate_actor("target", target)?;
+    trust_validate_not_self(&sender, &target)?;
+    let peer_key = trust_validate_peer_key(peer_key)?;
+    let mut entries = trust_read_store(path)?;
+    let outcome = trust_upsert_entry(&mut entries, &sender, &target, &peer_key, now_ms)?;
+    trust_write_store_atomic(path, &entries)?;
+    Ok(outcome)
+}
+
+fn trust_store_remove(path: &Path, sender: &str, target: &str) -> Result<bool, String> {
+    let sender = trust_validate_actor("sender", sender)?;
+    let target = trust_validate_actor("target", target)?;
+    trust_validate_not_self(&sender, &target)?;
+    let mut entries = trust_read_store(path)?;
+    let before = entries.len();
+    entries.retain(|entry| !trust_same_relationship(&entry.sender, &entry.target, &sender, &target));
+    let removed = entries.len() != before;
+    if removed {
+        trust_write_store_atomic(path, &entries)?;
     }
+    Ok(removed)
+}
+
+fn trust_upsert_entry(
+    entries: &mut Vec<TrustEntryPlan>,
+    sender: &str,
+    target: &str,
+    peer_key: &str,
+    now_ms: i64,
+) -> Result<TrustWriteOutcome, String> {
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| trust_same_relationship(&entry.sender, &entry.target, sender, target))
+    {
+        if let Some(existing) = &entry.peer_key {
+            if existing != peer_key {
+                return Err("trust add: peer-key mismatch for known peer; refusing to re-pin".to_owned());
+            }
+            return Ok(TrustWriteOutcome::AlreadyTrusted);
+        }
+        entry.peer_key = Some(peer_key.to_owned());
+        return Ok(TrustWriteOutcome::UpdatedPin);
+    }
+    entries.push(TrustEntryPlan {
+        sender: sender.to_owned(),
+        target: target.to_owned(),
+        peer_key: Some(peer_key.to_owned()),
+        added_at: trust_iso_from_ms(now_ms),
+    });
+    Ok(TrustWriteOutcome::Added)
+}
+
+fn trust_read_store(path: &Path) -> Result<Vec<TrustEntryPlan>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = std::fs::read_to_string(path).map_err(|error| format!("trust-store: read failed: {error}"))?;
+    trust_parse_store_entries(&body)
+}
+
+fn trust_parse_store_entries(body: &str) -> Result<Vec<TrustEntryPlan>, String> {
+    let value = serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|_| "trust-store: invalid trust-store json".to_owned())?;
+    let Some(items) = value.as_array() else {
+        return Err("trust-store: expected trust-store array".to_owned());
+    };
+    let entries = items.iter().filter_map(trust_entry_from_json).collect::<Vec<_>>();
+    if entries.len() != items.len() {
+        return Err("trust-store: invalid trust-store entry".to_owned());
+    }
+    Ok(entries)
+}
+
+fn trust_write_store_atomic(path: &Path, entries: &[TrustEntryPlan]) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("trust-store: create parent failed: {error}"))?;
+    let body = serde_json::to_string_pretty(entries)
+        .map_err(|error| format!("trust-store: encode failed: {error}"))?;
+    let tmp = trust_tmp_path(path);
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|error| format!("trust-store: tmp create failed: {error}"))?;
+        std::io::Write::write_all(&mut file, body.as_bytes())
+            .map_err(|error| format!("trust-store: tmp write failed: {error}"))?;
+        std::io::Write::write_all(&mut file, b"\n")
+            .map_err(|error| format!("trust-store: tmp newline failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("trust-store: tmp sync failed: {error}"))?;
+    }
+    let parsed = std::fs::read_to_string(&tmp)
+        .map_err(|error| format!("trust-store: tmp validate read failed: {error}"))?;
+    let roundtrip = trust_parse_store_entries(&parsed)?;
+    if roundtrip.len() != entries.len() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("trust-store: tmp validation mismatch".to_owned());
+    }
+    std::fs::rename(&tmp, path).map_err(|error| format!("trust-store: atomic rename failed: {error}"))?;
+    Ok(())
+}
+
+fn trust_tmp_path(path: &Path) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("trust-store.json");
+    parent.join(format!(".{name}.{}.tmp", std::process::id()))
+}
+
+fn trust_store_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os(TRUST_FAKE_STORE_ENV) {
+        return std::path::PathBuf::from(path);
+    }
+    maw_state_path(&real_xdg_env(), &["trust-store.json"])
 }
 
 fn trust_validate_auto_surface(argv: &[String]) -> Result<(), String> {
@@ -208,6 +383,25 @@ fn trust_validate_actor(label: &str, value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+fn trust_validate_peer_key(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.trim() != value {
+        return Err("trust: peer-key is missing".to_owned());
+    }
+    if value.starts_with('-') || value == "--" {
+        return Err("trust: peer-key must not start with '-'".to_owned());
+    }
+    if value.len() > 4096 {
+        return Err("trust: peer-key is too long".to_owned());
+    }
+    if value.bytes().any(|byte| byte == 0 || byte.is_ascii_control()) {
+        return Err("trust: peer-key must not contain control characters".to_owned());
+    }
+    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err("trust: peer-key must not contain whitespace".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
 fn trust_validate_not_self(sender: &str, target: &str) -> Result<(), String> {
     if sender == target {
         return Err("trust add: refusing self-trust relationship; self-messages are always allowed".to_owned());
@@ -215,16 +409,7 @@ fn trust_validate_not_self(sender: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn trust_load_fake_entries() -> Vec<TrustEntryPlan> {
-    let Some(path) = std::env::var_os(TRUST_FAKE_STORE_ENV) else {
-        return Vec::new();
-    };
-    let Ok(body) = std::fs::read_to_string(std::path::PathBuf::from(path)) else {
-        return Vec::new();
-    };
-    trust_parse_fake_entries(&body)
-}
-
+#[cfg(test)]
 fn trust_parse_fake_entries(body: &str) -> Vec<TrustEntryPlan> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -239,17 +424,29 @@ fn trust_entry_from_json(value: &serde_json::Value) -> Option<TrustEntryPlan> {
     let sender = value.get("sender")?.as_str()?.to_owned();
     let target = value.get("target")?.as_str()?.to_owned();
     let added_at = value.get("addedAt")?.as_str()?.to_owned();
+    let peer_key = value
+        .get("peerKey")
+        .and_then(serde_json::Value::as_str)
+        .map(trust_validate_peer_key)
+        .transpose()
+        .ok()?;
     if trust_validate_actor("sender", &sender).is_err()
         || trust_validate_actor("target", &target).is_err()
         || trust_validate_not_self(&sender, &target).is_err()
+        || !trust_valid_timestamp(&added_at)
     {
         return None;
     }
     Some(TrustEntryPlan {
         sender,
         target,
+        peer_key,
         added_at,
     })
+}
+
+fn trust_valid_timestamp(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_control) && value.len() <= 64
 }
 
 fn trust_format_list(entries: &[TrustEntryPlan]) -> String {
@@ -260,15 +457,21 @@ fn trust_format_list(entries: &[TrustEntryPlan]) -> String {
     rows.sort_by(|left, right| left.added_at.cmp(&right.added_at));
     let mut text = String::from("trusted relationships:\n");
     for entry in rows {
+        let key_state = if entry.peer_key.is_some() {
+            "peer key received (redacted)"
+        } else {
+            "peer key missing"
+        };
         let _ = writeln!(
             text,
-            "  {} ↔ {}   added {}",
-            entry.sender, entry.target, entry.added_at
+            "  {} ↔ {}   added {}   {}",
+            entry.sender, entry.target, entry.added_at, key_state
         );
     }
     text.trim_end().to_owned()
 }
 
+#[cfg(test)]
 fn trust_find_entry<'a>(
     entries: &'a [TrustEntryPlan],
     sender: &str,
@@ -279,9 +482,24 @@ fn trust_find_entry<'a>(
         .find(|entry| trust_same_relationship(&entry.sender, &entry.target, sender, target))
 }
 
-fn trust_same_relationship(left_sender: &str, left_target: &str, right_sender: &str, right_target: &str) -> bool {
+fn trust_same_relationship(
+    left_sender: &str,
+    left_target: &str,
+    right_sender: &str,
+    right_target: &str,
+) -> bool {
     (left_sender == right_sender && left_target == right_target)
         || (left_sender == right_target && left_target == right_sender)
+}
+
+fn trust_now_ms() -> i64 {
+    i64::try_from(current_epoch_seconds())
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000)
+}
+
+fn trust_iso_from_ms(ms: i64) -> String {
+    format!("epoch-ms:{ms}")
 }
 
 fn trust_normalize_token(value: &str) -> String {
@@ -372,14 +590,50 @@ mod trust_native_tests {
     }
 
     #[test]
-    fn trust_add_and_remove_are_plan_only() {
-        let add = trust_run_command(&trust_args(&["add", "alpha", "beta"]));
+    fn trust_add_list_and_remove_mutate_store_without_key_echo() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture(TRUST_FAKE_STORE_ENV);
+        let path = std::env::temp_dir().join(format!(
+            "maw-rs-trust-cli-{}-{}.json",
+            std::process::id(),
+            current_epoch_seconds()
+        ));
+        std::env::set_var(TRUST_FAKE_STORE_ENV, &path);
+        let key = "ed25519:secret-cli-peer-key";
+
+        let missing_key = trust_run_command(&trust_args(&["add", "alpha", "beta"]));
+        assert_eq!(missing_key.code, 2);
+        assert!(missing_key.stderr.contains("peer-key"));
+
+        let add = trust_run_command(&trust_args(&["add", "alpha", "beta", "--peer-key", key]));
         assert_eq!(add.code, 0, "{}", add.stderr);
-        assert!(add.stdout.contains("plan: would trust"));
-        assert!(add.stderr.contains("TODO(#115)"));
+        assert!(add.stdout.contains("trusted"));
+        assert!(!add.stdout.contains(key));
+        assert!(std::fs::read_to_string(&path).expect("store").contains(key));
+
+        let list = trust_run_command(&trust_args(&["list"]));
+        assert_eq!(list.code, 0);
+        assert!(list.stdout.contains("received (redacted)"));
+        assert!(!list.stdout.contains(key));
+
+        let mismatch = trust_run_command(&trust_args(&[
+            "pin",
+            "beta",
+            "alpha",
+            "--peer-key",
+            "ed25519:different-secret-key",
+        ]));
+        assert_eq!(mismatch.code, 2);
+        assert!(mismatch.stderr.contains("peer-key mismatch"));
+        assert!(!mismatch.stderr.contains("different-secret-key"));
+
         let remove = trust_run_command(&trust_args(&["remove", "alpha", "beta"]));
         assert_eq!(remove.code, 2);
         assert!(remove.stderr.contains("without --yes"));
+        let removed = trust_run_command(&trust_args(&["revoke", "alpha", "beta", "--yes"]));
+        assert_eq!(removed.code, 0, "{}", removed.stderr);
+        assert!(trust_read_store(&path).expect("read").is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

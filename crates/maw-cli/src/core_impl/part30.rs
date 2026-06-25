@@ -31,6 +31,7 @@ struct ServeState {
     now_override: Option<i64>,
     #[cfg(test)]
     serve_core_state_override: Option<crate::serve_core::ServecoreSharedState>,
+    trust_store_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,7 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         now_override: None,
         #[cfg(test)]
         serve_core_state_override: None,
+        trust_store_path: trust_store_path(),
     });
     println!("maw-rs serve listening http://{local_addr}");
     match axum::serve(
@@ -187,9 +189,16 @@ fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedSta
     if let Some(state) = &state.serve_core_state_override {
         return state.clone();
     }
-    crate::serve_core::ServecoreSharedState::default()
+    let core = crate::serve_core::ServecoreSharedState::default()
         .servecore_with_agents_node(load_hey_config().node)
-        .servecore_with_auth(state.cached_pubkey.clone(), state.cached_pubkey.clone())
+        .servecore_with_auth(state.cached_pubkey.clone(), state.cached_pubkey.clone());
+    #[cfg(test)]
+    let core = if let Some(now) = state.now_override {
+        core.servecore_with_auth_now(now)
+    } else {
+        core
+    };
+    core
 }
 
 fn serve_router(state: ServeState) -> Router {
@@ -212,6 +221,8 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/health", get(api_health))
         .route("/api/message-ledger", get(api_message_ledger))
         .route("/api/requests", get(api_requests))
+        .route("/api/trust", get(api_trust_list).post(api_trust_add))
+        .route("/api/trust/revoke", post(api_trust_revoke))
         .route("/api/request", post(api_request_create))
         .route("/api/reply/:correlation_id", post(api_reply))
         .route("/api/workspace/create", post(api_workspace_create))
@@ -223,10 +234,9 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/workspace/:id/status", get(api_workspace_status))
         .route("/api/workspace/:id/feed", get(api_workspace_feed))
         .route("/api/workspace/:id/message", post(api_workspace_message));
+    let router = crate::serve_core::servecore_apply_pipeline(router);
     let router = crate::serve_core::servecore_with_shared_state(router, serve_core_state);
-    crate::serve_core::servecore_apply_pipeline(router)
-        .fallback(api_not_found)
-        .with_state(state)
+    router.fallback(api_not_found).with_state(state)
 }
 
 async fn api_send(
@@ -383,6 +393,87 @@ async fn api_reply(
         ReplyResult::NotFound => (StatusCode::NOT_FOUND, Json(json!({"error": "request not found"}))).into_response(),
         ReplyResult::AlreadyReplied => Json(json!({"error": "already replied", "correlationId": correlation_id})).into_response(),
     })
+}
+
+
+async fn api_trust_list(State(state): State<Arc<ServeState>>) -> impl IntoResponse {
+    match trust_read_store(&state.trust_store_path) {
+        Ok(entries) => Json(json!({
+            "ok": true,
+            "entries": trust_entries_json(&entries),
+            "total": entries.len()
+        }))
+        .into_response(),
+        Err(message) => trust_http_error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    }
+}
+
+async fn api_trust_add(
+    State(state): State<Arc<ServeState>>,
+    Json(body): Json<TrustAddBody>,
+) -> impl IntoResponse {
+    match trust_store_add(
+        &state.trust_store_path,
+        &body.sender,
+        &body.target,
+        &body.peer_key,
+        unix_millis_i64(),
+    ) {
+        Ok(outcome) => Json(json!({
+            "ok": true,
+            "state": trust_outcome_state(&outcome),
+            "sender": body.sender,
+            "target": body.target,
+            "peerKey": "received (redacted)"
+        }))
+        .into_response(),
+        Err(message) => trust_http_error(StatusCode::BAD_REQUEST, &message),
+    }
+}
+
+async fn api_trust_revoke(
+    State(state): State<Arc<ServeState>>,
+    Json(body): Json<TrustRevokeBody>,
+) -> impl IntoResponse {
+    if !body.yes.unwrap_or(false) {
+        return trust_http_error(StatusCode::BAD_REQUEST, "trust revoke: missing explicit yes");
+    }
+    match trust_store_remove(&state.trust_store_path, &body.sender, &body.target) {
+        Ok(true) => Json(json!({"ok": true, "state": "revoked"})).into_response(),
+        Ok(false) => trust_http_error(StatusCode::NOT_FOUND, "trust revoke: entry not found"),
+        Err(message) => trust_http_error(StatusCode::BAD_REQUEST, &message),
+    }
+}
+
+fn trust_entries_json(entries: &[TrustEntryPlan]) -> Vec<Value> {
+    let mut rows = entries.to_vec();
+    rows.sort_by(|left, right| left.added_at.cmp(&right.added_at));
+    rows.into_iter()
+        .map(|entry| {
+            json!({
+                "sender": entry.sender,
+                "target": entry.target,
+                "addedAt": entry.added_at,
+                "peerKey": if entry.peer_key.is_some() { "received (redacted)" } else { "missing" }
+            })
+        })
+        .collect()
+}
+
+fn trust_outcome_state(outcome: &TrustWriteOutcome) -> &'static str {
+    match outcome {
+        TrustWriteOutcome::Added => "trusted",
+        TrustWriteOutcome::AlreadyTrusted => "already-trusted",
+        TrustWriteOutcome::UpdatedPin => "pin-updated",
+    }
+}
+
+fn trust_http_error(status: StatusCode, message: &str) -> axum::response::Response {
+    (status, Json(json!({"ok": false, "error": message}))).into_response()
+}
+
+fn unix_millis_i64() -> i64 {
+    i64::try_from(unix_millis()).unwrap_or(i64::MAX)
 }
 
 async fn api_workspace_create(
@@ -883,6 +974,21 @@ struct RequestListQuery {
     status: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustAddBody {
+    sender: String,
+    target: String,
+    peer_key: String,
+}
+
+#[derive(Deserialize)]
+struct TrustRevokeBody {
+    sender: String,
+    target: String,
+    yes: Option<bool>,
+}
+
 #[derive(Default, Deserialize)]
 struct RequestCreateBody {
     to: String,
@@ -989,12 +1095,75 @@ struct CaptureQuery {
 #[allow(clippy::redundant_closure_for_method_calls)]
 mod serve_tests {
     use super::*;
+    use axum::body::Body;
     use futures_util::{SinkExt, StreamExt};
     use maw_auth::{build_legacy_from_sign_payload, hash_body, sign_headers_v3_at, sign_hmac_sig};
     use tokio::sync::oneshot;
+    use tower::ServiceExt;
 
     const KEY: &str = "test-peer-key-0123456789";
     const FROM: &str = "sender-oracle:sender-node";
+
+
+    fn serve_test_trust_store_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "maw-rs-trust-live-{label}-{}-{}.json",
+            std::process::id(),
+            random_hex(4)
+        ))
+    }
+
+    fn serve_test_app(trust_store_path: std::path::PathBuf) -> Router {
+        serve_router(ServeState {
+            cached_pubkey: Some(KEY.to_owned()),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
+            now_override: Some(1_782_277_200),
+            serve_core_state_override: None,
+            trust_store_path,
+        })
+    }
+
+    fn signed_trust_request(method: &str, uri: &str, auth_path: &str, body: &'static str) -> axum::http::Request<Body> {
+        let headers = sign_headers_v3_at(
+            KEY,
+            FROM,
+            method,
+            auth_path,
+            Some(body.as_bytes()),
+            1_782_277_200,
+        )
+        .expect("sign trust");
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers.to_btree_map() {
+            builder = builder.header(name, value);
+        }
+        let mut request = builder.body(Body::from(body)).expect("request");
+        request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+        request
+    }
+
+    fn unsigned_trust_request(method: &str, uri: &str, body: &'static str) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+        request
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
 
     async fn spawn_test_server() -> SocketAddr {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1008,6 +1177,7 @@ mod serve_tests {
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
             serve_core_state_override: None,
+            trust_store_path: serve_test_trust_store_path("server"),
         });
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -1083,6 +1253,89 @@ mod serve_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+
+    #[tokio::test]
+    async fn serve_trust_live_is_auth_gated_atomic_redacted_and_tofu_safe() {
+        let path = serve_test_trust_store_path("route");
+        let app = serve_test_app(path.clone());
+        assert!(maw_auth::is_protected("/api/trust", "POST"));
+        assert!(maw_auth::is_protected("/api/trust/revoke", "POST"));
+        assert!(maw_auth::is_protected("/api/trust", "GET"));
+
+        let secret_key = "ed25519:alpha-peer-key-secret";
+        let body = r#"{"sender":"alpha","target":"beta","peerKey":"ed25519:alpha-peer-key-secret"}"#;
+        let denied = app
+            .clone()
+            .oneshot(unsigned_trust_request("POST", "/api/trust", body))
+            .await
+            .expect("denied");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let trusted = app
+            .clone()
+            .oneshot(signed_trust_request("POST", "/api/trust", "/trust", body))
+            .await
+            .expect("trust");
+        let trusted_status = trusted.status();
+        let payload = response_json(trusted).await;
+        assert_eq!(trusted_status, StatusCode::OK, "{payload}");
+        let rendered = payload.to_string();
+        assert_eq!(payload["peerKey"], "received (redacted)");
+        assert!(!rendered.contains(secret_key), "{rendered}");
+        let stored = std::fs::read_to_string(&path).expect("stored");
+        assert!(stored.contains(secret_key));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let mismatch = r#"{"sender":"beta","target":"alpha","peerKey":"ed25519:different-peer-key"}"#;
+        let rejected = app
+            .clone()
+            .oneshot(signed_trust_request("POST", "/api/trust", "/trust", mismatch))
+            .await
+            .expect("mismatch");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let rejected_payload = response_json(rejected).await.to_string();
+        assert!(rejected_payload.contains("peer-key mismatch"));
+        assert!(!rejected_payload.contains("different-peer-key"));
+
+        let listed = app
+            .clone()
+            .oneshot(signed_trust_request("GET", "/api/trust", "/trust", ""))
+            .await
+            .expect("list");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_payload = response_json(listed).await.to_string();
+        assert!(listed_payload.contains("received (redacted)"));
+        assert!(!listed_payload.contains(secret_key));
+
+        let missing_yes = r#"{"sender":"alpha","target":"beta"}"#;
+        let refused = app
+            .clone()
+            .oneshot(signed_trust_request(
+                "POST",
+                "/api/trust/revoke",
+                "/trust/revoke",
+                missing_yes,
+            ))
+            .await
+            .expect("missing yes");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let revoke = r#"{"sender":"alpha","target":"beta","yes":true}"#;
+        let revoked = app
+            .oneshot(signed_trust_request(
+                "POST",
+                "/api/trust/revoke",
+                "/trust/revoke",
+                revoke,
+            ))
+            .await
+            .expect("revoke");
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let entries = trust_read_store(&path).expect("read after revoke");
+        assert!(entries.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn serve_default_bind_is_loopback_only() {
         let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1150,6 +1403,7 @@ mod serve_tests {
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
             serve_core_state_override: Some(fake_core),
+            trust_store_path: serve_test_trust_store_path("agents"),
         });
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
