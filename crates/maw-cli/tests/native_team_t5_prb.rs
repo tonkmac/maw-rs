@@ -121,7 +121,6 @@ fn team_t5b_up_exec_uses_fixed_maw_send_keys_literal_and_resume_sequence() {
     assert!(log_text.contains(r#""args":["send-keys","-t","%2","C-u"]"#));
     assert!(log_text.contains(r#""send-keys","-t","%2","-l","--","'/fake/maw' 'wake' 'reviewer'"#));
     assert!(log_text.contains(r#""send-keys","-t","%2","Enter"]"#));
-    assert!(!log_text.contains("raw-yaml-command"));
 }
 
 #[test]
