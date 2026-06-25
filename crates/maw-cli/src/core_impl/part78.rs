@@ -94,7 +94,17 @@ impl KillTmux for KillSystemTmux {
 }
 
 fn kill_run_command(argv: &[String]) -> CliOutput {
+    if kill_has_peer_flag(argv) {
+        let mut fallback_argv = vec!["kill".to_owned()];
+        fallback_argv.extend(argv.iter().cloned());
+        return dispatch_bun_fallback(&fallback_argv, "kill");
+    }
     kill_run_command_with(argv, &mut KillSystemTmux::kill_new())
+}
+
+fn kill_has_peer_flag(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|arg| arg == "--peer" || arg.starts_with("--peer="))
 }
 
 fn kill_run_command_with(argv: &[String], tmux: &mut impl KillTmux) -> CliOutput {
