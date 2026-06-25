@@ -1,5 +1,5 @@
 use super::ServecoreModuleRegistration;
-use crate::serve_core::{ServecoreDiscoveredPeer, ServecoreLifecycleModule, ServecoreSharedState};
+use crate::serve_core::ServecoreLifecycleModule;
 use axum::{
     extract::Query, http::StatusCode, response::IntoResponse, routing::get, Extension, Json, Router,
 };
@@ -33,30 +33,34 @@ pub fn federation_mount<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    federation_mount_with_state(router, federation_default_state())
+}
+
+fn federation_mount_with_state<S>(router: Router<S>, state: FederationState) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     router
         .route("/api/federation/status", get(federation_status_get))
         .route("/api/peers/discoveries", get(federation_discoveries_get))
         .route("/api/peers/discovered", get(federation_discoveries_get))
+        .layer(Extension(Arc::new(state)))
 }
 
 async fn federation_status_get(
-    Extension(state): Extension<Arc<ServecoreSharedState>>,
+    Extension(state): Extension<Arc<FederationState>>,
 ) -> impl IntoResponse {
-    let status = state.servecore_federation_status();
-    Json(federation_status_payload(&status)).into_response()
+    Json(federation_status_payload(&state.status)).into_response()
 }
 
 async fn federation_discoveries_get(
-    Extension(state): Extension<Arc<ServecoreSharedState>>,
+    Extension(state): Extension<Arc<FederationState>>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> impl IntoResponse {
     match federation_parse_query(&query) {
         Ok(options) => {
-            let peers = federation_render_discoveries(
-                &state.servecore_discovered_peers(),
-                options,
-                federation_now_millis(),
-            );
+            let peers =
+                federation_render_discoveries(&state.discoveries, options, federation_now_millis());
             Json(peers).into_response()
         }
         Err(message) => (
@@ -65,6 +69,35 @@ async fn federation_discoveries_get(
         )
             .into_response(),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FederationState {
+    status: FederationStatus,
+    discoveries: Vec<FederationDiscoveredPeer>,
+}
+
+fn federation_default_state() -> FederationState {
+    FederationState {
+        status: FederationStatus {
+            local_url: String::new(),
+            peers: Vec::new(),
+        },
+        discoveries: Vec::new(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FederationDiscoveredPeer {
+    zid: String,
+    node: String,
+    oracle: String,
+    host: String,
+    locators: Vec<String>,
+    capabilities: Vec<String>,
+    oracles: Vec<String>,
+    last_seen: u64,
+    paired: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,7 +208,7 @@ fn federation_guard_query_part(value: &str, label: &str) -> Result<(), String> {
 }
 
 fn federation_render_discoveries(
-    peers: &[ServecoreDiscoveredPeer],
+    peers: &[FederationDiscoveredPeer],
     options: FederationQuery,
     now: u64,
 ) -> FederationDiscoveryResponse {
@@ -204,7 +237,7 @@ fn federation_render_discoveries(
     }
 }
 
-fn federation_discovery_row(peer: &ServecoreDiscoveredPeer, now: u64) -> FederationDiscoveryRow {
+fn federation_discovery_row(peer: &FederationDiscoveredPeer, now: u64) -> FederationDiscoveryRow {
     let seen = federation_iso_millis(peer.last_seen);
     FederationDiscoveryRow {
         zid: peer.zid.clone(),
@@ -281,17 +314,17 @@ fn federation_relative_seen(delta_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve_core::{servecore_apply_pipeline, servecore_with_shared_state};
+    use crate::serve_core::servecore_apply_pipeline;
     use maw_transport::{FederationPeerStatus, FederationStatus};
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::sync::oneshot;
 
-    async fn federation_spawn(state: ServecoreSharedState) -> std::net::SocketAddr {
+    async fn federation_spawn(state: FederationState) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let router = servecore_with_shared_state(federation_mount(Router::new()), state);
+        let router = federation_mount_with_state(Router::new(), state);
         let app = servecore_apply_pipeline(router);
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -304,8 +337,8 @@ mod tests {
         addr
     }
 
-    fn federation_peer(node: &str, last_seen: u64, paired: bool) -> ServecoreDiscoveredPeer {
-        ServecoreDiscoveredPeer {
+    fn federation_peer(node: &str, last_seen: u64, paired: bool) -> FederationDiscoveredPeer {
+        FederationDiscoveredPeer {
             zid: format!("zid-{node}"),
             node: node.to_owned(),
             oracle: format!("{node}-oracle"),
@@ -361,8 +394,8 @@ mod tests {
 
     #[tokio::test]
     async fn federation_real_wire_is_public_under_default_deny() {
-        let state = ServecoreSharedState::default()
-            .servecore_with_federation_status(FederationStatus {
+        let state = FederationState {
+            status: FederationStatus {
                 local_url: "http://local.test:3456".to_owned(),
                 peers: vec![FederationPeerStatus {
                     url: "http://paired.test:3456".to_owned(),
@@ -372,11 +405,12 @@ mod tests {
                     agents: vec!["paired:claude".to_owned()],
                     clock_warning: false,
                 }],
-            })
-            .servecore_with_discovered_peers(vec![
+            },
+            discoveries: vec![
                 federation_peer("paired", 1_700_000_000_000, true),
                 federation_peer("fresh", 1_700_000_005_000, false),
-            ]);
+            ],
+        };
         let addr = federation_spawn(state).await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
