@@ -12,6 +12,7 @@ pub mod agents;
 pub mod debug;
 pub mod federation;
 pub mod triggers;
+pub mod triggers_mutate;
 
 use super::{ServecoreLifecycle, ServecoreLifecycleModule};
 use axum::Router;
@@ -52,6 +53,7 @@ where
         debug::debug_registration(),
         federation::federation_registration(),
         triggers::triggers_registration(),
+        triggers_mutate::triggersmutate_registration(),
     ]
 }
 
