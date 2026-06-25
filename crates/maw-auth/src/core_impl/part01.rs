@@ -2,7 +2,11 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, net::IpAddr};
+use std::{
+    collections::BTreeMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -463,7 +467,39 @@ impl RequestAuthDecision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ed25519TofuStore {
+    pins: BTreeMap<String, String>,
+}
+
+impl Ed25519TofuStore {
+    #[must_use]
+    pub fn pinned(&self, from: &str) -> Option<&str> {
+        self.pins.get(from).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pins.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
+
+    pub fn pin_first_contact(&mut self, from: &str, pubkey_hex: &str) -> bool {
+        if self.pins.contains_key(from) {
+            return false;
+        }
+        self.pins.insert(from.to_owned(), pubkey_hex.to_owned());
+        true
+    }
+}
+
+pub type Ed25519TofuPins = Arc<Mutex<Ed25519TofuStore>>;
+
+#[derive(Debug, Clone)]
 pub struct RequestAuthParts {
     pub method: String,
     pub path: String,
@@ -472,6 +508,7 @@ pub struct RequestAuthParts {
     pub peer_ip: Option<IpAddr>,
     pub workspace_key: Option<String>,
     pub cached_pubkey: Option<String>,
+    pub ed25519_pins: Option<Ed25519TofuPins>,
     pub now: i64,
 }
 
