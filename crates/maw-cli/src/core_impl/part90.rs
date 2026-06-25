@@ -293,9 +293,10 @@ fn oracleworkon_render_spawn(handle: &crate::serve_core::ServecoreWorkonHandle) 
 }
 
 fn oracleworkon_orchestration_root() -> std::path::PathBuf {
-    std::env::var_os("GHQ_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+    std::env::var_os("GHQ_ROOT").map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        std::path::PathBuf::from,
+    )
 }
 
 fn oracleworkon_run_single_workon(options: &OracleworkonOptions) -> Result<String, String> {
