@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct NativeScope {
     name: String,
@@ -8,6 +9,7 @@ struct NativeScope {
     ttl: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 struct NativeFleetSession {
     name: String,
@@ -19,6 +21,7 @@ struct NativeFleetSession {
     project_repos: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 struct NativeFleetWindow {
     name: String,
@@ -26,6 +29,7 @@ struct NativeFleetWindow {
     repo: String,
 }
 
+#[allow(dead_code)]
 fn run_scope_command(argv: &[String]) -> CliOutput {
     let positional = argv
         .iter()
@@ -52,6 +56,7 @@ fn run_scope_command(argv: &[String]) -> CliOutput {
     }
 }
 
+#[allow(dead_code)]
 fn run_scope_create(argv: &[String], positional: &[&str]) -> CliOutput {
     let Some(name) = positional.get(1).copied() else {
         return scope_error("usage: maw scope create <name> --members <a,b,c> [--lead <m>] [--ttl <iso>]");
@@ -81,6 +86,7 @@ fn run_scope_create(argv: &[String], positional: &[&str]) -> CliOutput {
     }
 }
 
+#[allow(dead_code)]
 fn run_scope_show(positional: &[&str]) -> CliOutput {
     let Some(name) = positional.get(1).copied() else {
         return scope_error("usage: maw scope show <name>");
@@ -98,6 +104,7 @@ fn run_scope_show(positional: &[&str]) -> CliOutput {
     }
 }
 
+#[allow(dead_code)]
 fn run_scope_delete(argv: &[String], positional: &[&str]) -> CliOutput {
     let Some(name) = positional.get(1).copied() else {
         return scope_error("usage: maw scope delete <name> [--yes]");
@@ -116,14 +123,17 @@ fn run_scope_delete(argv: &[String], positional: &[&str]) -> CliOutput {
     }
 }
 
+#[allow(dead_code)]
 fn scope_help() -> &'static str {
     "usage: maw scope <list|create|show|delete> [...]\n  list                                                    — list all scopes\n  create   <name> --members <a,b,c> [--lead <m>] [--ttl <iso>]\n                                                          — create new scope (refuses overwrite)\n  show     <name>                                         — print one scope's JSON\n  delete   <name> [--yes]                                 — remove scope file (confirms unless --yes)\n\nstorage: <CONFIG_DIR>/scopes/<name>.json (one file per scope)\n\nnote: Phase 1 of #642 — primitive only. ACL evaluation, trust list, and\n      cross-scope approval queue are deferred to follow-up issues."
 }
 
+#[allow(dead_code)]
 fn scope_error(message: &str) -> CliOutput {
     CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") }
 }
 
+#[allow(dead_code)]
 fn validate_scope_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -138,6 +148,7 @@ fn validate_scope_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn scope_create(name: &str, members: Vec<String>, lead: Option<String>, ttl: Option<String>) -> Result<NativeScope, String> {
     validate_scope_name(name)?;
     if members.is_empty() {
@@ -164,6 +175,7 @@ fn scope_create(name: &str, members: Vec<String>, lead: Option<String>, ttl: Opt
     Ok(scope)
 }
 
+#[allow(dead_code)]
 fn scope_delete(name: &str) -> Result<bool, String> {
     validate_scope_name(name)?;
     let path = scope_path(name);
@@ -174,6 +186,7 @@ fn scope_delete(name: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+#[allow(dead_code)]
 fn scope_list() -> Result<Vec<NativeScope>, String> {
     std::fs::create_dir_all(scopes_dir()).map_err(|error| format!("scope: create scopes dir: {error}"))?;
     let mut out = Vec::new();
@@ -193,6 +206,7 @@ fn scope_list() -> Result<Vec<NativeScope>, String> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn load_scope(name: &str) -> Result<Option<NativeScope>, String> {
     let path = scope_path(name);
     if !path.exists() {
@@ -202,6 +216,7 @@ fn load_scope(name: &str) -> Result<Option<NativeScope>, String> {
     Ok(serde_json::from_str(&text).ok())
 }
 
+#[allow(dead_code)]
 fn format_scope_list(rows: &[NativeScope]) -> String {
     if rows.is_empty() {
         return "no scopes".to_owned();
@@ -223,9 +238,12 @@ fn format_scope_list(rows: &[NativeScope]) -> String {
     lines.join("\n")
 }
 
+#[allow(dead_code)]
 fn scopes_dir() -> std::path::PathBuf { active_config_dir().join("scopes") }
+#[allow(dead_code)]
 fn scope_path(name: &str) -> std::path::PathBuf { scopes_dir().join(format!("{name}.json")) }
 
+#[allow(dead_code)]
 fn run_find_command(argv: &[String]) -> CliOutput {
     let Some(keyword) = argv.first().filter(|arg| !arg.starts_with('-')) else {
         return CliOutput {
@@ -243,6 +261,7 @@ fn run_find_command(argv: &[String]) -> CliOutput {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 fn find_render(keyword: &str, oracle_filter: Option<&str>) -> String {
     let kw = keyword.to_lowercase();
     let repos_root = ghq_root().join("github.com");
@@ -409,6 +428,7 @@ fn find_render(keyword: &str, oracle_filter: Option<&str>) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn collect_find_code_matches(name: &str, root: &std::path::Path, kw: &str, out: &mut Vec<(String, String, String)>) {
     let Ok(entries) = std::fs::read_dir(root) else { return; };
     for entry in entries.flatten() {
