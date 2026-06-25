@@ -5,10 +5,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-fn bin() -> PathBuf { PathBuf::from(env!("CARGO_BIN_EXE_maw-rs")) }
+fn bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_maw-rs"))
+}
 
 fn temp_dir(name: &str) -> PathBuf {
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
     let path = std::env::temp_dir().join(format!("maw-rs-team-t3-{name}-{stamp}"));
     fs::create_dir_all(&path).expect("temp dir");
     path
@@ -41,7 +46,8 @@ members:
     engine: omx
     cwd: agents/scout
 ",
-    ).expect("charter");
+    )
+    .expect("charter");
     charter
 }
 
@@ -60,8 +66,17 @@ fn run(args: &[&str], root: &Path) -> std::process::Output {
 
 fn assert_golden(name: &str, root: &Path, args: &[&str], expected: &str) {
     let output = run(args, root);
-    assert!(output.status.success(), "{name} stderr={} stdout={}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
-    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), expected, "{name}");
+    assert!(
+        output.status.success(),
+        "{name} stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        expected,
+        "{name}"
+    );
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
 }
 
@@ -71,11 +86,44 @@ fn team_t3_status_dryrun_liveness_goldens_are_hermetic() {
     let charter = seed(&root);
     let charter_s = charter.to_string_lossy().into_owned();
 
-    assert_golden("up-status", &root, &["team", "up", "alpha", "--status", "--session", "alpha"], include_str!("fixtures/native-team-t3/team-up-status.stdout"));
-    assert_golden("up-dry-run", &root, &["team", "up", "alpha", "--dry-run", "--session", "alpha"], include_str!("fixtures/native-team-t3/team-up-dry-run.stdout"));
-    assert_golden("bring-dry-run", &root, &["team", "bring", "alpha", "--dry-run", "--session", "alpha", "--split"], include_str!("fixtures/native-team-t3/team-bring-dry-run.stdout"));
-    assert_golden("apply-dry-run", &root, &["team", "apply", &charter_s, "--session", "alpha"], include_str!("fixtures/native-team-t3/team-apply-dry-run.stdout"));
-    assert_golden("liveness", &root, &["team", "liveness", "alpha", "--session", "alpha"], include_str!("fixtures/native-team-t3/team-liveness.stdout"));
+    assert_golden(
+        "up-status",
+        &root,
+        &["team", "up", "alpha", "--status", "--session", "alpha"],
+        include_str!("fixtures/native-team-t3/team-up-status.stdout"),
+    );
+    assert_golden(
+        "up-dry-run",
+        &root,
+        &["team", "up", "alpha", "--dry-run", "--session", "alpha"],
+        include_str!("fixtures/native-team-t3/team-up-dry-run.stdout"),
+    );
+    assert_golden(
+        "bring-dry-run",
+        &root,
+        &[
+            "team",
+            "bring",
+            "alpha",
+            "--dry-run",
+            "--session",
+            "alpha",
+            "--split",
+        ],
+        include_str!("fixtures/native-team-t3/team-bring-dry-run.stdout"),
+    );
+    assert_golden(
+        "apply-dry-run",
+        &root,
+        &["team", "apply", &charter_s, "--session", "alpha"],
+        include_str!("fixtures/native-team-t3/team-apply-dry-run.stdout"),
+    );
+    assert_golden(
+        "liveness",
+        &root,
+        &["team", "liveness", "alpha", "--session", "alpha"],
+        include_str!("fixtures/native-team-t3/team-liveness.stdout"),
+    );
 }
 
 #[test]
@@ -86,11 +134,17 @@ fn team_t3_rejects_exec_paths_and_injection_without_spawning() {
     assert!(!up_exec.status.success());
     assert!(String::from_utf8_lossy(&up_exec.stderr).contains("read-only only"));
 
-    let apply_exec = run(&["team", "apply", "alpha", "--apply", "--session", "alpha"], &root);
+    let apply_exec = run(
+        &["team", "apply", "alpha", "--apply", "--session", "alpha"],
+        &root,
+    );
     assert!(!apply_exec.status.success());
     assert!(String::from_utf8_lossy(&apply_exec.stderr).contains("dry-run only"));
 
-    let bad = run(&["team", "up", "alpha", "--status", "--engine", "-bad"], &root);
+    let bad = run(
+        &["team", "up", "alpha", "--status", "--engine", "-bad"],
+        &root,
+    );
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("leading dash rejected"));
 }
