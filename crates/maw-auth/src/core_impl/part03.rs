@@ -410,7 +410,8 @@ pub fn is_protected(path: &str, method: &str) -> bool {
     let normalized = auth_normalize_protected_path(path);
     matches!(
         (method.as_str(), normalized.as_str()),
-        ("POST", "/triggers/fire" | "/worktrees/cleanup")
+        ("POST", "/triggers/fire" | "/worktrees/cleanup" | "/trust" | "/trust/revoke")
+            | ("GET", "/trust")
     ) || (method == "POST" && normalized.starts_with("/plugins/"))
 }
 
