@@ -290,6 +290,14 @@ pub struct ServecoreWorkonHandle {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swarm_argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swarm_skipped: Option<String>,
 }
 
 pub trait ServecoreOrchestrator: Send + Sync {
@@ -310,6 +318,7 @@ pub trait ServecoreOrchestrator: Send + Sync {
 pub struct ServecoreCommandOrchestrator {
     root: Arc<PathBuf>,
     runner: Arc<dyn ServecoreExecRunner>,
+    pane_runner: Arc<dyn ServecorePaneRunner>,
 }
 
 impl ServecoreCommandOrchestrator {
@@ -324,6 +333,7 @@ impl ServecoreCommandOrchestrator {
         Self {
             root: Arc::new(root),
             runner: Arc::new(ServecoreProcessRunner),
+            pane_runner: Arc::new(ServecoreTmuxPaneRunner),
         }
     }
 
@@ -332,6 +342,20 @@ impl ServecoreCommandOrchestrator {
         Self {
             root: Arc::new(root),
             runner,
+            pane_runner: Arc::new(TestPaneRunner),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn servecore_with_runners(
+        root: PathBuf,
+        runner: Arc<dyn ServecoreExecRunner>,
+        pane_runner: Arc<dyn ServecorePaneRunner>,
+    ) -> Self {
+        Self {
+            root: Arc::new(root),
+            runner,
+            pane_runner,
         }
     }
 }
@@ -343,12 +367,121 @@ impl ServecoreOrchestrator for ServecoreCommandOrchestrator {
         engine: Arc<dyn ServecoreEngine>,
     ) -> Result<ServecoreWorkonHandle, String> {
         let plan = servecore_prepare_workon(&self.root, request, engine.servecore_engine_name())?;
-        if plan.advanced_deferred {
-            return Ok(plan.into_deferred_handle());
+        match plan {
+            ServecorePreparedOrchestration::Simple(plan) => {
+                self.runner.servecore_run(&plan.argv, &plan.repo_path)?;
+                Ok(plan.into_handle("spawned"))
+            }
+            ServecorePreparedOrchestration::Advanced(plan) => {
+                self.runner
+                    .servecore_run(&plan.leader_argv, &plan.repo_path)?;
+                Ok(self.servecore_finish_advanced(plan))
+            }
         }
-        self.runner.servecore_run(&plan.argv, &plan.repo_path)?;
-        Ok(plan.into_handle("spawned"))
     }
+}
+
+impl ServecoreCommandOrchestrator {
+    fn servecore_finish_advanced(&self, plan: ServecoreAdvancedWorkon) -> ServecoreWorkonHandle {
+        let Some(swarm_argv) = plan.swarm_argv.clone() else {
+            return plan.into_handle("spawned", None, None);
+        };
+        let Ok(panes) = self.pane_runner.servecore_list_panes() else {
+            return plan.into_handle(
+                "leader-spawned",
+                None,
+                Some("pane discovery failed".to_owned()),
+            );
+        };
+        let Ok(pane) = servecore_find_pane_for_task(&panes, &plan.task) else {
+            return plan.into_handle(
+                "leader-spawned",
+                None,
+                Some("pane discovery failed".to_owned()),
+            );
+        };
+        let Ok(line) = servecore_shell_line_for_self(&swarm_argv) else {
+            return plan.into_handle("leader-spawned", None, Some("pane send failed".to_owned()));
+        };
+        if self
+            .pane_runner
+            .servecore_send_literal_enter(&pane, &line)
+            .is_err()
+        {
+            return plan.into_handle("leader-spawned", None, Some("pane send failed".to_owned()));
+        }
+        plan.into_handle("spawned", Some(pane), None)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServecorePaneCandidate {
+    pub id: String,
+    pub title: String,
+}
+
+pub trait ServecorePaneRunner: Send + Sync {
+    /// Lists panes that may receive a follow-up swarm command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pane backend cannot enumerate panes.
+    fn servecore_list_panes(&self) -> Result<Vec<ServecorePaneCandidate>, String>;
+
+    /// Sends one literal command line to the selected pane and presses Enter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pane id is invalid or the backend rejects the send.
+    fn servecore_send_literal_enter(&self, pane: &str, line: &str) -> Result<(), String>;
+}
+
+#[derive(Debug, Default)]
+pub struct ServecoreTmuxPaneRunner;
+
+impl ServecorePaneRunner for ServecoreTmuxPaneRunner {
+    fn servecore_list_panes(&self) -> Result<Vec<ServecorePaneCandidate>, String> {
+        let mut tmux = TmuxClient::local();
+        Ok(tmux
+            .list_panes()
+            .into_iter()
+            .map(|pane| ServecorePaneCandidate {
+                id: pane.id,
+                title: pane.title,
+            })
+            .collect())
+    }
+
+    fn servecore_send_literal_enter(&self, pane: &str, line: &str) -> Result<(), String> {
+        servecore_validate_pane_id(pane)?;
+        let mut tmux = TmuxClient::local();
+        tmux.send_keys(pane, &["C-u".to_owned()])
+            .map_err(|_| "serve-orchestration: tmux send failed".to_owned())?;
+        tmux.send_keys_literal(pane, line)
+            .map_err(|_| "serve-orchestration: tmux send failed".to_owned())?;
+        tmux.send_enter(pane)
+            .map_err(|_| "serve-orchestration: tmux send failed".to_owned())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestPaneRunner;
+
+#[cfg(test)]
+impl ServecorePaneRunner for TestPaneRunner {
+    fn servecore_list_panes(&self) -> Result<Vec<ServecorePaneCandidate>, String> {
+        Ok(Vec::new())
+    }
+
+    fn servecore_send_literal_enter(&self, _pane: &str, _line: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+enum ServecorePreparedOrchestration {
+    Simple(ServecorePreparedWorkon),
+    Advanced(ServecoreAdvancedWorkon),
 }
 
 struct ServecorePreparedWorkon {
@@ -356,7 +489,6 @@ struct ServecorePreparedWorkon {
     repo_path: PathBuf,
     engine: String,
     argv: Vec<String>,
-    advanced_deferred: bool,
 }
 
 impl ServecorePreparedWorkon {
@@ -370,20 +502,44 @@ impl ServecorePreparedWorkon {
             argv: self.argv,
             status: status.to_owned(),
             message: None,
+            leader_argv: None,
+            swarm_argv: None,
+            pane: None,
+            swarm_skipped: None,
         }
     }
+}
 
-    fn into_deferred_handle(self) -> ServecoreWorkonHandle {
-        let argv = servecore_redact_advanced_argv(&self.request);
+struct ServecoreAdvancedWorkon {
+    request: ServecoreWorkonRequest,
+    repo_path: PathBuf,
+    task: String,
+    engine: String,
+    leader_argv: Vec<String>,
+    public_leader_argv: Vec<String>,
+    swarm_argv: Option<Vec<String>>,
+}
+
+impl ServecoreAdvancedWorkon {
+    fn into_handle(
+        self,
+        status: &str,
+        pane: Option<String>,
+        swarm_skipped: Option<String>,
+    ) -> ServecoreWorkonHandle {
         ServecoreWorkonHandle {
             ok: true,
             repo: self.request.repo,
             cwd: self.repo_path.to_string_lossy().into_owned(),
             engine: self.engine,
             target: self.request.target,
-            argv,
-            status: "advanced-not-wired".to_owned(),
-            message: Some("advanced orchestration not yet wired, tracked in PR-B".to_owned()),
+            argv: self.public_leader_argv.clone(),
+            status: status.to_owned(),
+            message: None,
+            leader_argv: Some(self.public_leader_argv),
+            swarm_argv: self.swarm_argv,
+            pane,
+            swarm_skipped,
         }
     }
 }
@@ -392,39 +548,103 @@ fn servecore_prepare_workon(
     root: &Path,
     request: ServecoreWorkonRequest,
     default_engine: &str,
-) -> Result<ServecorePreparedWorkon, String> {
+) -> Result<ServecorePreparedOrchestration, String> {
     servecore_validate_path_text(&request.repo, "repo")?;
     if let Some(task) = &request.task {
-        servecore_validate_engine_token(task, "task")?;
+        servecore_validate_command_token(task, "task")?;
     }
     if let Some(target) = &request.target {
-        servecore_validate_engine_token(target, "target")?;
+        servecore_validate_command_token(target, "target")?;
     }
     if let Some(prompt) = &request.prompt {
         servecore_validate_prompt_text(prompt)?;
     }
     for oracle in &request.with_oracles {
-        servecore_validate_engine_token(oracle, "with")?;
+        servecore_validate_command_token(oracle, "with")?;
+    }
+    let repo_path = servecore_resolve_workon_repo(root, &request.repo)?;
+    if servecore_has_advanced_fields(&request) {
+        return servecore_prepare_advanced_workon(request, repo_path);
     }
     let engine = request
         .engine
         .clone()
         .unwrap_or_else(|| default_engine.to_owned());
     servecore_validate_engine_token(&engine, "engine")?;
-    let advanced_deferred = servecore_has_advanced_fields(&request);
-    let repo_path = servecore_resolve_workon_repo(root, &request.repo)?;
     let mut argv = vec!["workon".to_owned(), request.repo.clone()];
     if let Some(task) = &request.task {
         argv.push(task.clone());
     }
     argv.extend(["--layout".to_owned(), "nested".to_owned()]);
-    Ok(ServecorePreparedWorkon {
-        request,
-        repo_path,
-        engine,
-        argv,
-        advanced_deferred,
-    })
+    Ok(ServecorePreparedOrchestration::Simple(
+        ServecorePreparedWorkon {
+            request,
+            repo_path,
+            engine,
+            argv,
+        },
+    ))
+}
+
+fn servecore_prepare_advanced_workon(
+    request: ServecoreWorkonRequest,
+    repo_path: PathBuf,
+) -> Result<ServecorePreparedOrchestration, String> {
+    if request.attach {
+        return Err("serve-orchestration attach is not supported for advanced wake".to_owned());
+    }
+    let task = request
+        .task
+        .clone()
+        .ok_or_else(|| "serve-orchestration advanced wake requires task".to_owned())?;
+    let engine = request
+        .engine
+        .clone()
+        .unwrap_or_else(|| "claude47".to_owned());
+    servecore_validate_command_token(&engine, "engine")?;
+    let oracle = request
+        .target
+        .clone()
+        .map_or_else(|| servecore_oracle_from_repo(&request.repo), Ok)?;
+    servecore_validate_command_token(&oracle, "target")?;
+    let mut leader_argv = vec![
+        "wake".to_owned(),
+        oracle,
+        "--task".to_owned(),
+        task.clone(),
+        "--engine".to_owned(),
+        engine.clone(),
+        "--split".to_owned(),
+        "--no-attach".to_owned(),
+    ];
+    if servecore_repo_arg_is_safe(&request.repo) {
+        leader_argv.extend(["--repo".to_owned(), request.repo.clone()]);
+    }
+    if let Some(prompt) = &request.prompt {
+        leader_argv.extend(["--prompt".to_owned(), prompt.clone()]);
+    }
+    let public_leader_argv = servecore_redact_prompt_argv(&leader_argv);
+    let swarm_argv = if request.with_oracles.is_empty() {
+        None
+    } else {
+        let mut argv = vec!["swarm".to_owned()];
+        argv.extend(request.with_oracles.iter().cloned());
+        if request.tiled {
+            argv.push("--tiled".to_owned());
+        }
+        Some(argv)
+    };
+    Ok(ServecorePreparedOrchestration::Advanced(
+        ServecoreAdvancedWorkon {
+            request,
+            repo_path,
+            task,
+            engine,
+            leader_argv,
+            public_leader_argv,
+            swarm_argv,
+        },
+    ))
 }
 
 fn servecore_has_advanced_fields(request: &ServecoreWorkonRequest) -> bool {
@@ -432,35 +652,84 @@ fn servecore_has_advanced_fields(request: &ServecoreWorkonRequest) -> bool {
         || request.prompt.is_some()
         || request.target.is_some()
         || !request.with_oracles.is_empty()
+        || request.attach
         || request.split
         || request.tiled
 }
 
-fn servecore_redact_advanced_argv(request: &ServecoreWorkonRequest) -> Vec<String> {
-    let mut argv = vec!["workon".to_owned(), request.repo.clone()];
-    if let Some(task) = &request.task {
-        argv.push(task.clone());
+fn servecore_redact_prompt_argv(argv: &[String]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(argv.len());
+    let mut redact_next = false;
+    for arg in argv {
+        if redact_next {
+            redacted.push("<redacted>".to_owned());
+            redact_next = false;
+            continue;
+        }
+        redact_next = arg == "--prompt";
+        redacted.push(arg.clone());
     }
-    argv.extend(["--layout".to_owned(), "nested".to_owned()]);
-    if request.engine.is_some() {
-        argv.extend(["--engine".to_owned(), "<deferred>".to_owned()]);
+    redacted
+}
+
+fn servecore_oracle_from_repo(repo: &str) -> Result<String, String> {
+    let name = Path::new(repo)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "serve-orchestration target must be safe".to_owned())?;
+    let oracle = name.strip_suffix("-oracle").unwrap_or(name).to_owned();
+    servecore_validate_command_token(&oracle, "target")?;
+    Ok(oracle)
+}
+
+fn servecore_repo_arg_is_safe(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && servecore_validate_command_token(owner, "repo").is_ok()
+        && servecore_validate_command_token(name, "repo").is_ok()
+}
+
+fn servecore_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn servecore_shell_line_for_self(argv: &[String]) -> Result<String, String> {
+    let mut parts = vec![servecore_shell_quote(
+        &engine::serveengine_self_bin()?.to_string_lossy(),
+    )];
+    parts.extend(argv.iter().map(|arg| servecore_shell_quote(arg)));
+    Ok(parts.join(" "))
+}
+
+fn servecore_find_pane_for_task(
+    panes: &[ServecorePaneCandidate],
+    task: &str,
+) -> Result<String, String> {
+    let needle = task.to_ascii_lowercase();
+    let Some(pane) = panes
+        .iter()
+        .find(|pane| pane.title.to_ascii_lowercase().contains(&needle))
+    else {
+        return Err("serve-orchestration: pane discovery failed".to_owned());
+    };
+    servecore_validate_pane_id(&pane.id)?;
+    Ok(pane.id.clone())
+}
+
+fn servecore_validate_pane_id(value: &str) -> Result<(), String> {
+    if value
+        .strip_prefix('%')
+        .is_none_or(|rest| rest.is_empty() || !rest.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err("serve-orchestration pane must be safe".to_owned());
     }
-    if request.target.is_some() {
-        argv.extend(["--target".to_owned(), "<deferred>".to_owned()]);
-    }
-    if request.prompt.is_some() {
-        argv.extend(["--prompt".to_owned(), "<redacted>".to_owned()]);
-    }
-    for _ in &request.with_oracles {
-        argv.extend(["--with".to_owned(), "<deferred>".to_owned()]);
-    }
-    if request.split {
-        argv.push("--split".to_owned());
-    }
-    if request.tiled {
-        argv.push("--tiled".to_owned());
-    }
-    argv
+    Ok(())
 }
 
 fn servecore_resolve_workon_repo(root: &Path, repo: &str) -> Result<PathBuf, String> {
@@ -537,6 +806,19 @@ fn servecore_validate_engine_token(value: &str, label: &str) -> Result<(), Strin
     if value
         .chars()
         .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\0')
+    {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    Ok(())
+}
+
+fn servecore_validate_command_token(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value || value.starts_with('-') || value == "--" {
+        return Err(format!("serve-orchestration {label} must be safe"));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
     {
         return Err(format!("serve-orchestration {label} must be safe"));
     }
@@ -1608,6 +1890,10 @@ mod tests {
                 argv: vec!["workon".to_owned(), "demo".to_owned()],
                 status: "fake-spawned".to_owned(),
                 message: None,
+                leader_argv: None,
+                swarm_argv: None,
+                pane: None,
+                swarm_skipped: None,
             })
         }
     }
@@ -1627,6 +1913,57 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakePaneRunner {
+        panes: Mutex<Vec<ServecorePaneCandidate>>,
+        sends: Mutex<Vec<(String, String)>>,
+        fail_send: Mutex<Option<String>>,
+    }
+
+    impl FakePaneRunner {
+        fn with_panes(panes: Vec<ServecorePaneCandidate>) -> Self {
+            Self {
+                panes: Mutex::new(panes),
+                sends: Mutex::new(Vec::new()),
+                fail_send: Mutex::new(None),
+            }
+        }
+
+        fn with_send_failure(panes: Vec<ServecorePaneCandidate>) -> Self {
+            Self {
+                panes: Mutex::new(panes),
+                sends: Mutex::new(Vec::new()),
+                fail_send: Mutex::new(Some("send failed".to_owned())),
+            }
+        }
+    }
+
+    impl ServecorePaneRunner for FakePaneRunner {
+        fn servecore_list_panes(&self) -> Result<Vec<ServecorePaneCandidate>, String> {
+            Ok(self
+                .panes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        }
+
+        fn servecore_send_literal_enter(&self, pane: &str, line: &str) -> Result<(), String> {
+            if let Some(error) = self
+                .fail_send
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Err(error);
+            }
+            self.sends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((pane.to_owned(), line.to_owned()));
+            Ok(())
+        }
+    }
+
     fn servecore_test_root(name: &str) -> PathBuf {
         let mut root = std::env::temp_dir();
         let nanos = SystemTime::now()
@@ -1637,6 +1974,46 @@ mod tests {
             std::process::id()
         ));
         root
+    }
+
+    fn servecore_expected_public_leader() -> Vec<String> {
+        [
+            "wake",
+            "nova",
+            "--task",
+            "feat-295",
+            "--engine",
+            "claude47",
+            "--split",
+            "--no-attach",
+            "--repo",
+            "acme/demo",
+            "--prompt",
+            "<redacted>",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+    }
+
+    fn servecore_expected_private_leader() -> Vec<String> {
+        [
+            "wake",
+            "nova",
+            "--task",
+            "feat-295",
+            "--engine",
+            "claude47",
+            "--split",
+            "--no-attach",
+            "--repo",
+            "acme/demo",
+            "--prompt",
+            "SECRET prompt $(touch pwn)",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
     }
 
     #[test]
@@ -1651,15 +2028,31 @@ mod tests {
             target: Some("nova:1".to_owned()),
             prompt: Some("ship it".to_owned()),
             with_oracles: vec!["wish".to_owned()],
-            attach: true,
+            attach: false,
             split: true,
             tiled: false,
         };
         let plan = servecore_prepare_workon(&root, valid, "stub").expect("plan");
+        let ServecorePreparedOrchestration::Advanced(plan) = plan else {
+            panic!("advanced plan");
+        };
         assert_eq!(plan.engine, "codex-anything");
         assert_eq!(
-            plan.argv,
-            vec!["workon", "acme/demo", "feat-219", "--layout", "nested"]
+            plan.leader_argv,
+            vec![
+                "wake",
+                "nova:1",
+                "--task",
+                "feat-219",
+                "--engine",
+                "codex-anything",
+                "--split",
+                "--no-attach",
+                "--repo",
+                "acme/demo",
+                "--prompt",
+                "ship it",
+            ]
         );
         assert_eq!(plan.repo_path, repo.canonicalize().expect("canon"));
 
@@ -1698,6 +2091,9 @@ mod tests {
         assert_eq!(handle.engine, "maw-rs");
         assert_eq!(handle.status, "spawned");
         assert_eq!(handle.message, None);
+        assert_eq!(handle.leader_argv, None);
+        assert_eq!(handle.swarm_argv, None);
+        assert_eq!(handle.swarm_skipped, None);
         let calls = runner
             .calls
             .lock()
@@ -1716,47 +2112,276 @@ mod tests {
     }
 
     #[test]
-    fn servecore_advanced_fields_return_explicit_deferred_notice_and_redact_prompt() {
-        let root = servecore_test_root("advanced-deferred");
+    fn servecore_advanced_wake_swarm_executes_and_matches_golden() {
+        let root = servecore_test_root("advanced-live");
         let repo = root.join("github.com/acme/demo");
         std::fs::create_dir_all(&repo).expect("repo");
         let runner = Arc::new(FakeExecRunner::default());
-        let orchestrator =
-            ServecoreCommandOrchestrator::servecore_with_runner(root, runner.clone());
+        let pane_runner = Arc::new(FakePaneRunner::with_panes(vec![ServecorePaneCandidate {
+            id: "%42".to_owned(),
+            title: "nova feat-295 leader".to_owned(),
+        }]));
+        let orchestrator = ServecoreCommandOrchestrator::servecore_with_runners(
+            root,
+            runner.clone(),
+            pane_runner.clone(),
+        );
         let handle = orchestrator
             .spawn_workon(
                 ServecoreWorkonRequest {
                     repo: "acme/demo".to_owned(),
                     task: Some("feat-295".to_owned()),
-                    engine: Some("codex".to_owned()),
+                    target: Some("nova".to_owned()),
                     prompt: Some("SECRET prompt $(touch pwn)".to_owned()),
-                    with_oracles: vec!["nova".to_owned()],
+                    with_oracles: vec!["wish".to_owned(), "codex".to_owned()],
+                    split: true,
+                    tiled: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+                Arc::new(ServecoreNativeEngine),
+            )
+            .expect("advanced");
+        assert_eq!(handle.engine, "claude47");
+        assert_eq!(handle.status, "spawned");
+        assert_eq!(handle.pane.as_deref(), Some("%42"));
+        let expected_public_leader = servecore_expected_public_leader();
+        assert_eq!(handle.leader_argv, Some(expected_public_leader.clone()));
+        assert_eq!(handle.argv, expected_public_leader);
+        assert_eq!(
+            handle.swarm_argv,
+            Some(vec![
+                "swarm".to_owned(),
+                "wish".to_owned(),
+                "codex".to_owned(),
+                "--tiled".to_owned()
+            ])
+        );
+        let handle_json = serde_json::to_string(&handle).expect("handle json");
+        assert!(!handle_json.contains("SECRET"));
+        assert!(!handle_json.contains("touch pwn"));
+        assert!(!handle_json.contains("workon"));
+        let calls = runner
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, servecore_expected_private_leader());
+        let sends = pane_runner
+            .sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected_line = format!(
+            "{} 'swarm' 'wish' 'codex' '--tiled'",
+            servecore_shell_quote(
+                &engine::serveengine_self_bin()
+                    .expect("self")
+                    .to_string_lossy()
+            )
+        );
+        assert_eq!(sends.as_slice(), [("%42".to_owned(), expected_line)]);
+        let golden = serde_json::json!({
+            "argv": handle.argv,
+            "engine": handle.engine,
+            "leader_argv": handle.leader_argv,
+            "pane": handle.pane,
+            "status": handle.status,
+            "swarm_argv": handle.swarm_argv,
+        })
+        .to_string();
+        assert_eq!(
+            format!("{golden}\n"),
+            include_str!("../../tests/fixtures/native-serve-engine/advanced-wake-swarm.stdout")
+        );
+    }
+
+    #[test]
+    fn servecore_advanced_shell_quote_and_metachar_guards_block_injection() {
+        assert_eq!(servecore_shell_quote("builder'one"), "'builder'\\''one'");
+        assert_eq!(servecore_shell_quote("$(touch pwn)"), "'$(touch pwn)'");
+        assert_eq!(servecore_shell_quote("`touch pwn`;"), "'`touch pwn`;'");
+
+        let root = servecore_test_root("advanced-quote");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let runner = Arc::new(FakeExecRunner::default());
+        let pane_runner = Arc::new(FakePaneRunner::with_panes(vec![ServecorePaneCandidate {
+            id: "%7".to_owned(),
+            title: "feat-295".to_owned(),
+        }]));
+        let orchestrator = ServecoreCommandOrchestrator::servecore_with_runners(
+            root.clone(),
+            runner.clone(),
+            pane_runner.clone(),
+        );
+        orchestrator
+            .spawn_workon(
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    target: Some("nova".to_owned()),
+                    prompt: Some("data $(touch pwn) `whoami`;".to_owned()),
+                    with_oracles: vec!["wish".to_owned()],
                     split: true,
                     ..ServecoreWorkonRequest::default()
                 },
                 Arc::new(ServecoreNativeEngine),
             )
-            .expect("deferred");
-        assert_eq!(handle.status, "advanced-not-wired");
-        assert_eq!(
-            handle.message.as_deref(),
-            Some("advanced orchestration not yet wired, tracked in PR-B")
+            .expect("spawn");
+        let sends = pane_runner
+            .sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected_line = format!(
+            "{} 'swarm' 'wish'",
+            servecore_shell_quote(
+                &engine::serveengine_self_bin()
+                    .expect("self")
+                    .to_string_lossy()
+            )
         );
-        assert!(!handle
-            .argv
-            .iter()
-            .any(|arg| arg.contains("SECRET") || arg.contains("touch pwn")));
-        assert!(handle.argv.iter().any(|arg| arg == "<redacted>"));
-        assert!(runner
-            .calls
+        assert_eq!(
+            sends[0].1, expected_line,
+            "send-keys receives one quoted literal line, not shell-expanded fragments"
+        );
+
+        for (label, mut request) in [
+            (
+                "target",
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    target: Some("bad;name".to_owned()),
+                    split: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+            ),
+            (
+                "with",
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    with_oracles: vec!["$(touch-pwn)".to_owned()],
+                    split: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+            ),
+            (
+                "with-quote",
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    with_oracles: vec!["bad'name".to_owned()],
+                    split: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+            ),
+        ] {
+            request.engine = Some("claude47".to_owned());
+            assert!(
+                servecore_prepare_workon(&root, request, "maw-rs").is_err(),
+                "{label} metachar must reject before runner"
+            );
+        }
+        assert_eq!(
+            runner
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "bad metachar requests never reach child runner"
+        );
+    }
+
+    #[test]
+    fn servecore_advanced_pane_discovery_fail_is_soft_loud() {
+        let root = servecore_test_root("advanced-no-pane");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let runner = Arc::new(FakeExecRunner::default());
+        let pane_runner = Arc::new(FakePaneRunner::default());
+        let orchestrator =
+            ServecoreCommandOrchestrator::servecore_with_runners(root, runner, pane_runner.clone());
+        let handle = orchestrator
+            .spawn_workon(
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    with_oracles: vec!["wish".to_owned()],
+                    split: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+                Arc::new(ServecoreNativeEngine),
+            )
+            .expect("soft");
+        assert_eq!(handle.status, "leader-spawned");
+        assert_eq!(
+            handle.swarm_skipped.as_deref(),
+            Some("pane discovery failed")
+        );
+        assert!(pane_runner
+            .sends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
-        let golden = serde_json::json!({"argv": handle.argv, "message": handle.message, "status": handle.status}).to_string();
-        assert_eq!(
-            format!("{golden}\n"),
-            include_str!("../../tests/fixtures/native-serve-engine/advanced-deferred.stdout")
-        );
+    }
+
+    #[test]
+    fn servecore_advanced_pane_send_fail_is_soft_loud() {
+        let root = servecore_test_root("advanced-send-fail");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let runner = Arc::new(FakeExecRunner::default());
+        let pane_runner = Arc::new(FakePaneRunner::with_send_failure(vec![
+            ServecorePaneCandidate {
+                id: "%9".to_owned(),
+                title: "feat-295".to_owned(),
+            },
+        ]));
+        let orchestrator =
+            ServecoreCommandOrchestrator::servecore_with_runners(root, runner, pane_runner);
+        let handle = orchestrator
+            .spawn_workon(
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    with_oracles: vec!["wish".to_owned()],
+                    split: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+                Arc::new(ServecoreNativeEngine),
+            )
+            .expect("soft");
+        assert_eq!(handle.status, "leader-spawned");
+        assert_eq!(handle.swarm_skipped.as_deref(), Some("pane send failed"));
+    }
+
+    #[test]
+    fn servecore_advanced_refuses_attach_and_requires_task() {
+        let root = servecore_test_root("advanced-guards");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let attach = ServecoreWorkonRequest {
+            repo: "acme/demo".to_owned(),
+            task: Some("feat-295".to_owned()),
+            attach: true,
+            split: true,
+            ..ServecoreWorkonRequest::default()
+        };
+        let Err(attach_err) = servecore_prepare_workon(&root, attach, "maw-rs") else {
+            panic!("attach must fail");
+        };
+        assert!(attach_err.contains("attach is not supported"));
+
+        let no_task = ServecoreWorkonRequest {
+            repo: "acme/demo".to_owned(),
+            split: true,
+            ..ServecoreWorkonRequest::default()
+        };
+        let Err(task_err) = servecore_prepare_workon(&root, no_task, "maw-rs") else {
+            panic!("task must fail");
+        };
+        assert!(task_err.contains("advanced wake requires task"));
     }
 
     #[test]
