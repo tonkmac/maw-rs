@@ -112,3 +112,8 @@ jobs:
 
       - name: Build maw-cli for musl static
         run: cargo build --release --target x86_64-unknown-linux-musl -p maw-cli
+
+      - name: Report musl binary size
+        run: |
+          ls -lh target/x86_64-unknown-linux-musl/release/maw-rs
+          file target/x86_64-unknown-linux-musl/release/maw-rs
