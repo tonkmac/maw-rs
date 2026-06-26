@@ -1,4 +1,7 @@
+pub mod engine;
 pub mod modules;
+
+pub use engine::{ServecoreExecRunner, ServecoreNativeEngine, ServecoreProcessRunner};
 
 use axum::{
     body::{to_bytes, Body},
@@ -22,7 +25,6 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -286,6 +288,8 @@ pub struct ServecoreWorkonHandle {
     pub target: Option<String>,
     pub argv: Vec<String>,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 pub trait ServecoreOrchestrator: Send + Sync {
@@ -302,9 +306,10 @@ pub trait ServecoreOrchestrator: Send + Sync {
     ) -> Result<ServecoreWorkonHandle, String>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServecoreCommandOrchestrator {
     root: Arc<PathBuf>,
+    runner: Arc<dyn ServecoreExecRunner>,
 }
 
 impl ServecoreCommandOrchestrator {
@@ -318,6 +323,15 @@ impl ServecoreCommandOrchestrator {
     pub fn servecore_with_root(root: PathBuf) -> Self {
         Self {
             root: Arc::new(root),
+            runner: Arc::new(ServecoreProcessRunner),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn servecore_with_runner(root: PathBuf, runner: Arc<dyn ServecoreExecRunner>) -> Self {
+        Self {
+            root: Arc::new(root),
+            runner,
         }
     }
 }
@@ -329,20 +343,10 @@ impl ServecoreOrchestrator for ServecoreCommandOrchestrator {
         engine: Arc<dyn ServecoreEngine>,
     ) -> Result<ServecoreWorkonHandle, String> {
         let plan = servecore_prepare_workon(&self.root, request, engine.servecore_engine_name())?;
-        let output = Command::new("maw")
-            .args(&plan.argv)
-            .current_dir(&plan.repo_path)
-            .output()
-            .map_err(|error| format!("serve-orchestration: spawn failed: {error}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let trimmed = stderr.trim();
-            return Err(if trimmed.is_empty() {
-                "serve-orchestration: workon failed".to_owned()
-            } else {
-                format!("serve-orchestration: workon failed: {trimmed}")
-            });
+        if plan.advanced_deferred {
+            return Ok(plan.into_deferred_handle());
         }
+        self.runner.servecore_run(&plan.argv, &plan.repo_path)?;
         Ok(plan.into_handle("spawned"))
     }
 }
@@ -352,6 +356,7 @@ struct ServecorePreparedWorkon {
     repo_path: PathBuf,
     engine: String,
     argv: Vec<String>,
+    advanced_deferred: bool,
 }
 
 impl ServecorePreparedWorkon {
@@ -364,6 +369,21 @@ impl ServecorePreparedWorkon {
             target: self.request.target,
             argv: self.argv,
             status: status.to_owned(),
+            message: None,
+        }
+    }
+
+    fn into_deferred_handle(self) -> ServecoreWorkonHandle {
+        let argv = servecore_redact_advanced_argv(&self.request);
+        ServecoreWorkonHandle {
+            ok: true,
+            repo: self.request.repo,
+            cwd: self.repo_path.to_string_lossy().into_owned(),
+            engine: self.engine,
+            target: self.request.target,
+            argv,
+            status: "advanced-not-wired".to_owned(),
+            message: Some("advanced orchestration not yet wired, tracked in PR-B".to_owned()),
         }
     }
 }
@@ -391,6 +411,7 @@ fn servecore_prepare_workon(
         .clone()
         .unwrap_or_else(|| default_engine.to_owned());
     servecore_validate_engine_token(&engine, "engine")?;
+    let advanced_deferred = servecore_has_advanced_fields(&request);
     let repo_path = servecore_resolve_workon_repo(root, &request.repo)?;
     let mut argv = vec!["workon".to_owned(), request.repo.clone()];
     if let Some(task) = &request.task {
@@ -402,7 +423,44 @@ fn servecore_prepare_workon(
         repo_path,
         engine,
         argv,
+        advanced_deferred,
     })
+}
+
+fn servecore_has_advanced_fields(request: &ServecoreWorkonRequest) -> bool {
+    request.engine.is_some()
+        || request.prompt.is_some()
+        || request.target.is_some()
+        || !request.with_oracles.is_empty()
+        || request.split
+        || request.tiled
+}
+
+fn servecore_redact_advanced_argv(request: &ServecoreWorkonRequest) -> Vec<String> {
+    let mut argv = vec!["workon".to_owned(), request.repo.clone()];
+    if let Some(task) = &request.task {
+        argv.push(task.clone());
+    }
+    argv.extend(["--layout".to_owned(), "nested".to_owned()]);
+    if request.engine.is_some() {
+        argv.extend(["--engine".to_owned(), "<deferred>".to_owned()]);
+    }
+    if request.target.is_some() {
+        argv.extend(["--target".to_owned(), "<deferred>".to_owned()]);
+    }
+    if request.prompt.is_some() {
+        argv.extend(["--prompt".to_owned(), "<redacted>".to_owned()]);
+    }
+    for _ in &request.with_oracles {
+        argv.extend(["--with".to_owned(), "<deferred>".to_owned()]);
+    }
+    if request.split {
+        argv.push("--split".to_owned());
+    }
+    if request.tiled {
+        argv.push("--tiled".to_owned());
+    }
+    argv
 }
 
 fn servecore_resolve_workon_repo(root: &Path, repo: &str) -> Result<PathBuf, String> {
@@ -1549,7 +1607,23 @@ mod tests {
                 target: request.target,
                 argv: vec!["workon".to_owned(), "demo".to_owned()],
                 status: "fake-spawned".to_owned(),
+                message: None,
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeExecRunner {
+        calls: Mutex<Vec<(Vec<String>, PathBuf)>>,
+    }
+
+    impl ServecoreExecRunner for FakeExecRunner {
+        fn servecore_run(&self, argv: &[String], cwd: &Path) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((argv.to_vec(), cwd.to_path_buf()));
+            Ok(())
         }
     }
 
@@ -1601,6 +1675,112 @@ mod tests {
             ..ServecoreWorkonRequest::default()
         };
         assert!(servecore_prepare_workon(&root, escaped, "stub").is_err());
+    }
+
+    #[test]
+    fn servecore_simple_workon_executes_self_runner_and_matches_golden() {
+        let root = servecore_test_root("simple-exec");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let runner = Arc::new(FakeExecRunner::default());
+        let orchestrator =
+            ServecoreCommandOrchestrator::servecore_with_runner(root.clone(), runner.clone());
+        let handle = orchestrator
+            .spawn_workon(
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    ..ServecoreWorkonRequest::default()
+                },
+                Arc::new(ServecoreNativeEngine),
+            )
+            .expect("spawn");
+        assert_eq!(handle.engine, "maw-rs");
+        assert_eq!(handle.status, "spawned");
+        assert_eq!(handle.message, None);
+        let calls = runner
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            vec!["workon", "acme/demo", "feat-295", "--layout", "nested"]
+        );
+        assert_eq!(calls[0].1, repo.canonicalize().expect("canon"));
+        let golden = serde_json::json!({"argv": handle.argv, "engine": handle.engine, "status": handle.status}).to_string();
+        assert_eq!(
+            format!("{golden}\n"),
+            include_str!("../../tests/fixtures/native-serve-engine/simple-workon.stdout")
+        );
+    }
+
+    #[test]
+    fn servecore_advanced_fields_return_explicit_deferred_notice_and_redact_prompt() {
+        let root = servecore_test_root("advanced-deferred");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let runner = Arc::new(FakeExecRunner::default());
+        let orchestrator =
+            ServecoreCommandOrchestrator::servecore_with_runner(root, runner.clone());
+        let handle = orchestrator
+            .spawn_workon(
+                ServecoreWorkonRequest {
+                    repo: "acme/demo".to_owned(),
+                    task: Some("feat-295".to_owned()),
+                    engine: Some("codex".to_owned()),
+                    prompt: Some("SECRET prompt $(touch pwn)".to_owned()),
+                    with_oracles: vec!["nova".to_owned()],
+                    split: true,
+                    ..ServecoreWorkonRequest::default()
+                },
+                Arc::new(ServecoreNativeEngine),
+            )
+            .expect("deferred");
+        assert_eq!(handle.status, "advanced-not-wired");
+        assert_eq!(
+            handle.message.as_deref(),
+            Some("advanced orchestration not yet wired, tracked in PR-B")
+        );
+        assert!(!handle
+            .argv
+            .iter()
+            .any(|arg| arg.contains("SECRET") || arg.contains("touch pwn")));
+        assert!(handle.argv.iter().any(|arg| arg == "<redacted>"));
+        assert!(runner
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+        let golden = serde_json::json!({"argv": handle.argv, "message": handle.message, "status": handle.status}).to_string();
+        assert_eq!(
+            format!("{golden}\n"),
+            include_str!("../../tests/fixtures/native-serve-engine/advanced-deferred.stdout")
+        );
+    }
+
+    #[test]
+    fn servecore_rejects_task_engine_and_repo_guards() {
+        let root = servecore_test_root("guards");
+        let repo = root.join("github.com/acme/demo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let bad_task = ServecoreWorkonRequest {
+            repo: "acme/demo".to_owned(),
+            task: Some("-bad".to_owned()),
+            ..ServecoreWorkonRequest::default()
+        };
+        assert!(servecore_prepare_workon(&root, bad_task, "maw-rs").is_err());
+        let bad_engine = ServecoreWorkonRequest {
+            repo: "acme/demo".to_owned(),
+            engine: Some("bad\nengine".to_owned()),
+            ..ServecoreWorkonRequest::default()
+        };
+        assert!(servecore_prepare_workon(&root, bad_engine, "maw-rs").is_err());
+        let bad_repo = ServecoreWorkonRequest {
+            repo: "../demo".to_owned(),
+            ..ServecoreWorkonRequest::default()
+        };
+        assert!(servecore_prepare_workon(&root, bad_repo, "maw-rs").is_err());
     }
 
     async fn servecore_spawn_test_server() -> std::net::SocketAddr {

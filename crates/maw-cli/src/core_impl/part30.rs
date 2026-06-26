@@ -190,6 +190,7 @@ fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedSta
         return state.clone();
     }
     let core = crate::serve_core::ServecoreSharedState::default()
+        .servecore_with_engine(Arc::new(crate::serve_core::ServecoreNativeEngine))
         .servecore_with_agents_node(load_hey_config().node)
         .servecore_with_auth(state.cached_pubkey.clone(), state.cached_pubkey.clone());
     #[cfg(not(test))]
