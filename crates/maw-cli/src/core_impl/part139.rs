@@ -1,4 +1,4 @@
-const DISPATCH_133: &[DispatcherEntry] = &[DispatcherEntry {
+const DISPATCH_139: &[DispatcherEntry] = &[DispatcherEntry {
     command: "serve-peer-startup-warnings",
     handler: Handler::Sync(servepeerstartupwarnings_run_command),
 }];
