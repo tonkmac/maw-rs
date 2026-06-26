@@ -351,10 +351,11 @@ pub fn load_manifest_from_dir(dir: &Path) -> Result<Option<LoadedPlugin>, String
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
         });
-    let has_artifact_js = manifest
-        .artifact
-        .as_ref()
-        .is_some_and(|artifact| !artifact.path.is_empty());
+    let has_artifact_js = manifest.artifact.as_ref().is_some_and(|artifact| {
+        !Path::new(&artifact.path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+    });
     let effective_entry = manifest.entry.as_ref().or_else(|| {
         if has_artifact_js {
             manifest.artifact.as_ref().map(|artifact| &artifact.path)
