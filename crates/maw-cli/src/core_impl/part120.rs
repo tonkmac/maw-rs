@@ -30,6 +30,8 @@ struct ChannelPlugin {
 struct ChannelMcpConfig {
     command: String,
     args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untrusted: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -567,6 +569,9 @@ trait ChannelGithubRunner {
     fn ghq_root(&self) -> Result<std::path::PathBuf, (i32, String)>;
     fn repo_exists(&self, path: &std::path::Path) -> bool;
     fn ghq_get(&self, repo: &str, url: &str, root: &std::path::Path) -> Result<(), (i32, String)>;
+    fn file_exists(&self, path: &std::path::Path) -> bool;
+    fn read_to_string(&self, path: &std::path::Path) -> Result<Option<String>, (i32, String)>;
+    fn bun_install_stub(&self, repo: &std::path::Path) -> Result<(), (i32, String)>;
 }
 
 struct ChannelSystemGithubRunner;
@@ -612,6 +617,39 @@ impl ChannelGithubRunner for ChannelSystemGithubRunner {
         let _ = repo;
         channel_run_ghq(&["get", url], std::time::Duration::from_secs(30)).map(|_| ())
     }
+
+    fn file_exists(&self, path: &std::path::Path) -> bool {
+        path.exists()
+    }
+
+    fn read_to_string(&self, path: &std::path::Path) -> Result<Option<String>, (i32, String)> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err((1, format!("channel setup: read {} failed: {error}", path.display()))),
+        }
+    }
+
+    fn bun_install_stub(&self, repo: &std::path::Path) -> Result<(), (i32, String)> {
+        if let Some(log_path) = std::env::var_os("MAW_RS_CHANNEL_FAKE_BUN_INSTALL_LOG") {
+            use std::io::Write as _;
+
+            let path = std::path::PathBuf::from(log_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| (1, format!("channel setup: fake bun log dir failed: {error}")))?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|error| (1, format!("channel setup: fake bun log failed: {error}")))?;
+            writeln!(file, "bun install --cwd {}", repo.display()).map_err(|error| (1, format!("channel setup: fake bun log failed: {error}")))?;
+        }
+        if std::env::var_os("MAW_RS_CHANNEL_FAKE_BUN_INSTALL_FAIL").is_some() {
+            return Err((1, "channel setup: bun install failed".to_owned()));
+        }
+        Ok(())
+    }
 }
 
 fn channel_setup_github(args: &ChannelSetupArgs) -> Result<String, (i32, String)> {
@@ -636,10 +674,36 @@ fn channel_setup_github_with_runner(args: &ChannelSetupArgs, runner: &dyn Channe
     }
     let repo_canon = channel_canonicalize_github_repo(&root, &repo_path)?;
 
+    let mcp = channel_github_mcp_config(runner, &repo_canon)?;
+    let bun_result = if runner.file_exists(&repo_canon.join("package.json")) {
+        Some(runner.bun_install_stub(&repo_canon))
+    } else {
+        None
+    };
+    let config_path = channel_oracle_config_path(&args.oracle);
+    let mut config = channel_load_config_at(&config_path).unwrap_or_default();
+    let mut wrote_config = false;
+    let plugin = channel_github_plugin(args, repo, &repo_canon, &mcp);
+    if let Some(pass_key) = &args.pass_key {
+        config.token_source = Some(format!("pass:{pass_key}"));
+    }
+    if config.plugins.iter().any(|existing| existing.id == plugin.id) {
+        if args.pass_key.is_some() {
+            channel_archive_existing_config(&config_path)?;
+            channel_save_config_private_at(&config_path, &config)?;
+            wrote_config = true;
+        }
+    } else {
+        config.plugins.push(plugin.clone());
+        channel_archive_existing_config(&config_path)?;
+        channel_save_config_private_at(&config_path, &config)?;
+        wrote_config = true;
+    }
+
     let mut stdout = String::new();
     let _ = writeln!(stdout, "\n  \x1b[36;1m🔧 Git Channel Setup for {}\x1b[0m", args.oracle);
     let _ = writeln!(stdout, "  {}", "─".repeat(45));
-    let _ = writeln!(stdout, "\n  \x1b[36mStep 1/3: Locate repo\x1b[0m");
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 1/4: Locate repo\x1b[0m");
     let _ = writeln!(stdout, "  source: github:{repo}");
     let _ = writeln!(stdout, "  ghq root: {}", root.display());
     let _ = writeln!(stdout, "  repo: {}", repo_canon.display());
@@ -648,20 +712,142 @@ fn channel_setup_github_with_runner(args: &ChannelSetupArgs, runner: &dyn Channe
     } else {
         stdout.push_str("  \x1b[32m✓\x1b[0m repo already present — clone skipped\n");
     }
-    let _ = writeln!(stdout, "\n  \x1b[36mStep 2/3: Token reference\x1b[0m");
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 2/4: Token + dependencies\x1b[0m");
     if let Some(pass_key) = &args.pass_key {
         let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m token source: pass:{pass_key} (reference only)");
     } else {
-        stdout.push_str("  \x1b[90m· token source not configured in PR-A\x1b[0m\n");
+        stdout.push_str("  \x1b[90m· token source not configured\x1b[0m\n");
     }
-    if !args.env.is_empty() {
-        stdout.push_str("  \x1b[90m· env entries validated; config write deferred to PR-B\x1b[0m\n");
+    match bun_result {
+        Some(Ok(())) => stdout.push_str("  \x1b[33m⚠\x1b[0m package.json found — bun install stubbed/best-effort; continuing\n"),
+        Some(Err((_, message))) => {
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m {message}; continuing");
+        }
+        None => stdout.push_str("  \x1b[90m· no package.json — bun install skipped\x1b[0m\n"),
     }
-    let _ = writeln!(stdout, "\n  \x1b[36mStep 3/3: Deferred live wiring\x1b[0m");
-    stdout.push_str("  \x1b[90m· config registration deferred to PR-B\x1b[0m\n");
-    stdout.push_str("  \x1b[90m· .mcp.json detection deferred to PR-B (not read)\x1b[0m\n");
-    stdout.push_str("  \x1b[90m· bun install/dev-server deferred to PR-B (not run)\x1b[0m\n");
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 3/4: MCP record\x1b[0m");
+    let untrusted_label = if mcp.config.untrusted == Some(true) { " (untrusted .mcp.json, validated)" } else { " (native default)" };
+    let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {} → {}{}{}", mcp.plugin_id, mcp.config.command, channel_display_args(&mcp.config.args), untrusted_label);
+    stdout.push_str("  \x1b[90m· setup records MCP only; it does not spawn the MCP command\x1b[0m\n");
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 4/4: Register config\x1b[0m");
+    if wrote_config {
+        let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m wrote {} (0600)", channel_tilde_path(&config_path));
+    } else {
+        let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m already registered: {} → {}", args.oracle, plugin.id);
+    }
+    stdout.push_str("  \x1b[90m· dev-server spawn is out of scope for setup\x1b[0m\n");
+    stdout.push_str("\n  \x1b[32m✅ Git channel setup complete\x1b[0m\n");
     Ok(stdout)
+}
+
+#[derive(Debug)]
+struct ChannelGithubMcp {
+    plugin_id: String,
+    config: ChannelMcpConfig,
+}
+
+fn channel_github_plugin(args: &ChannelSetupArgs, repo: &str, repo_path: &std::path::Path, mcp: &ChannelGithubMcp) -> ChannelPlugin {
+    ChannelPlugin {
+        id: mcp.plugin_id.clone(),
+        env: (!args.env.is_empty()).then_some(args.env.clone()),
+        source: Some(format!("github:{repo}")),
+        path: Some(repo_path.display().to_string()),
+        mcp: Some(mcp.config.clone()),
+        dev: Some(true),
+    }
+}
+
+fn channel_github_mcp_config(runner: &dyn ChannelGithubRunner, repo_path: &std::path::Path) -> Result<ChannelGithubMcp, (i32, String)> {
+    let path = repo_path.join(".mcp.json");
+    let Some(raw) = runner.read_to_string(&path)? else {
+        return Ok(ChannelGithubMcp {
+            plugin_id: "server:relay".to_owned(),
+            config: ChannelMcpConfig {
+                command: "bun".to_owned(),
+                args: vec!["run".to_owned(), "--cwd".to_owned(), repo_path.display().to_string(), "start".to_owned()],
+                untrusted: None,
+            },
+        });
+    };
+    channel_parse_untrusted_mcp(&raw, repo_path)
+}
+
+fn channel_parse_untrusted_mcp(raw: &str, repo_path: &std::path::Path) -> Result<ChannelGithubMcp, (i32, String)> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| (2, format!("channel setup: invalid .mcp.json: {error}")))?;
+    let servers = value
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .filter(|object| !object.is_empty())
+        .ok_or_else(|| (2, "channel setup: .mcp.json missing mcpServers".to_owned()))?;
+    let (name, server) = servers
+        .iter()
+        .next()
+        .ok_or_else(|| (2, "channel setup: .mcp.json missing mcpServers".to_owned()))?;
+    let server_name = channel_validate_mcp_server_name(name)?;
+    let command = server.get("command").and_then(serde_json::Value::as_str).unwrap_or("bun");
+    let command = channel_validate_mcp_command(command)?;
+    let args = server
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| (2, "channel setup: invalid .mcp.json args".to_owned()))
+                        .and_then(|arg| channel_validate_mcp_arg(arg, repo_path))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ChannelGithubMcp {
+        plugin_id: format!("server:{server_name}"),
+        config: ChannelMcpConfig { command, args, untrusted: Some(true) },
+    })
+}
+
+fn channel_validate_mcp_server_name(value: &str) -> Result<String, (i32, String)> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.starts_with('-')
+        || value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+        || !value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err((2, "channel setup: invalid .mcp.json server name".to_owned()));
+    }
+    Ok(value.to_owned())
+}
+
+fn channel_validate_mcp_command(value: &str) -> Result<String, (i32, String)> {
+    if channel_mcp_token_invalid(value) || value.contains('/') || value.contains('\\') || value.chars().any(char::is_whitespace) {
+        return Err((2, "channel setup: invalid .mcp.json command".to_owned()));
+    }
+    Ok(value.to_owned())
+}
+
+fn channel_validate_mcp_arg(value: &str, repo_path: &std::path::Path) -> Result<String, (i32, String)> {
+    let resolved = value.replace("${CLAUDE_PLUGIN_ROOT}", &repo_path.display().to_string());
+    if channel_mcp_token_invalid(&resolved) {
+        return Err((2, "channel setup: invalid .mcp.json args".to_owned()));
+    }
+    Ok(resolved)
+}
+
+fn channel_mcp_token_invalid(value: &str) -> bool {
+    value.is_empty()
+        || value.trim() != value
+        || value.starts_with('-')
+        || value.chars().any(char::is_control)
+        || value.chars().any(|ch| matches!(ch, ';' | '&' | '|' | '$' | '<' | '>' | '`' | '"' | '\'' | '(' | ')' | '{' | '}'))
+}
+
+fn channel_display_args(args: &[String]) -> String {
+    if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) }
 }
 
 fn channel_github_repo_path(root: &std::path::Path, repo: &str) -> std::path::PathBuf {
@@ -1308,6 +1494,11 @@ fn channel_save_config_at(path: &std::path::Path, config: &ChannelConfig) -> Res
     channel_atomic_write(path, &(json + "\n"))
 }
 
+fn channel_save_config_private_at(path: &std::path::Path, config: &ChannelConfig) -> Result<(), (i32, String)> {
+    let json = serde_json::to_string_pretty(config).map_err(|error| (1, format!("channel: serialize config failed: {error}")))?;
+    channel_atomic_write_private(path, &(json + "\n"), 0o600)
+}
+
 fn channel_atomic_write(path: &std::path::Path, contents: &str) -> Result<(), (i32, String)> {
     let parent = path.parent().ok_or_else(|| (1, "channel: config path has no parent".to_owned()))?;
     std::fs::create_dir_all(parent).map_err(|error| (1, format!("channel: create config dir failed: {error}")))?;
@@ -1409,12 +1600,183 @@ mod channel_pr301_tests {
         assert_eq!(plugin.dev, Some(true));
         assert_eq!(
             plugin.mcp.as_ref().expect("mcp"),
-            &ChannelMcpConfig { command: "node".to_owned(), args: vec!["server.js".to_owned()] }
+            &ChannelMcpConfig { command: "node".to_owned(), args: vec!["server.js".to_owned()], untrusted: None }
         );
         let serialized = serde_json::to_string(&config).expect("serialize");
         assert!(serialized.contains("\"source\""));
         assert!(serialized.contains("\"path\""));
         assert!(serialized.contains("\"mcp\""));
         assert!(serialized.contains("\"dev\""));
+    }
+
+    #[derive(Debug)]
+    struct FakeGithubRunner {
+        root: std::path::PathBuf,
+        bun_fail: bool,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeGithubRunner {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self { root, bun_fail: false, calls: std::cell::RefCell::new(Vec::new()) }
+        }
+
+        fn with_bun_fail(root: std::path::PathBuf) -> Self {
+            Self { root, bun_fail: true, calls: std::cell::RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl ChannelGithubRunner for FakeGithubRunner {
+        fn ghq_root(&self) -> Result<std::path::PathBuf, (i32, String)> {
+            self.calls.borrow_mut().push("ghq root".to_owned());
+            Ok(self.root.clone())
+        }
+
+        fn repo_exists(&self, path: &std::path::Path) -> bool {
+            self.calls.borrow_mut().push(format!("exists {}", path.display()));
+            path.exists()
+        }
+
+        fn ghq_get(&self, repo: &str, url: &str, root: &std::path::Path) -> Result<(), (i32, String)> {
+            self.calls.borrow_mut().push(format!("ghq get {url}"));
+            std::fs::create_dir_all(channel_github_repo_path(root, repo)).expect("fake clone");
+            Ok(())
+        }
+
+        fn file_exists(&self, path: &std::path::Path) -> bool {
+            self.calls.borrow_mut().push(format!("file-exists {}", path.display()));
+            path.exists()
+        }
+
+        fn read_to_string(&self, path: &std::path::Path) -> Result<Option<String>, (i32, String)> {
+            self.calls.borrow_mut().push(format!("read {}", path.display()));
+            match std::fs::read_to_string(path) {
+                Ok(raw) => Ok(Some(raw)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err((1, error.to_string())),
+            }
+        }
+
+        fn bun_install_stub(&self, repo: &std::path::Path) -> Result<(), (i32, String)> {
+            self.calls.borrow_mut().push(format!("bun-stub {}", repo.display()));
+            if self.bun_fail {
+                Err((1, "channel setup: bun install failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("maw-rs-channel-{name}-{stamp}"));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    fn github_args() -> ChannelSetupArgs {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CHANNEL_MODE".to_owned(), "dev".to_owned());
+        ChannelSetupArgs {
+            oracle: "relay-oracle".to_owned(),
+            provider: ChannelSetupProvider::Github("ARRA-01/claude-channel-relay".to_owned()),
+            pass_key: Some("github/relay-token".to_owned()),
+            guild_id: None,
+            env,
+        }
+    }
+
+    fn seed_repo(root: &std::path::Path, mcp: Option<&str>, package_json: bool) -> std::path::PathBuf {
+        let repo = channel_github_repo_path(root, "ARRA-01/claude-channel-relay");
+        std::fs::create_dir_all(&repo).expect("repo");
+        if let Some(mcp) = mcp {
+            std::fs::write(repo.join(".mcp.json"), mcp).expect("mcp");
+        }
+        if package_json {
+            std::fs::write(repo.join("package.json"), "{}\n").expect("package");
+        }
+        repo
+    }
+
+    #[test]
+    fn channel_github_prb_records_untrusted_mcp_without_autospawn_or_token_value() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = super::EnvVarRestore::capture("HOME");
+        let home = temp_path("home-record");
+        let ghq = temp_path("ghq-record");
+        std::env::set_var("HOME", &home);
+        let repo = seed_repo(
+            &ghq,
+            Some(r#"{"mcpServers":{"relay":{"command":"bun","args":["run","start"]}}}"#),
+            true,
+        );
+        let runner = FakeGithubRunner::new(ghq.clone());
+
+        let stdout = channel_setup_github_with_runner(&github_args(), &runner).expect("setup");
+        assert!(stdout.contains("setup records MCP only; it does not spawn"));
+        assert!(stdout.contains("pass:github/relay-token (reference only)"));
+        assert!(!stdout.contains("ghp_"));
+        let calls = runner.calls.borrow().join("\n");
+        assert!(calls.contains("bun-stub"));
+        assert!(!calls.contains("bun run start"), "mcp command must not spawn at setup: {calls}");
+
+        let config = channel_load_config_at(&channel_oracle_config_path("relay-oracle")).expect("config");
+        assert_eq!(config.token_source.as_deref(), Some("pass:github/relay-token"));
+        assert_eq!(config.plugins.len(), 1);
+        let plugin = &config.plugins[0];
+        assert_eq!(plugin.id, "server:relay");
+        assert_eq!(plugin.source.as_deref(), Some("github:ARRA-01/claude-channel-relay"));
+        assert_eq!(plugin.path.as_deref(), Some(repo.canonicalize().expect("repo canon").to_string_lossy().as_ref()));
+        assert_eq!(plugin.dev, Some(true));
+        let mcp = plugin.mcp.as_ref().expect("mcp");
+        assert_eq!(mcp.command, "bun");
+        assert_eq!(mcp.args, vec!["run".to_owned(), "start".to_owned()]);
+        assert_eq!(mcp.untrusted, Some(true));
+    }
+
+    #[test]
+    fn channel_github_prb_rejects_untrusted_mcp_leading_dash_before_config_write() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = super::EnvVarRestore::capture("HOME");
+        let home = temp_path("home-reject");
+        let ghq = temp_path("ghq-reject");
+        std::env::set_var("HOME", &home);
+        seed_repo(
+            &ghq,
+            Some(r#"{"mcpServers":{"relay":{"command":"bun","args":["--cwd","/tmp"]}}}"#),
+            false,
+        );
+        let runner = FakeGithubRunner::new(ghq);
+
+        let err = channel_setup_github_with_runner(&github_args(), &runner).expect_err("reject untrusted arg");
+        assert_eq!(err.0, 2);
+        assert!(err.1.contains("invalid .mcp.json args"));
+        assert!(!channel_oracle_config_path("relay-oracle").exists());
+        let calls = runner.calls.borrow().join("\n");
+        assert!(!calls.contains("bun-stub"));
+    }
+
+    #[test]
+    fn channel_github_prb_default_mcp_allows_internal_cwd_and_bun_failure_warns_continue() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = super::EnvVarRestore::capture("HOME");
+        let home = temp_path("home-default");
+        let ghq = temp_path("ghq-default");
+        std::env::set_var("HOME", &home);
+        let repo = seed_repo(&ghq, None, true);
+        let runner = FakeGithubRunner::with_bun_fail(ghq);
+
+        let stdout = channel_setup_github_with_runner(&github_args(), &runner).expect("setup");
+        assert!(stdout.contains("bun install failed; continuing"));
+        let config = channel_load_config_at(&channel_oracle_config_path("relay-oracle")).expect("config");
+        let mcp = config.plugins[0].mcp.as_ref().expect("mcp");
+        assert_eq!(mcp.untrusted, None);
+        assert_eq!(
+            mcp.args,
+            vec!["run".to_owned(), "--cwd".to_owned(), repo.canonicalize().expect("repo").display().to_string(), "start".to_owned()]
+        );
     }
 }
