@@ -481,7 +481,7 @@ fn channel_setup_imessage_matches_golden_with_fake_darwin() {
 }
 
 #[test]
-fn channel_setup_github_clones_with_fake_ghq_and_defers_writes() {
+fn channel_setup_github_clones_with_fake_ghq_and_registers_config() {
     let root = channel_temp_dir("setup-github");
     let repo = channel_empty_repo(&root);
     let ghq_root = root.join("ghq");
@@ -528,9 +528,33 @@ fn channel_setup_github_clones_with_fake_ghq_and_defers_writes() {
     assert!(ghq_root
         .join("github.com/ARRA-01/claude-channel-relay")
         .is_dir());
-    assert!(!root
-        .join("home/.claude/channels/hermes-git/config.json")
-        .exists());
+    let config_path = root.join("home/.claude/channels/hermes-git/config.json");
+    assert!(config_path.exists());
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).expect("config")).expect("json");
+    assert_eq!(config["token_source"], "pass:github/hermes-token");
+    assert_eq!(config["plugins"][0]["id"], "server:relay");
+    assert_eq!(
+        config["plugins"][0]["source"],
+        "github:ARRA-01/claude-channel-relay"
+    );
+    assert_eq!(config["plugins"][0]["dev"], true);
+    assert_eq!(config["plugins"][0]["mcp"]["command"], "bun");
+    assert!(!fs::read_to_string(&config_path)
+        .expect("config text")
+        .contains(SECRET_VALUE));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&config_path)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]
