@@ -31,6 +31,7 @@ struct AgentsRow {
 
 trait AgentsRuntime {
     fn agents_node(&self) -> String;
+    fn agents_routes(&self) -> HashMap<String, String>;
     fn agents_sessions(&mut self) -> Vec<TmuxSession>;
     fn agents_panes(&mut self) -> Vec<TmuxPane>;
 }
@@ -40,6 +41,10 @@ struct AgentsSystemRuntime;
 impl AgentsRuntime for AgentsSystemRuntime {
     fn agents_node(&self) -> String {
         agents_load_node().unwrap_or_else(|| "local".to_owned())
+    }
+
+    fn agents_routes(&self) -> HashMap<String, String> {
+        load_hey_config().route.agents
     }
 
     fn agents_sessions(&mut self) -> Vec<TmuxSession> {
@@ -71,8 +76,14 @@ fn agents_run(argv: &[String], runtime: &mut impl AgentsRuntime) -> Result<Strin
         return Ok(format!("{AGENTS_USAGE}\n"));
     }
     let options = agents_parse_args(argv)?;
-    if options.node.is_some() {
-        return Ok(agents_render_node_stub());
+    if let Some(node) = &options.node {
+        let local_node = runtime.agents_node();
+        let routes = runtime.agents_routes();
+        let rows = agents_build_node_rows(&routes, node, &local_node);
+        if options.json {
+            return agents_render_json(&rows);
+        }
+        return Ok(agents_render_table(&rows));
     }
     let node = runtime.agents_node();
     let sessions = runtime.agents_sessions();
@@ -255,8 +266,36 @@ fn agents_is_shell_command(command: &str) -> bool {
     )
 }
 
-fn agents_render_node_stub() -> String {
-    "--node <name> federation not yet implemented\nTrack progress: https://github.com/Soul-Brews-Studio/maw-js/issues\n".to_owned()
+fn agents_build_node_rows(routes: &HashMap<String, String>, requested_node: &str, local_node: &str) -> Vec<AgentsRow> {
+    let mut oracles = routes
+        .iter()
+        .filter(|(_, node)| agents_route_matches_node(node, requested_node, local_node))
+        .map(|(oracle, _)| oracle.clone())
+        .collect::<Vec<_>>();
+    oracles.sort();
+    oracles
+        .into_iter()
+        .map(|oracle| AgentsRow {
+            node: requested_node.to_owned(),
+            session: oracle.clone(),
+            window: agents_oracle_window(&oracle),
+            oracle: agents_oracle_name(&oracle),
+            state: "idle".to_owned(),
+            pid: None,
+        })
+        .collect()
+}
+
+fn agents_route_matches_node(route_node: &str, requested_node: &str, local_node: &str) -> bool {
+    route_node == requested_node || (route_node == "local" && (requested_node == "local" || requested_node == local_node))
+}
+
+fn agents_oracle_window(oracle: &str) -> String {
+    if oracle.ends_with(AGENTS_ORACLE_SUFFIX) { oracle.to_owned() } else { format!("{oracle}{AGENTS_ORACLE_SUFFIX}") }
+}
+
+fn agents_oracle_name(oracle: &str) -> String {
+    oracle.strip_suffix(AGENTS_ORACLE_SUFFIX).unwrap_or(oracle).to_owned()
 }
 
 fn agents_render_json(rows: &[AgentsRow]) -> Result<String, String> {
@@ -338,6 +377,7 @@ mod agents_tests {
 
     struct AgentsFakeRuntime {
         node: String,
+        routes: HashMap<String, String>,
         sessions: Vec<TmuxSession>,
         panes: Vec<TmuxPane>,
         touched_tmux: bool,
@@ -346,6 +386,10 @@ mod agents_tests {
     impl AgentsRuntime for AgentsFakeRuntime {
         fn agents_node(&self) -> String {
             self.node.clone()
+        }
+
+        fn agents_routes(&self) -> HashMap<String, String> {
+            self.routes.clone()
         }
 
         fn agents_sessions(&mut self) -> Vec<TmuxSession> {
@@ -362,6 +406,11 @@ mod agents_tests {
     fn agents_fake_runtime() -> AgentsFakeRuntime {
         AgentsFakeRuntime {
             node: "test-node".to_owned(),
+            routes: HashMap::from([
+                ("nova".to_owned(), "edge".to_owned()),
+                ("wish-oracle".to_owned(), "edge".to_owned()),
+                ("localbot".to_owned(), "local".to_owned()),
+            ]),
             sessions: vec![TmuxSession {
                 name: "alpha".to_owned(),
                 windows: vec![
@@ -440,10 +489,28 @@ mod agents_tests {
     fn agents_node_and_help_do_not_touch_tmux() {
         let mut runtime = agents_fake_runtime();
         let node = agents_run(&agents_args(&["--node", "edge"]), &mut runtime).expect("node");
-        assert!(node.contains("federation not yet implemented"));
+        assert_eq!(node, include_str!("../../tests/fixtures/native-agents/node-edge.stdout"));
         assert!(!runtime.touched_tmux);
         let help = agents_run(&agents_args(&["--help"]), &mut runtime).expect("help");
         assert_eq!(help, format!("{AGENTS_USAGE}\n"));
+        assert!(!runtime.touched_tmux);
+    }
+
+    #[test]
+    fn agents_node_json_is_metadata_only_and_ignores_missing_js_ref() {
+        let old = std::env::var_os("MAW_JS_REF_DIR");
+        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+        let mut runtime = agents_fake_runtime();
+        let out = agents_run(&agents_args(&["--node=edge", "--json"]), &mut runtime).expect("json");
+        if let Some(value) = old { std::env::set_var("MAW_JS_REF_DIR", value); } else { std::env::remove_var("MAW_JS_REF_DIR"); }
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json parse");
+        assert_eq!(value.as_array().expect("array").len(), 2);
+        assert_eq!(value[0]["node"], "edge");
+        assert_eq!(value[0]["session"], "nova");
+        assert_eq!(value[0]["window"], "nova-oracle");
+        assert_eq!(value[0]["oracle"], "nova");
+        assert_eq!(value[0]["state"], "idle");
+        assert!(value[0]["pid"].is_null());
         assert!(!runtime.touched_tmux);
     }
 
@@ -459,6 +526,7 @@ mod agents_tests {
     fn agents_empty_table_matches_js_message() {
         let mut runtime = AgentsFakeRuntime {
             node: "local".to_owned(),
+            routes: HashMap::new(),
             sessions: Vec::new(),
             panes: vec![agents_pane("%1", "bash", "alpha:notes.0", None)],
             touched_tmux: false,
