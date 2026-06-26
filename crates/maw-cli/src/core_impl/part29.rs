@@ -858,18 +858,12 @@ async fn run_health_async_impl(raw_args: &[String]) -> CliOutput {
 }
 
 async fn run_messages_async_impl(raw_args: &[String]) -> CliOutput {
+    if let Some(output) = messages_lifecycle_subcommand152(raw_args) { return output; }
     let mut path = "/api/message-ledger".to_owned();
     let mut passthrough = Vec::<String>::new();
     let mut index = 0;
     while index < raw_args.len() {
         match raw_args[index].as_str() {
-            "serve" | "status" | "stop" => {
-                return CliOutput {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: "messages: serve/status/stop engine subcommands are not used by the native local-server client\n".to_owned(),
-                };
-            }
             "--limit" | "--from" | "--to" | "--direction" | "--state" | "--q" => {
                 let Some(value) = raw_args.get(index + 1) else {
                     return messages_usage_error(&format!("messages: missing {} value", raw_args[index]));
@@ -904,7 +898,7 @@ fn messages_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
         stdout: String::new(),
-        stderr: format!("{message}\nusage: maw-rs messages [--limit N --from ID --to ID --direction outbound|inbound|forwarded --state queued|delivered|failed --q text --json]\n"),
+        stderr: format!("{message}\nusage: maw-rs messages [serve [--detach] [--engine URL] [--port N] | status [--engine URL] | stop [--engine URL] | --limit N --from ID --to ID --direction outbound|inbound|forwarded --state queued|delivered|failed --q text --json]\n"),
     }
 }
 

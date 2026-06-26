@@ -46,6 +46,7 @@ fn run_serve_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> 
 }
 
 async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
+    if let Some(output) = serve_lifecycle_subcommand152(raw_args) { return output; }
     let args = match parse_serve_args(raw_args) {
         Ok(args) => args,
         Err(message) => return serve_usage_error(&message),
@@ -173,7 +174,7 @@ fn serve_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{prefix}usage: maw-rs serve [--host 127.0.0.1] [--port <port>] [--cached-pubkey <key>]\n"
+            "{prefix}usage: maw-rs serve [--host 127.0.0.1] [--port <port>] [--cached-pubkey <key>] | maw-rs serve status|--status|stop\n"
         ),
     }
 }
