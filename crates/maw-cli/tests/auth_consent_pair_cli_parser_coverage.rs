@@ -57,7 +57,7 @@ fn top_level_help_shows_only_live_ported_surfaces() {
 
     assert_eq!(
         dispatcher_status("not-a-real-command"),
-        DispatchKind::BunFallback
+        DispatchKind::NativeError
     );
 }
 
