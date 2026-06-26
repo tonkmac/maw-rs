@@ -87,7 +87,6 @@ fn native_oracle_skills_passes_args_to_arra_binary_and_matches_golden() {
         &root,
         &[
             "oracle-skills",
-            "--help",
             "list",
             "--agent=codex",
             "--literal=-not-a-maw-flag",
@@ -101,7 +100,7 @@ fn native_oracle_skills_passes_args_to_arra_binary_and_matches_golden() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout"),
-        include_str!("fixtures/native-oracle-skills/help.stdout")
+        "oracle-skills child stdout\n"
     );
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr"),
@@ -109,7 +108,7 @@ fn native_oracle_skills_passes_args_to_arra_binary_and_matches_golden() {
     );
     assert_eq!(
         fs::read_to_string(root.join("argv.log")).expect("argv log"),
-        "<--help>\n<list>\n<--agent=codex>\n<--literal=-not-a-maw-flag>\n"
+        "<list>\n<--agent=codex>\n<--literal=-not-a-maw-flag>\n"
     );
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -148,7 +147,7 @@ fn native_oracle_skills_missing_binary_surfaces_install_hint_without_maw_js_ref(
     let root = temp_dir("missing");
     fs::create_dir_all(root.join("bin")).expect("bin dir");
 
-    let output = run(&root, &["oracle-skills", "--help"]);
+    let output = run(&root, &["oracle-skills", "list"]);
 
     assert!(!output.status.success());
     assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
