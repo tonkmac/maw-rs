@@ -16,6 +16,20 @@ struct ChannelPlugin {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<ChannelMcpConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ChannelMcpConfig {
+    command: String,
+    args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,7 +241,7 @@ fn channel_new_plugin(args: &ChannelAddArgs) -> ChannelPlugin {
         let state_dir = if args.repo_path.is_some() { ".claude/channel-state".to_owned() } else { format!("~/.claude/channels/{}", args.oracle) };
         env.insert("DISCORD_STATE_DIR".to_owned(), state_dir);
     }
-    ChannelPlugin { id: args.plugin_id.clone(), env: (!env.is_empty()).then_some(env) }
+    ChannelPlugin { id: args.plugin_id.clone(), env: (!env.is_empty()).then_some(env), ..ChannelPlugin::default() }
 }
 
 fn channel_push_added_env(stdout: &mut String, plugin: &ChannelPlugin) {
@@ -456,7 +470,7 @@ fn channel_remove_global_after_copy(stem: &str, stdout: &mut String) -> Result<(
 fn channel_setup(input: &[String]) -> Result<String, (i32, String)> {
     let setup_args = channel_parse_setup(input)?;
     match &setup_args.provider {
-        ChannelSetupProvider::Github(repo) => Ok(channel_setup_github_stub(&setup_args.oracle, repo)),
+        ChannelSetupProvider::Github(_) => channel_setup_github(&setup_args),
         _ => channel_setup_official(&setup_args),
     }
 }
@@ -549,11 +563,157 @@ fn channel_validate_snowflake(value: &str) -> Result<String, (i32, String)> {
     Ok(value.to_owned())
 }
 
-fn channel_setup_github_stub(oracle: &str, repo: &str) -> String {
-    format!(
-        "\n  \x1b[36;1m🔧 Git Channel Setup for {oracle}\x1b[0m\n  {}\n\n  \x1b[33m⚠\x1b[0m github:{repo} setup is plan-only in native PR-C\n  \x1b[90mno external clone, no JS dependency install, no dev server registration performed\x1b[0m\n  \x1b[90mdeferred to channel migrate/setup destructive design gate\x1b[0m\n",
-        "─".repeat(45)
-    )
+trait ChannelGithubRunner {
+    fn ghq_root(&self) -> Result<std::path::PathBuf, (i32, String)>;
+    fn repo_exists(&self, path: &std::path::Path) -> bool;
+    fn ghq_get(&self, repo: &str, url: &str, root: &std::path::Path) -> Result<(), (i32, String)>;
+}
+
+struct ChannelSystemGithubRunner;
+
+impl ChannelGithubRunner for ChannelSystemGithubRunner {
+    fn ghq_root(&self) -> Result<std::path::PathBuf, (i32, String)> {
+        if let Some(root) = std::env::var_os("MAW_RS_CHANNEL_FAKE_GHQ_ROOT") {
+            return Ok(std::path::PathBuf::from(root));
+        }
+        let stdout = channel_run_ghq(&["root"], std::time::Duration::from_secs(10))?;
+        let root = stdout.trim();
+        if root.is_empty() {
+            return Err((1, "channel setup: ghq root returned empty path".to_owned()));
+        }
+        Ok(std::path::PathBuf::from(root))
+    }
+
+    fn repo_exists(&self, path: &std::path::Path) -> bool {
+        path.exists()
+    }
+
+    fn ghq_get(&self, repo: &str, url: &str, root: &std::path::Path) -> Result<(), (i32, String)> {
+        if std::env::var_os("MAW_RS_CHANNEL_FAKE_GHQ_GET_FAIL").is_some() {
+            return Err((1, "channel setup: ghq get failed".to_owned()));
+        }
+        if let Some(log_path) = std::env::var_os("MAW_RS_CHANNEL_FAKE_GHQ_GET_LOG") {
+            use std::io::Write as _;
+
+            let path = std::path::PathBuf::from(log_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| (1, format!("channel setup: fake ghq log dir failed: {error}")))?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|error| (1, format!("channel setup: fake ghq log failed: {error}")))?;
+            writeln!(file, "ghq get {url}").map_err(|error| (1, format!("channel setup: fake ghq log failed: {error}")))?;
+            std::fs::create_dir_all(channel_github_repo_path(root, repo))
+                .map_err(|error| (1, format!("channel setup: fake ghq create repo failed: {error}")))?;
+            return Ok(());
+        }
+        let _ = repo;
+        channel_run_ghq(&["get", url], std::time::Duration::from_secs(30)).map(|_| ())
+    }
+}
+
+fn channel_setup_github(args: &ChannelSetupArgs) -> Result<String, (i32, String)> {
+    channel_setup_github_with_runner(args, &ChannelSystemGithubRunner)
+}
+
+fn channel_setup_github_with_runner(args: &ChannelSetupArgs, runner: &dyn ChannelGithubRunner) -> Result<String, (i32, String)> {
+    use std::fmt::Write as _;
+
+    let ChannelSetupProvider::Github(repo) = &args.provider else {
+        return Err((2, "channel setup: github runner used for non-github provider".to_owned()));
+    };
+    let root_raw = runner.ghq_root()?;
+    let root = channel_canonicalize_ghq_root(&root_raw)?;
+    let repo_path = channel_github_repo_path(&root, repo);
+    let url = format!("https://github.com/{repo}");
+    let mut cloned = false;
+
+    if !runner.repo_exists(&repo_path) {
+        runner.ghq_get(repo, &url, &root)?;
+        cloned = true;
+    }
+    let repo_canon = channel_canonicalize_github_repo(&root, &repo_path)?;
+
+    let mut stdout = String::new();
+    let _ = writeln!(stdout, "\n  \x1b[36;1m🔧 Git Channel Setup for {}\x1b[0m", args.oracle);
+    let _ = writeln!(stdout, "  {}", "─".repeat(45));
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 1/3: Locate repo\x1b[0m");
+    let _ = writeln!(stdout, "  source: github:{repo}");
+    let _ = writeln!(stdout, "  ghq root: {}", root.display());
+    let _ = writeln!(stdout, "  repo: {}", repo_canon.display());
+    if cloned {
+        stdout.push_str("  \x1b[32m✓\x1b[0m cloned with ghq get\n");
+    } else {
+        stdout.push_str("  \x1b[32m✓\x1b[0m repo already present — clone skipped\n");
+    }
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 2/3: Token reference\x1b[0m");
+    if let Some(pass_key) = &args.pass_key {
+        let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m token source: pass:{pass_key} (reference only)");
+    } else {
+        stdout.push_str("  \x1b[90m· token source not configured in PR-A\x1b[0m\n");
+    }
+    if !args.env.is_empty() {
+        stdout.push_str("  \x1b[90m· env entries validated; config write deferred to PR-B\x1b[0m\n");
+    }
+    let _ = writeln!(stdout, "\n  \x1b[36mStep 3/3: Deferred live wiring\x1b[0m");
+    stdout.push_str("  \x1b[90m· config registration deferred to PR-B\x1b[0m\n");
+    stdout.push_str("  \x1b[90m· .mcp.json detection deferred to PR-B (not read)\x1b[0m\n");
+    stdout.push_str("  \x1b[90m· bun install/dev-server deferred to PR-B (not run)\x1b[0m\n");
+    Ok(stdout)
+}
+
+fn channel_github_repo_path(root: &std::path::Path, repo: &str) -> std::path::PathBuf {
+    let (org, name) = repo.split_once('/').unwrap_or((repo, ""));
+    root.join("github.com").join(org).join(name)
+}
+
+fn channel_canonicalize_ghq_root(path: &std::path::Path) -> Result<std::path::PathBuf, (i32, String)> {
+    let root = path.canonicalize().map_err(|error| (1, format!("channel setup: ghq root unavailable: {error}")))?;
+    if !root.is_dir() {
+        return Err((1, "channel setup: ghq root is not a directory".to_owned()));
+    }
+    Ok(root)
+}
+
+fn channel_canonicalize_github_repo(root: &std::path::Path, repo_path: &std::path::Path) -> Result<std::path::PathBuf, (i32, String)> {
+    let repo = repo_path.canonicalize().map_err(|error| (1, format!("channel setup: cloned repo missing: {error}")))?;
+    if repo == root || !repo.starts_with(root) {
+        return Err((1, "channel setup: cloned repo escaped ghq root".to_owned()));
+    }
+    Ok(repo)
+}
+
+fn channel_run_ghq(args: &[&str], timeout: std::time::Duration) -> Result<String, (i32, String)> {
+    use std::io::Read as _;
+
+    let mut child = std::process::Command::new("ghq")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| (1, format!("channel setup: ghq unavailable: {error}")))?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| (1, format!("channel setup: ghq wait failed: {error}")))? {
+            let mut stdout = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_string(&mut stdout).map_err(|error| (1, format!("channel setup: ghq stdout failed: {error}")))?;
+            }
+            if !status.success() {
+                return Err((1, "channel setup: ghq command failed".to_owned()));
+            }
+            return Ok(stdout);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err((1, "channel setup: ghq command timed out".to_owned()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 fn channel_setup_official(args: &ChannelSetupArgs) -> Result<String, (i32, String)> {
@@ -612,7 +772,7 @@ fn channel_setup_imessage(args: &ChannelSetupArgs, mut stdout: String, total: us
     let path = channel_oracle_config_path(&args.oracle);
     let mut config = channel_load_config_at(&path).unwrap_or_default();
     if !config.plugins.iter().any(|plugin| plugin.id == plugin_id) {
-        config.plugins.push(ChannelPlugin { id: plugin_id.to_owned(), env: None });
+        config.plugins.push(ChannelPlugin { id: plugin_id.to_owned(), ..ChannelPlugin::default() });
         channel_archive_existing_config(&path)?;
         channel_save_config_at(&path, &config)?;
     }
@@ -695,7 +855,7 @@ fn channel_setup_register(args: &ChannelSetupArgs, plugin_id: &str, stdout: &mut
     if matches!(args.provider, ChannelSetupProvider::Discord) {
         env.entry("DISCORD_STATE_DIR".to_owned()).or_insert_with(|| format!("~/.claude/channels/{}", args.oracle));
     }
-    let plugin = ChannelPlugin { id: plugin_id.to_owned(), env: (!env.is_empty()).then_some(env) };
+    let plugin = ChannelPlugin { id: plugin_id.to_owned(), env: (!env.is_empty()).then_some(env), ..ChannelPlugin::default() };
     if let Some(pass_key) = &args.pass_key { config.token_source = Some(format!("pass:{pass_key}")); }
     if config.plugins.iter().any(|existing| existing.id == plugin_id) {
         stdout.push_str("  \x1b[32m✓\x1b[0m already registered\n");
@@ -1221,4 +1381,40 @@ fn channel_channels_base() -> std::path::PathBuf { channel_home().join(".claude"
 
 fn channel_home() -> std::path::PathBuf {
     std::env::var_os("HOME").map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod channel_pr301_tests {
+    use super::*;
+
+    #[test]
+    fn channel_plugin_schema_accepts_github_setup_fields() {
+        let raw = r#"{
+          "plugins": [
+            {
+              "id": "server:relay",
+              "source": "github:ARRA-01/claude-channel-relay",
+              "path": "/tmp/ghq/github.com/ARRA-01/claude-channel-relay",
+              "mcp": { "command": "node", "args": ["server.js"] },
+              "dev": true,
+              "env": { "CHANNEL_MODE": "dev" }
+            }
+          ],
+          "token_source": "pass:github/hermes-token"
+        }"#;
+        let config: ChannelConfig = serde_json::from_str(raw).expect("schema parses");
+        let plugin = config.plugins.first().expect("plugin");
+        assert_eq!(plugin.source.as_deref(), Some("github:ARRA-01/claude-channel-relay"));
+        assert_eq!(plugin.path.as_deref(), Some("/tmp/ghq/github.com/ARRA-01/claude-channel-relay"));
+        assert_eq!(plugin.dev, Some(true));
+        assert_eq!(
+            plugin.mcp.as_ref().expect("mcp"),
+            &ChannelMcpConfig { command: "node".to_owned(), args: vec!["server.js".to_owned()] }
+        );
+        let serialized = serde_json::to_string(&config).expect("serialize");
+        assert!(serialized.contains("\"source\""));
+        assert!(serialized.contains("\"path\""));
+        assert!(serialized.contains("\"mcp\""));
+        assert!(serialized.contains("\"dev\""));
+    }
 }
