@@ -1,4 +1,4 @@
-const DISPATCH_133: &[DispatcherEntry] = &[DispatcherEntry {
+const DISPATCH_137: &[DispatcherEntry] = &[DispatcherEntry {
     command: "check",
     handler: Handler::Sync(run_check_command),
 }];
