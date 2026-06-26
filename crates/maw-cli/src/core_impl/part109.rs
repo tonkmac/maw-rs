@@ -26,6 +26,21 @@ struct ScopeAclTrustPair {
     target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ScopeTrustEntry {
+    sender: String,
+    target: String,
+    #[serde(rename = "addedAt")]
+    added_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ScopeTrustWriteOutcome {
+    Added,
+    AlreadyTrusted,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ScopeArgs {
     subcommand: Option<String>,
@@ -338,6 +353,181 @@ fn scope_acl_trust_pair_matches(pair: &ScopeAclTrustPair, sender: &str, target: 
         || (pair.sender == target && pair.target == sender)
 }
 
+#[allow(dead_code)]
+fn scope_trust_load() -> Vec<ScopeTrustEntry> {
+    scope_trust_load_from_path(&scope_trust_path())
+}
+
+#[allow(dead_code)]
+fn scope_trust_add(sender: &str, target: &str) -> Result<ScopeTrustWriteOutcome, String> {
+    scope_trust_add_to_path(&scope_trust_path(), sender, target, &scope_trust_now_iso())
+}
+
+#[allow(dead_code)]
+fn scope_trust_path() -> std::path::PathBuf {
+    maw_state_path(&current_xdg_env(), &["scope-trust.json"])
+}
+
+#[allow(dead_code)]
+fn scope_trust_pairs(entries: &[ScopeTrustEntry]) -> Vec<ScopeAclTrustPair> {
+    entries
+        .iter()
+        .map(|entry| ScopeAclTrustPair {
+            sender: entry.sender.clone(),
+            target: entry.target.clone(),
+        })
+        .collect()
+}
+
+fn scope_trust_add_to_path(
+    path: &std::path::Path,
+    sender: &str,
+    target: &str,
+    added_at: &str,
+) -> Result<ScopeTrustWriteOutcome, String> {
+    let sender = scope_trust_validate_actor("sender", sender)?;
+    let target = scope_trust_validate_actor("target", target)?;
+    scope_trust_validate_not_self(&sender, &target)?;
+    scope_trust_validate_added_at(added_at)?;
+    let mut entries = scope_trust_load_from_path(path);
+    if entries
+        .iter()
+        .any(|entry| scope_trust_same_relationship(&entry.sender, &entry.target, &sender, &target))
+    {
+        return Ok(ScopeTrustWriteOutcome::AlreadyTrusted);
+    }
+    entries.push(ScopeTrustEntry {
+        sender,
+        target,
+        added_at: added_at.to_owned(),
+    });
+    scope_trust_write_atomic(path, &entries)?;
+    Ok(ScopeTrustWriteOutcome::Added)
+}
+
+fn scope_trust_load_from_path(path: &std::path::Path) -> Vec<ScopeTrustEntry> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    scope_trust_parse_entries(&body)
+}
+
+fn scope_trust_parse_entries(body: &str) -> Vec<ScopeTrustEntry> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items.iter().filter_map(scope_trust_entry_from_json).collect()
+}
+
+fn scope_trust_entry_from_json(value: &serde_json::Value) -> Option<ScopeTrustEntry> {
+    let sender = value.get("sender")?.as_str()?.to_owned();
+    let target = value.get("target")?.as_str()?.to_owned();
+    let added_at = value.get("addedAt")?.as_str()?.to_owned();
+    if scope_trust_validate_actor("sender", &sender).is_err()
+        || scope_trust_validate_actor("target", &target).is_err()
+        || scope_trust_validate_not_self(&sender, &target).is_err()
+        || scope_trust_validate_added_at(&added_at).is_err()
+    {
+        return None;
+    }
+    Some(ScopeTrustEntry {
+        sender,
+        target,
+        added_at,
+    })
+}
+
+fn scope_trust_write_atomic(path: &std::path::Path, entries: &[ScopeTrustEntry]) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| format!("scope-trust: create parent failed: {error}"))?;
+    let body = serde_json::to_string_pretty(entries).map_err(|error| format!("scope-trust: encode failed: {error}"))? + "\n";
+    let tmp = scope_trust_tmp_path(path);
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|error| format!("scope-trust: tmp create failed: {error}"))?;
+        std::io::Write::write_all(&mut file, body.as_bytes())
+            .map_err(|error| format!("scope-trust: tmp write failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("scope-trust: tmp sync failed: {error}"))?;
+    }
+    let parsed = std::fs::read_to_string(&tmp)
+        .map_err(|error| format!("scope-trust: tmp validate read failed: {error}"))?;
+    if scope_trust_parse_entries(&parsed).len() != entries.len() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("scope-trust: tmp validation mismatch".to_owned());
+    }
+    std::fs::rename(&tmp, path).map_err(|error| format!("scope-trust: atomic rename failed: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, permissions)
+            .map_err(|error| format!("scope-trust: chmod 0600 failed: {error}"))?;
+    }
+    Ok(())
+}
+
+fn scope_trust_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scope-trust.json");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    parent.join(format!(".{name}.{}-{nanos}.tmp", std::process::id()))
+}
+
+fn scope_trust_validate_actor(label: &str, value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("scope-trust: {label} must be non-empty"));
+    }
+    if trimmed != value || trimmed.starts_with('-') {
+        return Err(format!("scope-trust: {label} is rejected"));
+    }
+    if trimmed.contains('\0') || trimmed.chars().any(char::is_control) || trimmed.chars().any(char::is_whitespace) {
+        return Err(format!("scope-trust: {label} contains a rejected character"));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn scope_trust_validate_not_self(sender: &str, target: &str) -> Result<(), String> {
+    if sender == target {
+        return Err("scope-trust: refusing self-trust relationship; self-sender is already allowed".to_owned());
+    }
+    Ok(())
+}
+
+fn scope_trust_validate_added_at(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.chars().any(char::is_control) || !value.ends_with('Z') || !value.contains('T') {
+        return Err("scope-trust: addedAt timestamp is rejected".to_owned());
+    }
+    Ok(())
+}
+
+fn scope_trust_same_relationship(left_sender: &str, left_target: &str, sender: &str, target: &str) -> bool {
+    (left_sender == sender && left_target == target) || (left_sender == target && left_target == sender)
+}
+
+fn scope_trust_now_iso() -> String {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    trust_iso_from_ms(ms)
+}
+
 fn scope_acl_load_scopes() -> Vec<ScopeNativeRecord> {
     scope_acl_load_scopes_from_dir(&scope_native_dir())
 }
@@ -490,6 +680,10 @@ mod scope_acl_tests {
         std::fs::write(path, format!("{json}\n")).expect("write scope json");
     }
 
+    fn scope_trust_test_path(name: &str) -> std::path::PathBuf {
+        scope_acl_temp_dir(name).join("state").join("scope-trust.json")
+    }
+
     #[test]
     fn scope_acl_allows_self_sender() {
         let decision = scope_acl_evaluate("alice", "alice", &[], &[]);
@@ -541,5 +735,117 @@ mod scope_acl_tests {
         let rows = scope_acl_load_scopes_from_dir(&dir);
         let names = rows.iter().map(|scope| scope.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn scope_trust_load_missing_and_malformed_are_empty_or_filtered() {
+        let path = scope_trust_test_path("load");
+        assert!(scope_trust_load_from_path(&path).is_empty());
+
+        let parent = path.parent().expect("parent");
+        std::fs::create_dir_all(parent).expect("state dir");
+        std::fs::write(&path, "{not json").expect("malformed");
+        assert!(scope_trust_load_from_path(&path).is_empty());
+
+        std::fs::write(
+            &path,
+            r#"[
+              {"sender":"alice","target":"bob","addedAt":"2026-06-26T00:00:00.000Z"},
+              {"sender":"missing-target","addedAt":"2026-06-26T00:00:00.000Z"},
+              {"sender":"carol","target":"carol","addedAt":"2026-06-26T00:00:00.000Z"},
+              {"sender":7,"target":"eve","addedAt":"2026-06-26T00:00:00.000Z"}
+            ]"#,
+        )
+        .expect("mixed trust");
+
+        let entries = scope_trust_load_from_path(&path);
+        assert_eq!(
+            entries,
+            vec![ScopeTrustEntry {
+                sender: "alice".to_owned(),
+                target: "bob".to_owned(),
+                added_at: "2026-06-26T00:00:00.000Z".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn scope_trust_add_preserves_entries_is_symmetric_idempotent_and_feeds_acl() {
+        let path = scope_trust_test_path("add");
+        let outcome = scope_trust_add_to_path(&path, "alice", "bob", "2026-06-26T00:00:00.000Z")
+            .expect("first add");
+        assert_eq!(outcome, ScopeTrustWriteOutcome::Added);
+        let outcome = scope_trust_add_to_path(&path, "bob", "alice", "2026-06-26T00:01:00.000Z")
+            .expect("symmetric no-op");
+        assert_eq!(outcome, ScopeTrustWriteOutcome::AlreadyTrusted);
+        let outcome = scope_trust_add_to_path(&path, "carol", "dave", "2026-06-26T00:02:00.000Z")
+            .expect("second add");
+        assert_eq!(outcome, ScopeTrustWriteOutcome::Added);
+
+        let entries = scope_trust_load_from_path(&path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sender, "alice");
+        assert_eq!(entries[0].target, "bob");
+        assert_eq!(entries[1].sender, "carol");
+        assert_eq!(entries[1].target, "dave");
+        let pairs = scope_trust_pairs(&entries);
+        assert_eq!(
+            scope_acl_evaluate("dave", "carol", &[], &pairs),
+            ScopeAclDecision::Allow
+        );
+        assert_eq!(
+            scope_acl_evaluate("alice", "dave", &[], &pairs),
+            ScopeAclDecision::Queue
+        );
+    }
+
+    #[test]
+    fn scope_trust_add_rejects_empty_self_and_injection_without_write() {
+        let path = scope_trust_test_path("reject");
+        let empty = scope_trust_add_to_path(&path, "", "bob", "2026-06-26T00:00:00.000Z").expect_err("empty");
+        assert!(empty.contains("non-empty"));
+        let self_trust =
+            scope_trust_add_to_path(&path, "alice", "alice", "2026-06-26T00:00:00.000Z").expect_err("self");
+        assert!(self_trust.contains("self-trust"));
+        let injected =
+            scope_trust_add_to_path(&path, "-alice", "bob", "2026-06-26T00:00:00.000Z").expect_err("dash");
+        assert!(injected.contains("rejected"));
+        let bad_time = scope_trust_add_to_path(&path, "alice", "bob", "not-time").expect_err("time");
+        assert!(bad_time.contains("addedAt"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scope_trust_writes_scope_trust_json_only_0600_and_never_consent_trust_json() {
+        let root = scope_acl_temp_dir("consent-separate").join("state");
+        let scope_path = root.join("scope-trust.json");
+        let consent_path = root.join("trust.json");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(&consent_path, r#"[{"from":"lead","to":"peer","action":"team-invite"}]"#)
+            .expect("consent trust");
+
+        scope_trust_add_to_path(&scope_path, "alice", "bob", "2026-06-26T00:00:00.000Z").expect("add");
+
+        assert!(scope_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&consent_path).expect("consent untouched"),
+            r#"[{"from":"lead","to":"peer","action":"team-invite"}]"#
+        );
+        let names = std::fs::read_dir(&root)
+            .expect("state listing")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"scope-trust.json".to_owned()));
+        assert!(names.contains(&"trust.json".to_owned()));
+        assert!(!names
+            .iter()
+            .any(|name| std::path::Path::new(name).extension().is_some_and(|ext| ext == "tmp")));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&scope_path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
