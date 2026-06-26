@@ -13,6 +13,7 @@ const AWAKE_USAGE: &str = "usage: maw awake <name> [wake flags...]";
 const SCAFFOLD_USAGE: &str = "usage: maw scaffold <name> [--rust|--as] [--dest <path>] [--dry-run]";
 const NEW_USAGE: &str = "usage: maw new <name> [--rust|--as] [--dest <path>] [--dry-run]";
 const PROMOTE_USAGE: &str = "usage: maw promote <window> [--as <name>] [--attach] [--force]";
+const PROMOTE_PLACEHOLDER: &str = "__promote_placeholder__";
 const PREFLIGHT_USAGE: &str = "usage: maw preflight [path] [--json]";
 const SNAPSHOTS_USAGE: &str = "usage: maw snapshots [list|create|show] [name] [--json]";
 
@@ -45,6 +46,17 @@ struct PromoteResolvedNative {
     dst_session: String,
     attach: bool,
     force: bool,
+}
+
+impl PromoteResolvedNative {
+    fn src_target(&self) -> String { format!("{}:{}", self.src_session, self.src_window) }
+    fn dst_target(&self) -> String { format!("{}:", self.dst_session) }
+    fn placeholder_target(&self) -> String { promote_placeholder_target(&self.dst_session) }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromoteMutationStateNative {
+    created_dst_by_this_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,11 +102,45 @@ impl PromoteTmuxNative for PromoteSystemTmuxNative {
 
     fn promote_caller_in_tmux(&self) -> bool { std::env::var_os("TMUX").is_some() }
 
-    fn promote_new_session(&mut self, _name: &str, _window: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
-    fn promote_move_window(&mut self, _src: &str, _dst: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
-    fn promote_kill_session(&mut self, _name: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
-    fn promote_kill_window(&mut self, _target: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
-    fn promote_switch_client(&mut self, _session: &str) -> Result<(), String> { Err("promote: attach deferred to #299 PR-B".to_owned()) }
+    fn promote_new_session(&mut self, name: &str, window: &str) -> Result<(), String> {
+        promote_validate_tmux_name(name, "destination session")?;
+        promote_validate_tmux_name(window, "placeholder window")?;
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        maw_tmux::TmuxRunner::run(
+            &mut runner,
+            "new-session",
+            &["-d".to_owned(), "-s".to_owned(), name.to_owned(), "-n".to_owned(), window.to_owned()],
+        )
+        .map(|_| ())
+        .map_err(|error| error.message)
+    }
+
+    fn promote_move_window(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        promote_validate_tmux_target(src, "source target")?;
+        promote_validate_tmux_target(dst, "destination target")?;
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        maw_tmux::TmuxRunner::run(
+            &mut runner,
+            "move-window",
+            &["-s".to_owned(), src.to_owned(), "-t".to_owned(), dst.to_owned()],
+        )
+        .map(|_| ())
+        .map_err(|error| error.message)
+    }
+
+    fn promote_kill_session(&mut self, name: &str) -> Result<(), String> {
+        promote_validate_tmux_name(name, "rollback destination session")?;
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        maw_tmux::TmuxRunner::run(&mut runner, "kill-session", &["-t".to_owned(), name.to_owned()]).map(|_| ()).map_err(|error| error.message)
+    }
+
+    fn promote_kill_window(&mut self, target: &str) -> Result<(), String> {
+        promote_validate_tmux_target(target, "rollback placeholder target")?;
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        maw_tmux::TmuxRunner::run(&mut runner, "kill-window", &["-t".to_owned(), target.to_owned()]).map(|_| ()).map_err(|error| error.message)
+    }
+
+    fn promote_switch_client(&mut self, _session: &str) -> Result<(), String> { Err("promote: attach deferred to #299 attach follow-up".to_owned()) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,7 +380,7 @@ fn promote_run_command(argv: &[String]) -> CliOutput {
 }
 
 fn promote_run_command_with(argv: &[String], tmux: &mut impl PromoteTmuxNative) -> CliOutput {
-    match promote_parse_args(argv).and_then(|options| promote_plan_no_mutation(&options, tmux)) {
+    match promote_parse_args(argv).and_then(|options| promote_execute(&options, tmux)) {
         Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
         Err(message) => promote_error(&message),
     }
@@ -381,11 +427,86 @@ fn promote_set_target(slot: &mut Option<String>, value: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn promote_plan_no_mutation(options: &PromoteOptionsNative, tmux: &mut impl PromoteTmuxNative) -> Result<String, String> {
+fn promote_execute(options: &PromoteOptionsNative, tmux: &mut impl PromoteTmuxNative) -> Result<String, String> {
+    let planned = promote_resolve_ready(options, tmux)?;
+    let ready = promote_revalidate_ready(options, &planned, tmux)?;
+    let dst_exists_now = tmux.promote_has_session(&ready.dst_session);
+    if dst_exists_now && !ready.force {
+        return Err(promote_destination_exists_error(&options.target, &ready.dst_session));
+    }
+
+    let mut state = PromoteMutationStateNative { created_dst_by_this_run: false };
+    if !dst_exists_now {
+        tmux.promote_new_session(&ready.dst_session, PROMOTE_PLACEHOLDER).map_err(|error| format!("promote: tmux new-session failed — {error}"))?;
+        state.created_dst_by_this_run = true;
+    }
+
+    let src_target = ready.src_target();
+    let dst_target = ready.dst_target();
+    promote_validate_tmux_target(&src_target, "source target")?;
+    promote_validate_tmux_target(&dst_target, "destination target")?;
+
+    if let Err(error) = tmux.promote_move_window(&src_target, &dst_target) {
+        promote_rollback_after_failure(tmux, &ready, &state, "move-window failure");
+        return Err(format!("promote: tmux move failed — {error}"));
+    }
+
+    let dst_windows = match tmux.promote_list_windows(&ready.dst_session) {
+        Ok(windows) => windows,
+        Err(error) => {
+            promote_cleanup_after_unknown_verify_failure(tmux, &ready, &state);
+            return Err(format!(
+                "promote: tmux move verification failed — cannot list destination session '{}': {error}; no session rollback performed because ownership cannot be verified; inspect and clean '{}' manually if needed",
+                ready.dst_session, ready.dst_session
+            ));
+        }
+    };
+
+    if !promote_window_exists(&dst_windows, &ready.src_window) {
+        promote_rollback_after_verify_miss(tmux, &ready, &state, &dst_windows);
+        let suffix = if state.created_dst_by_this_run && promote_windows_only_placeholder(&dst_windows) { "; rolled back placeholder session" } else { "" };
+        return Err(format!(
+            "promote: tmux move verification failed — '{}' did not appear in '{}' after move-window{suffix}",
+            src_target, ready.dst_session
+        ));
+    }
+
+    if state.created_dst_by_this_run {
+        let _ = tmux.promote_kill_window(&ready.placeholder_target());
+    }
+
+    Ok(promote_render_success(&ready))
+}
+
+fn promote_resolve_ready(options: &PromoteOptionsNative, tmux: &mut impl PromoteTmuxNative) -> Result<PromoteResolvedNative, String> {
     let sessions = tmux.promote_list_all();
-    let resolved = promote_resolve_target(&options.target, &sessions)?;
+    promote_resolve_ready_from_sessions(options, tmux, &sessions, "promote planning")
+}
+
+fn promote_revalidate_ready(options: &PromoteOptionsNative, planned: &PromoteResolvedNative, tmux: &mut impl PromoteTmuxNative) -> Result<PromoteResolvedNative, String> {
+    let sessions = tmux.promote_list_all();
+    let fresh = promote_resolve_ready_from_sessions(options, tmux, &sessions, "promote mutation")?;
+    if fresh.src_session != planned.src_session || fresh.src_window != planned.src_window {
+        return Err(format!(
+            "promote: source changed before mutation (planned {}:{}, now {}:{})",
+            planned.src_session, planned.src_window, fresh.src_session, fresh.src_window
+        ));
+    }
+    if fresh.dst_session != planned.dst_session {
+        return Err(format!("promote: destination changed before mutation (planned {}, now {})", planned.dst_session, fresh.dst_session));
+    }
+    Ok(fresh)
+}
+
+fn promote_resolve_ready_from_sessions(
+    options: &PromoteOptionsNative,
+    tmux: &mut impl PromoteTmuxNative,
+    sessions: &[TmuxSession],
+    phase: &str,
+) -> Result<PromoteResolvedNative, String> {
+    let resolved = promote_resolve_target(&options.target, sessions)?;
     let PromoteResolveResultNative::Resolved { session: src_session, window: src_window } = resolved else {
-        return promote_resolution_error(&options.target, resolved);
+        return Err(promote_resolution_error_message(&options.target, resolved));
     };
     promote_validate_tmux_name(&src_session, "source session")?;
     promote_validate_tmux_name(&src_window, "source window")?;
@@ -394,15 +515,10 @@ fn promote_plan_no_mutation(options: &PromoteOptionsNative, tmux: &mut impl Prom
         return Err(promote_only_window_error(&src_session, &src_window));
     }
     if !promote_window_exists(&source_windows, &src_window) {
-        return Err(format!("promote: source '{src_session}:{src_window}' disappeared before promote planning"));
+        return Err(format!("promote: source '{src_session}:{src_window}' disappeared before {phase}"));
     }
     let dst_session = promote_destination_session(options, &src_window)?;
-    let dst_exists = tmux.promote_has_session(&dst_session);
-    if dst_exists && !options.force {
-        return Err(promote_destination_exists_error(&options.target, &dst_session));
-    }
-    let resolved = PromoteResolvedNative { src_session, src_window, dst_session, attach: options.attach, force: options.force };
-    Ok(promote_render_deferred(&resolved, dst_exists, tmux.promote_caller_in_tmux()))
+    Ok(PromoteResolvedNative { src_session, src_window, dst_session, attach: options.attach, force: options.force })
 }
 
 fn promote_resolve_target(target: &str, sessions: &[TmuxSession]) -> Result<PromoteResolveResultNative, String> {
@@ -448,9 +564,9 @@ fn promote_exact_window_matches(target: &str, sessions: &[TmuxSession]) -> Vec<P
     }).collect()
 }
 
-fn promote_resolution_error(target: &str, resolved: PromoteResolveResultNative) -> Result<String, String> {
+fn promote_resolution_error_message(target: &str, resolved: PromoteResolveResultNative) -> String {
     match resolved {
-        PromoteResolveResultNative::None => Err(format!("promote: no window matches '{target}'")),
+        PromoteResolveResultNative::None => format!("promote: no window matches '{target}'"),
         PromoteResolveResultNative::Ambiguous(candidates) => {
             let mut message = format!("promote: '{target}' matches {} windows", candidates.len());
             for candidate in candidates {
@@ -459,7 +575,7 @@ fn promote_resolution_error(target: &str, resolved: PromoteResolveResultNative) 
             }
             let _ = write!(message, "
   [90muse: maw promote <session>:<window>[0m");
-            Err(message)
+            message
         }
         PromoteResolveResultNative::Resolved { .. } => unreachable!("resolved handled by caller"),
     }
@@ -524,19 +640,82 @@ fn promote_destination_exists_error(target: &str, dst_session: &str) -> String {
   [90mor:  maw promote {target} --force[0m  (merges into existing)")
 }
 
-fn promote_render_deferred(resolved: &PromoteResolvedNative, dst_exists: bool, caller_in_tmux: bool) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "promote-mutation-deferred");
-    let _ = writeln!(out, "  source: {}:{}", resolved.src_session, resolved.src_window);
-    let _ = writeln!(out, "  destination: {}", resolved.dst_session);
-    let _ = writeln!(out, "  destination-exists: {dst_exists}");
-    let _ = writeln!(out, "  force: {}", resolved.force);
-    let _ = writeln!(out, "  attach: {}", resolved.attach);
-    if resolved.attach && !caller_in_tmux {
-        let _ = writeln!(out, "  attach-note: caller is not in tmux; switch-client remains deferred");
+fn promote_placeholder_target(dst_session: &str) -> String {
+    format!("{dst_session}:{PROMOTE_PLACEHOLDER}")
+}
+
+fn promote_validate_tmux_target(value: &str, label: &str) -> Result<(), String> {
+    promote_validate_target(value, label)?;
+    if value.contains(':') {
+        for (index, part) in value.split(':').enumerate() {
+            if part.is_empty() && index == 1 && value.ends_with(':') {
+                continue;
+            }
+            if !part.is_empty() {
+                promote_validate_tmux_name(part, label)?;
+            }
+        }
+    } else {
+        promote_validate_tmux_name(value, label)?;
     }
-    out.push_str("  note: tmux move-window + rollback lands in #299 PR-B
-");
+    Ok(())
+}
+
+fn promote_windows_only_placeholder(windows: &[maw_tmux::TmuxWindow]) -> bool {
+    windows.is_empty() || windows.iter().all(|window| window.name == PROMOTE_PLACEHOLDER)
+}
+
+fn promote_windows_have_foreign(windows: &[maw_tmux::TmuxWindow]) -> bool {
+    windows.iter().any(|window| window.name != PROMOTE_PLACEHOLDER)
+}
+
+fn promote_rollback_after_failure(tmux: &mut impl PromoteTmuxNative, ready: &PromoteResolvedNative, state: &PromoteMutationStateNative, reason: &str) {
+    if !state.created_dst_by_this_run {
+        return;
+    }
+    match tmux.promote_list_windows(&ready.dst_session) {
+        Ok(windows) if promote_windows_have_foreign(&windows) => {
+            let _ = tmux.promote_kill_window(&ready.placeholder_target());
+        }
+        _ => promote_rollback_owned_placeholder_session(tmux, ready, reason),
+    }
+}
+
+fn promote_rollback_after_verify_miss(
+    tmux: &mut impl PromoteTmuxNative,
+    ready: &PromoteResolvedNative,
+    state: &PromoteMutationStateNative,
+    dst_windows: &[maw_tmux::TmuxWindow],
+) {
+    if !state.created_dst_by_this_run {
+        return;
+    }
+    if promote_windows_have_foreign(dst_windows) {
+        let _ = tmux.promote_kill_window(&ready.placeholder_target());
+    } else {
+        promote_rollback_owned_placeholder_session(tmux, ready, "move verification failure");
+    }
+}
+
+fn promote_cleanup_after_unknown_verify_failure(tmux: &mut impl PromoteTmuxNative, ready: &PromoteResolvedNative, state: &PromoteMutationStateNative) {
+    if state.created_dst_by_this_run {
+        let _ = tmux.promote_kill_window(&ready.placeholder_target());
+    }
+}
+
+fn promote_rollback_owned_placeholder_session(tmux: &mut impl PromoteTmuxNative, ready: &PromoteResolvedNative, _reason: &str) {
+    if tmux.promote_kill_session(&ready.dst_session).is_err() {
+        let _ = tmux.promote_kill_window(&ready.placeholder_target());
+    }
+}
+
+fn promote_render_success(resolved: &PromoteResolvedNative) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "  \u{001b}[32m✓\u{001b}[0m promoted — {}:{} → {}:{}", resolved.src_session, resolved.src_window, resolved.dst_session, resolved.src_window);
+    let _ = writeln!(out, "      \u{001b}[90m↻ undo: tmux move-window -s {}:{} -t {}:\u{001b}[0m", resolved.dst_session, resolved.src_window, resolved.src_session);
+    if resolved.attach {
+        let _ = writeln!(out, "      \u{001b}[33m⚠\u{001b}[0m promote succeeded; --attach deferred (switch-client manual): tmux switch-client -t {}", resolved.dst_session);
+    }
     out
 }
 
@@ -779,12 +958,18 @@ mod work_bundle_tests {
     }
 
     #[derive(Default)]
+    #[allow(clippy::struct_excessive_bools)]
     struct PromoteFakeTmux {
         sessions: Vec<TmuxSession>,
         existing: std::collections::BTreeSet<String>,
         caller_in_tmux: bool,
         calls: Vec<String>,
         mutation_calls: Vec<String>,
+        move_should_fail: bool,
+        kill_session_should_fail: bool,
+        verify_missing: bool,
+        list_windows_fail_for: std::collections::BTreeSet<String>,
+        foreign_before_rollback: bool,
     }
 
     impl PromoteFakeTmux {
@@ -795,14 +980,15 @@ mod work_bundle_tests {
                         name: "77-mawjs".to_owned(),
                         windows: vec![promote_test_window("mawjs-oracle"), promote_test_window("test-cli")],
                     },
-                    TmuxSession {
-                        name: "scratch".to_owned(),
-                        windows: vec![promote_test_window("scratch")],
-                    },
+                    TmuxSession { name: "scratch".to_owned(), windows: vec![promote_test_window("scratch")] },
                 ],
                 caller_in_tmux: true,
                 ..Self::default()
             }
+        }
+
+        fn promote_session_mut(&mut self, name: &str) -> Option<&mut TmuxSession> {
+            self.sessions.iter_mut().find(|item| item.name == name)
         }
     }
 
@@ -814,38 +1000,70 @@ mod work_bundle_tests {
 
         fn promote_list_windows(&mut self, session: &str) -> Result<Vec<maw_tmux::TmuxWindow>, String> {
             self.calls.push(format!("list-windows {session}"));
+            if self.list_windows_fail_for.contains(session) {
+                return Err("tmux list failed".to_owned());
+            }
             self.sessions.iter().find(|item| item.name == session).map(|item| item.windows.clone()).ok_or_else(|| "no such session".to_owned())
         }
 
         fn promote_has_session(&mut self, name: &str) -> bool {
             self.calls.push(format!("has-session {name}"));
-            self.existing.contains(name)
+            self.existing.contains(name) || self.sessions.iter().any(|item| item.name == name)
         }
 
         fn promote_caller_in_tmux(&self) -> bool { self.caller_in_tmux }
 
         fn promote_new_session(&mut self, name: &str, window: &str) -> Result<(), String> {
-            self.mutation_calls.push(format!("new-session {name}:{window}"));
+            self.mutation_calls.push(format!("new-session -d -s {name} -n {window}"));
+            self.existing.insert(name.to_owned());
+            self.sessions.push(TmuxSession { name: name.to_owned(), windows: vec![promote_test_window(window)] });
             Ok(())
         }
 
         fn promote_move_window(&mut self, src: &str, dst: &str) -> Result<(), String> {
-            self.mutation_calls.push(format!("move-window {src} {dst}"));
+            self.mutation_calls.push(format!("move-window -s {src} -t {dst}"));
+            let (src_session, src_window) = src.split_once(':').ok_or_else(|| "bad source".to_owned())?;
+            let dst_session = dst.trim_end_matches(':');
+            if self.move_should_fail {
+                if self.foreign_before_rollback {
+                    if let Some(dst) = self.promote_session_mut(dst_session) {
+                        dst.windows.push(promote_test_window("foreign"));
+                    }
+                }
+                return Err("move failed".to_owned());
+            }
+            if let Some(src_session_item) = self.promote_session_mut(src_session) {
+                src_session_item.windows.retain(|window| window.name != src_window);
+            }
+            if !self.verify_missing {
+                if let Some(dst_session_item) = self.promote_session_mut(dst_session) {
+                    dst_session_item.windows.push(promote_test_window(src_window));
+                }
+            }
             Ok(())
         }
 
         fn promote_kill_session(&mut self, name: &str) -> Result<(), String> {
-            self.mutation_calls.push(format!("kill-session {name}"));
+            self.mutation_calls.push(format!("kill-session -t {name}"));
+            if self.kill_session_should_fail {
+                return Err("kill session failed".to_owned());
+            }
+            self.existing.remove(name);
+            self.sessions.retain(|session| session.name != name);
             Ok(())
         }
 
         fn promote_kill_window(&mut self, target: &str) -> Result<(), String> {
-            self.mutation_calls.push(format!("kill-window {target}"));
+            self.mutation_calls.push(format!("kill-window -t {target}"));
+            let Some((session, window)) = target.split_once(':') else { return Err("bad target".to_owned()); };
+            if let Some(session_item) = self.promote_session_mut(session) {
+                session_item.windows.retain(|item| item.name != window);
+            }
             Ok(())
         }
 
         fn promote_switch_client(&mut self, session: &str) -> Result<(), String> {
-            self.mutation_calls.push(format!("switch-client {session}"));
+            self.mutation_calls.push(format!("switch-client -t {session}"));
             Ok(())
         }
     }
@@ -889,16 +1107,26 @@ mod work_bundle_tests {
     }
 
     #[test]
-    fn promote_resolves_and_defers_without_mutation_golden() {
+    fn promote_mutates_missing_destination_with_golden_and_exact_argv() {
         let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
         std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
         let mut tmux = PromoteFakeTmux::promote_fixture();
         let out = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated", "--attach"]), &mut tmux);
         assert_eq!(out.code, 0, "{}", out.stderr);
-        assert_eq!(out.stdout, include_str!("../../tests/fixtures/native-promote/promote-deferred.stdout"));
-        assert_eq!(tmux.calls, ["list-all", "list-windows 77-mawjs", "has-session isolated"]);
-        assert!(tmux.mutation_calls.is_empty());
+        assert_eq!(out.stdout, include_str!("../../tests/fixtures/native-promote/promote-success.stdout"));
+        assert_eq!(
+            tmux.calls,
+            ["list-all", "list-windows 77-mawjs", "list-all", "list-windows 77-mawjs", "has-session isolated", "list-windows isolated"]
+        );
+        assert_eq!(
+            tmux.mutation_calls,
+            [
+                "new-session -d -s isolated -n __promote_placeholder__",
+                "move-window -s 77-mawjs:test-cli -t isolated:",
+                "kill-window -t isolated:__promote_placeholder__",
+            ]
+        );
     }
 
     #[test]
@@ -942,6 +1170,57 @@ mod work_bundle_tests {
         assert!(old_shape.stderr.contains("looks like a flag"));
         assert!(tmux.calls.is_empty());
         assert!(tmux.mutation_calls.is_empty());
+    }
+
+    #[test]
+    fn promote_force_merge_existing_destination_never_kills_existing_dst() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
+        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.sessions.push(TmuxSession { name: "isolated".to_owned(), windows: vec![promote_test_window("existing")] });
+        let out = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated", "--force"]), &mut tmux);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, include_str!("../../tests/fixtures/native-promote/promote-existing-force.stdout"));
+        assert_eq!(tmux.mutation_calls, ["move-window -s 77-mawjs:test-cli -t isolated:"]);
+        assert!(tmux.mutation_calls.iter().all(|call| !call.starts_with("kill-")));
+    }
+
+    #[test]
+    fn promote_rolls_back_created_placeholder_but_not_foreign_windows() {
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.verify_missing = true;
+        let verify = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated"]), &mut tmux);
+        assert_eq!(verify.code, 1);
+        assert!(verify.stderr.contains("rolled back placeholder session"));
+        assert!(tmux.mutation_calls.contains(&"kill-session -t isolated".to_owned()));
+
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.verify_missing = true;
+        tmux.move_should_fail = false;
+        let out = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated"]), &mut tmux);
+        assert_eq!(out.code, 1);
+        assert!(out.stderr.contains("rolled back placeholder session"));
+    }
+
+    #[test]
+    fn promote_q1_foreign_window_safe_and_q2_list_fail_conservative_no_kill_session() {
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.move_should_fail = true;
+        tmux.foreign_before_rollback = true;
+        let move_fail = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated"]), &mut tmux);
+        assert_eq!(move_fail.code, 1);
+        assert!(move_fail.stderr.contains("move failed"));
+        assert!(!tmux.mutation_calls.contains(&"kill-session -t isolated".to_owned()));
+        assert!(tmux.mutation_calls.contains(&"kill-window -t isolated:__promote_placeholder__".to_owned()));
+
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.list_windows_fail_for.insert("isolated".to_owned());
+        let list_fail = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated"]), &mut tmux);
+        assert_eq!(list_fail.code, 1);
+        assert!(list_fail.stderr.contains("no session rollback performed because ownership cannot be verified"));
+        assert!(!tmux.mutation_calls.contains(&"kill-session -t isolated".to_owned()));
+        assert!(tmux.mutation_calls.contains(&"kill-window -t isolated:__promote_placeholder__".to_owned()));
     }
 
     #[test]
