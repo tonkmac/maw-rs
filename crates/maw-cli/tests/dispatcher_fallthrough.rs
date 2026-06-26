@@ -375,17 +375,17 @@ fn plugin_manifest_invoke_is_native_and_never_invokes_path_maw() {
     let root = temp_dir("plugin-manifest-native");
     let bin_dir = root.join("bin");
     let plugins_dir = root.join("plugins");
-    let plugin_dir = plugins_dir.join("ts-proof");
+    let manifest_dir = plugins_dir.join("ts-proof");
     create_dir_all(&bin_dir).expect("bin dir");
-    create_dir_all(&plugin_dir).expect("plugin dir");
+    create_dir_all(&manifest_dir).expect("plugin dir");
     write_maw_shim(&bin_dir, 37);
     write(
-        plugin_dir.join("plugin.json"),
+        manifest_dir.join("plugin.json"),
         r#"{"name":"ts-proof","version":"1.0.0","sdk":"*","target":"js","entry":"index.ts"}"#,
     )
     .expect("manifest");
     write(
-        plugin_dir.join("index.ts"),
+        manifest_dir.join("index.ts"),
         b"export default () => ({ ok: true });\n",
     )
     .expect("entry");
