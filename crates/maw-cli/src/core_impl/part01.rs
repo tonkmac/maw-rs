@@ -87,6 +87,17 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// #317 final: native maw-rs identity. Build metadata is embedded at compile time;
+// never fall through to PATH maw-js for top-level version output.
+pub const MAW_RS_VERSION_STRING: &str = concat!(
+    "maw-rs v",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("MAW_RS_GIT_HASH"),
+    ") built ",
+    env!("MAW_RS_BUILD_DATE")
+);
+
 #[cfg(test)]
 fn env_test_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -168,6 +179,9 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "--help", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "-h", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "help", handler: Handler::Sync(usage_handler) },
+    DispatcherEntry { command: "--version", handler: Handler::Sync(version_handler) },
+    DispatcherEntry { command: "-v", handler: Handler::Sync(version_handler) },
+    DispatcherEntry { command: "version", handler: Handler::Sync(version_handler) },
     DispatcherEntry { command: "auto-wake", handler: Handler::Sync(run_auto_wake_plan) },
     DispatcherEntry { command: "hub", handler: Handler::Sync(run_hub_plan) },
     DispatcherEntry { command: "xdg", handler: Handler::Sync(run_xdg_plan) },
@@ -264,7 +278,7 @@ mod async_dispatch_tests {
 
 #[cfg(test)]
 mod dispatcher_fragment_tests {
-    use super::{dispatcher_entries, dispatcher_status, DispatchKind};
+    use super::{dispatcher_entries, dispatcher_status, run_cli, DispatchKind, MAW_RS_VERSION_STRING};
     use std::collections::BTreeSet;
 
     const CORE_COMMANDS: &[&str] = &[
@@ -292,6 +306,19 @@ mod dispatcher_fragment_tests {
             assert!(seen.contains(*command), "missing core dispatcher command: {command}");
         }
     }
+
+    #[test]
+    fn top_level_version_is_native_and_uses_single_const() {
+        for command in ["--version", "-v", "version"] {
+            assert_eq!(dispatcher_status(command), DispatchKind::Native, "{command}");
+            let output = run_cli(&[command.to_owned()]);
+            assert_eq!(output.code, 0, "{command}");
+            assert_eq!(output.stdout, format!("{MAW_RS_VERSION_STRING}\n"), "{command}");
+            assert!(output.stderr.is_empty(), "{command}: {}", output.stderr);
+        }
+        assert!(MAW_RS_VERSION_STRING.starts_with(concat!("maw-rs v", env!("CARGO_PKG_VERSION"))));
+        assert!(MAW_RS_VERSION_STRING.contains(" built "));
+    }
 }
 
 #[must_use]
@@ -314,6 +341,14 @@ fn dispatcher_target(command: &str) -> DispatchTarget {
 
 fn usage_handler(_: &[String]) -> CliOutput {
     usage_ok()
+}
+
+fn version_handler(_: &[String]) -> CliOutput {
+    CliOutput {
+        code: 0,
+        stdout: format!("{MAW_RS_VERSION_STRING}\n"),
+        stderr: String::new(),
+    }
 }
 
 /// Run the current maw-rs CLI parser/renderer over argv without process exit.
