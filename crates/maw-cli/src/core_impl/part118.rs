@@ -3,13 +3,25 @@ const DISPATCH_118: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(sleep_run_command),
 }];
 
-const SLEEP_USAGE: &str = "usage: maw sleep <oracle> [window] — gracefully stop one Oracle window; see maw kill for immediate removal and maw done for worktrees";
+const SLEEP_USAGE: &str = "usage: maw sleep <oracle> [window] | maw sleep --all-done [--dry-run] — gracefully stop one Oracle window; see maw kill for immediate removal and maw done for worktrees";
 const SLEEP_WINDOW_FORMAT: &str = "#{session_name}|||#{window_index}|||#{window_name}";
+const SLEEP_PANE_FORMAT: &str = "#{session_name}|||#{window_index}|||#{window_name}|||#{pane_index}|||#{pane_id}|||#{pane_pid}|||#{pane_current_command}|||#{pane_title}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SleepArgs {
+enum SleepArgs {
+    One(SleepOneArgs),
+    AllDone(SleepAllDoneArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SleepOneArgs {
     target: String,
     window: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SleepAllDoneArgs {
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,12 +42,28 @@ struct SleepResolved {
     window: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SleepPane {
+    session: String,
+    window_index: u32,
+    window_name: String,
+    pane_index: u32,
+    pane_id: String,
+    pane_pid: String,
+    current_command: String,
+    title: String,
+}
+
 trait SleepTmux {
     fn sleep_list_sessions(&mut self) -> Result<Vec<SleepSession>, String>;
     fn sleep_list_windows(&mut self, session: &str) -> Result<Vec<SleepWindow>, String>;
+    fn sleep_current_session(&mut self) -> Result<String, String>;
+    fn sleep_list_panes(&mut self, session: &str) -> Result<Vec<SleepPane>, String>;
+    fn sleep_capture_pane(&mut self, pane_id: &str) -> Result<String, String>;
     fn sleep_send_exit(&mut self, target: &str) -> Result<(), String>;
     fn sleep_wait_grace(&mut self) -> Result<(), String>;
     fn sleep_kill_window(&mut self, target: &str) -> Result<(), String>;
+    fn sleep_kill_pane(&mut self, pane_id: &str) -> Result<(), String>;
     fn sleep_save_tab_order(&mut self, session: &str, windows: &[SleepWindow]) -> Result<(), String>;
     fn sleep_run_lifecycle(&mut self, resolved: &SleepResolved, requested: &str) -> Result<(), String>;
     fn sleep_append_log(&mut self, requested: &str, window: &str) -> Result<(), String>;
@@ -62,6 +90,24 @@ impl SleepTmux for SleepSystemTmux {
         Ok(sleep_parse_windows(&raw))
     }
 
+    fn sleep_current_session(&mut self) -> Result<String, String> {
+        let raw = sleep_tmux_run(&mut self.runner, "display-message", &["-p", "#{session_name}"])?;
+        let session = raw.trim().to_owned();
+        sleep_validate_tmux_target(&session)?;
+        Ok(session)
+    }
+
+    fn sleep_list_panes(&mut self, session: &str) -> Result<Vec<SleepPane>, String> {
+        sleep_validate_tmux_target(session)?;
+        let raw = sleep_tmux_run(&mut self.runner, "list-panes", &["-t", session, "-F", SLEEP_PANE_FORMAT])?;
+        Ok(sleep_parse_panes(&raw))
+    }
+
+    fn sleep_capture_pane(&mut self, pane_id: &str) -> Result<String, String> {
+        sleep_validate_pane_id(pane_id)?;
+        sleep_tmux_run(&mut self.runner, "capture-pane", &["-p", "-t", pane_id, "-S", "-40"])
+    }
+
     fn sleep_send_exit(&mut self, target: &str) -> Result<(), String> {
         sleep_validate_tmux_target(target)?;
         for ch in ["/", "e", "x", "i", "t"] {
@@ -78,6 +124,11 @@ impl SleepTmux for SleepSystemTmux {
     fn sleep_kill_window(&mut self, target: &str) -> Result<(), String> {
         sleep_validate_tmux_target(target)?;
         sleep_tmux_run(&mut self.runner, "kill-window", &["-t", target]).map(|_| ())
+    }
+
+    fn sleep_kill_pane(&mut self, pane_id: &str) -> Result<(), String> {
+        sleep_validate_pane_id(pane_id)?;
+        sleep_tmux_run(&mut self.runner, "kill-pane", &["-t", pane_id]).map(|_| ())
     }
 
     fn sleep_save_tab_order(&mut self, session: &str, windows: &[SleepWindow]) -> Result<(), String> {
@@ -110,6 +161,10 @@ fn sleep_run_command_with(argv: &[String], tmux: &mut impl SleepTmux, load_fleet
 
 fn sleep_run(argv: &[String], tmux: &mut impl SleepTmux, load_fleet: StopFleetLoader) -> Result<String, String> {
     let options = sleep_parse_args(argv)?;
+    let options = match options {
+        SleepArgs::One(options) => options,
+        SleepArgs::AllDone(options) => return sleep_run_all_done(tmux, &options),
+    };
     let sessions = tmux.sleep_list_sessions()?;
     let fleet = load_fleet();
     let resolved = sleep_resolve_target(&options, &sessions, &fleet).ok_or_else(|| sleep_missing_target(&options.target, &sessions))?;
@@ -136,26 +191,62 @@ fn sleep_run(argv: &[String], tmux: &mut impl SleepTmux, load_fleet: StopFleetLo
     Ok(out)
 }
 
+fn sleep_run_all_done(tmux: &mut impl SleepTmux, options: &SleepAllDoneArgs) -> Result<String, String> {
+    let session = tmux.sleep_current_session()?;
+    let sessions = tmux.sleep_list_sessions()?;
+    sleep_validate_current_session(&session, &sessions)?;
+    let windows = tmux.sleep_list_windows(&session).unwrap_or_else(|_| sleep_find_session(&sessions, &session).map_or_else(Vec::new, |s| s.windows.clone()));
+    let candidates = sleep_collect_done_panes(tmux, &session)?;
+    let mut out = sleep_render_all_done_plan(&session, &candidates, options.dry_run);
+    if candidates.is_empty() {
+        let _ = writeln!(out, "\x1b[33m!\x1b[0m no done panes found");
+        if options.dry_run { let _ = writeln!(out, "No changes made"); }
+        return Ok(out);
+    }
+    if options.dry_run {
+        let _ = writeln!(out, "No changes made");
+        return Ok(out);
+    }
+    let owned = sleep_validate_all_done_ownership(tmux, &session, &candidates)?;
+    let _ = tmux.sleep_save_tab_order(&session, &windows);
+    for pane in &owned {
+        let owned_now = sleep_validate_one_done_pane_ownership(tmux, &session, pane)?;
+        tmux.sleep_kill_pane(&owned_now.pane_id)?;
+        let _ = tmux.sleep_append_log("--all-done", &pane.window_name);
+    }
+    let latest = tmux.sleep_list_sessions().unwrap_or_default();
+    let _ = tmux.sleep_take_snapshot(&latest);
+    Ok(out)
+}
+
 fn sleep_parse_args(argv: &[String]) -> Result<SleepArgs, String> {
     if argv.is_empty() { return Err(SLEEP_USAGE.to_owned()); }
     let mut words = Vec::new();
+    let mut all_done = false;
+    let mut dry_run = false;
     for value in argv {
         match value.as_str() {
             "--help" | "-h" | "help" => return Err(SLEEP_USAGE.to_owned()),
-            "--all-done" => return Err("(placeholder) maw sleep --all-done — sleep ALL agents. Not yet implemented.".to_owned()),
+            "--all-done" => all_done = true,
+            "--dry-run" => dry_run = true,
             "--" => return Err("sleep: -- separator is not allowed".to_owned()),
             item if item.starts_with('-') => return Err(sleep_flag_like_target(item)),
             item => words.push(sleep_validate_user_target(item)?),
         }
     }
+    if all_done {
+        if !words.is_empty() { return Err("sleep --all-done does not accept a target".to_owned()); }
+        return Ok(SleepArgs::AllDone(SleepAllDoneArgs { dry_run }));
+    }
+    if dry_run { return Err("sleep --dry-run is only supported with --all-done".to_owned()); }
     match words.as_slice() {
-        [target] => Ok(SleepArgs { target: target.clone(), window: None }),
-        [target, window] => Ok(SleepArgs { target: target.clone(), window: Some(window.clone()) }),
+        [target] => Ok(SleepArgs::One(SleepOneArgs { target: target.clone(), window: None })),
+        [target, window] => Ok(SleepArgs::One(SleepOneArgs { target: target.clone(), window: Some(window.clone()) })),
         _ => Err(SLEEP_USAGE.to_owned()),
     }
 }
 
-fn sleep_resolve_target(args: &SleepArgs, sessions: &[SleepSession], fleet: &[NativeFleetSession]) -> Option<SleepResolved> {
+fn sleep_resolve_target(args: &SleepOneArgs, sessions: &[SleepSession], fleet: &[NativeFleetSession]) -> Option<SleepResolved> {
     if args.window.is_none() {
         if let Some(found) = sleep_resolve_by_window(&args.target, sessions) { return Some(found); }
     }
@@ -177,13 +268,13 @@ fn sleep_resolve_by_window(target: &str, sessions: &[SleepSession]) -> Option<Sl
     None
 }
 
-fn sleep_resolve_by_session(args: &SleepArgs, sessions: &[SleepSession], fleet: &[NativeFleetSession]) -> Option<SleepResolved> {
+fn sleep_resolve_by_session(args: &SleepOneArgs, sessions: &[SleepSession], fleet: &[NativeFleetSession]) -> Option<SleepResolved> {
     let session = sessions.iter().find(|session| sleep_session_matches(&session.name, &args.target))?;
     let window = args.window.clone().or_else(|| sleep_fleet_primary(&session.name, fleet)).or_else(|| session.windows.first().map(|item| item.name.clone()))?;
     Some(SleepResolved { session: session.name.clone(), window })
 }
 
-fn sleep_detect_session(args: &SleepArgs, sessions: &[SleepSession], fleet: &[NativeFleetSession]) -> Option<SleepResolved> {
+fn sleep_detect_session(args: &SleepOneArgs, sessions: &[SleepSession], fleet: &[NativeFleetSession]) -> Option<SleepResolved> {
     let fleet_entry = fleet.iter().find(|entry| sleep_session_matches(&entry.name, &args.target))?;
     let session = fleet_entry.name.clone();
     let window = args.window.clone().or_else(|| fleet_entry.windows.first().map(|item| item.name.clone())).or_else(|| sleep_find_session(sessions, &session).and_then(|item| item.windows.first().map(|w| w.name.clone())))?;
@@ -238,6 +329,109 @@ fn sleep_parse_window_line(line: &str) -> Option<SleepWindow> {
     Some(SleepWindow { index: fields.next()?.parse().ok()?, name: fields.next().unwrap_or_default().to_owned() })
 }
 
+fn sleep_parse_panes(raw: &str) -> Vec<SleepPane> {
+    raw.lines().filter_map(sleep_parse_pane_line).collect()
+}
+
+fn sleep_parse_pane_line(line: &str) -> Option<SleepPane> {
+    let mut fields = line.split("|||");
+    Some(SleepPane {
+        session: fields.next()?.to_owned(),
+        window_index: fields.next()?.parse().ok()?,
+        window_name: fields.next().unwrap_or_default().to_owned(),
+        pane_index: fields.next()?.parse().ok()?,
+        pane_id: fields.next().unwrap_or_default().to_owned(),
+        pane_pid: fields.next().unwrap_or_default().to_owned(),
+        current_command: fields.next().unwrap_or_default().to_owned(),
+        title: fields.next().unwrap_or_default().to_owned(),
+    })
+}
+
+fn sleep_validate_current_session(session: &str, sessions: &[SleepSession]) -> Result<(), String> {
+    sleep_validate_tmux_target(session)?;
+    if sleep_find_session(sessions, session).is_some() { Ok(()) } else { Err(format!("sleep --all-done: refusing missing current session {session}")) }
+}
+
+fn sleep_collect_done_panes(tmux: &mut impl SleepTmux, session: &str) -> Result<Vec<SleepPane>, String> {
+    let mut candidates = Vec::new();
+    for pane in tmux.sleep_list_panes(session)? {
+        if pane.session != session { continue; }
+        if !sleep_is_parked_command(&pane.current_command) { continue; }
+        sleep_validate_pane_ownership_fields(&pane, session)?;
+        let capture = tmux.sleep_capture_pane(&pane.pane_id)?;
+        if sleep_capture_has_done_marker(&capture) { candidates.push(pane); }
+    }
+    Ok(candidates)
+}
+
+fn sleep_validate_all_done_ownership(tmux: &mut impl SleepTmux, session: &str, candidates: &[SleepPane]) -> Result<Vec<SleepPane>, String> {
+    let mut owned = Vec::new();
+    let refreshed = tmux.sleep_list_panes(session)?;
+    for candidate in candidates {
+        sleep_validate_pane_ownership_fields(candidate, session)?;
+        let Some(current) = refreshed.iter().find(|pane| pane.pane_id == candidate.pane_id) else {
+            return Err(format!("sleep --all-done: refusing pane {} because ownership disappeared", candidate.pane_id));
+        };
+        sleep_validate_same_owned_pane(candidate, current, session)?;
+        let capture = tmux.sleep_capture_pane(&current.pane_id)?;
+        if !sleep_capture_has_done_marker(&capture) || !sleep_is_parked_command(&current.current_command) {
+            return Err(format!("sleep --all-done: refusing pane {} because it is no longer done", current.pane_id));
+        }
+        owned.push(current.clone());
+    }
+    Ok(owned)
+}
+
+fn sleep_validate_one_done_pane_ownership(tmux: &mut impl SleepTmux, session: &str, expected: &SleepPane) -> Result<SleepPane, String> {
+    let refreshed = tmux.sleep_list_panes(session)?;
+    let Some(current) = refreshed.iter().find(|pane| pane.pane_id == expected.pane_id) else {
+        return Err(format!("sleep --all-done: refusing pane {} because ownership disappeared", expected.pane_id));
+    };
+    sleep_validate_same_owned_pane(expected, current, session)?;
+    let capture = tmux.sleep_capture_pane(&current.pane_id)?;
+    if !sleep_capture_has_done_marker(&capture) || !sleep_is_parked_command(&current.current_command) {
+        return Err(format!("sleep --all-done: refusing pane {} because it is no longer done", current.pane_id));
+    }
+    Ok(current.clone())
+}
+
+fn sleep_validate_same_owned_pane(expected: &SleepPane, current: &SleepPane, session: &str) -> Result<(), String> {
+    sleep_validate_pane_ownership_fields(current, session)?;
+    if current.pane_pid != expected.pane_pid || current.window_name != expected.window_name || current.window_index != expected.window_index {
+        return Err(format!("sleep --all-done: refusing pane {} because PID/window ownership changed", expected.pane_id));
+    }
+    Ok(())
+}
+
+fn sleep_validate_pane_ownership_fields(pane: &SleepPane, session: &str) -> Result<(), String> {
+    if pane.session != session {
+        return Err(format!("sleep --all-done: refusing pane {} outside current session {session}", pane.pane_id));
+    }
+    sleep_validate_tmux_target(&pane.session)?;
+    sleep_validate_tmux_target(&pane.window_name)?;
+    sleep_validate_pane_id(&pane.pane_id)?;
+    sleep_validate_pid(&pane.pane_pid)?;
+    Ok(())
+}
+
+fn sleep_is_parked_command(command: &str) -> bool {
+    matches!(command.trim().to_ascii_lowercase().as_str(), "read" | "sleep")
+}
+
+fn sleep_capture_has_done_marker(capture: &str) -> bool {
+    let lower = capture.to_ascii_lowercase();
+    lower.contains("[done") && lower.contains("exit")
+}
+
+fn sleep_render_all_done_plan(session: &str, panes: &[SleepPane], dry_run: bool) -> String {
+    let mut out = if dry_run { format!("\x1b[32msleep --all-done\x1b[0m {session} (dry-run)\n") } else { format!("\x1b[32msleep --all-done\x1b[0m {session}\n") };
+    for pane in panes {
+        let action = if dry_run { "would sleep" } else { "slept" };
+        let _ = writeln!(out, "  {action} {} pid={} window={} command={}", pane.pane_id, pane.pane_pid, pane.window_name, pane.current_command);
+    }
+    out
+}
+
 fn sleep_validate_user_target(value: &str) -> Result<String, String> {
     if value.is_empty() || value.trim() != value || value.starts_with('-') || value == "--" || value.contains('\0') || value.chars().any(char::is_control) {
         Err("sleep target must be non-empty, unpadded, and not start with '-'".to_owned())
@@ -249,6 +443,22 @@ fn sleep_validate_user_target(value: &str) -> Result<String, String> {
 fn sleep_validate_tmux_target(value: &str) -> Result<(), String> {
     if value.is_empty() || value.trim() != value || value.starts_with('-') || value == "--" || value.contains('\0') || value.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         Err("sleep tmux target must be non-empty, unpadded, and not start with '-'".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn sleep_validate_pane_id(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value || value.starts_with('-') || value == "--" || !value.starts_with('%') || value.contains('\0') || value.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        Err("sleep pane id must be a tmux %pane id and not start with '-'".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn sleep_validate_pid(value: &str) -> Result<(), String> {
+    if value.is_empty() || value == "0" || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        Err("sleep pane pid must be a non-zero decimal PID".to_owned())
     } else {
         Ok(())
     }
@@ -317,22 +527,57 @@ mod sleep_tests {
     #[derive(Default)]
     struct SleepFakeTmux {
         sessions: Vec<SleepSession>,
+        current_session: String,
+        panes: Vec<SleepPane>,
+        captures: std::collections::BTreeMap<String, String>,
+        mutate_pid_on_refresh: bool,
         calls: Vec<String>,
         log: Vec<String>,
     }
 
     impl SleepFakeTmux {
         fn sleep_fixture() -> Self {
-            Self { sessions: vec![SleepSession { name: "01-nova".to_owned(), windows: vec![SleepWindow { index: 0, name: "nova-oracle".to_owned() }, SleepWindow { index: 1, name: "worktree-task-".to_owned() }] }], ..Self::default() }
+            Self {
+                current_session: "01-nova".to_owned(),
+                sessions: vec![SleepSession { name: "01-nova".to_owned(), windows: vec![SleepWindow { index: 0, name: "nova-oracle".to_owned() }, SleepWindow { index: 1, name: "worktree-task-".to_owned() }] }],
+                ..Self::default()
+            }
+        }
+
+        fn sleep_all_done_fixture() -> Self {
+            let mut fake = Self::sleep_fixture();
+            fake.panes = vec![
+                SleepPane { session: "01-nova".to_owned(), window_index: 1, window_name: "worktree-task-".to_owned(), pane_index: 0, pane_id: "%21".to_owned(), pane_pid: "421".to_owned(), current_command: "read".to_owned(), title: "done".to_owned() },
+                SleepPane { session: "01-nova".to_owned(), window_index: 0, window_name: "nova-oracle".to_owned(), pane_index: 0, pane_id: "%20".to_owned(), pane_pid: "420".to_owned(), current_command: "codex".to_owned(), title: "busy".to_owned() },
+                SleepPane { session: "02-other".to_owned(), window_index: 0, window_name: "other-done".to_owned(), pane_index: 0, pane_id: "%99".to_owned(), pane_pid: "999".to_owned(), current_command: "read".to_owned(), title: "done".to_owned() },
+            ];
+            fake.captures.insert("%21".to_owned(), "job output\n[done — exit 0]\n".to_owned());
+            fake.captures.insert("%20".to_owned(), "still running\n".to_owned());
+            fake.captures.insert("%99".to_owned(), "[done — exit 0]\n".to_owned());
+            fake
         }
     }
 
     impl SleepTmux for SleepFakeTmux {
         fn sleep_list_sessions(&mut self) -> Result<Vec<SleepSession>, String> { Ok(self.sessions.clone()) }
         fn sleep_list_windows(&mut self, session: &str) -> Result<Vec<SleepWindow>, String> { Ok(sleep_find_session(&self.sessions, session).map_or_else(Vec::new, |s| s.windows.clone())) }
+        fn sleep_current_session(&mut self) -> Result<String, String> { Ok(self.current_session.clone()) }
+        fn sleep_list_panes(&mut self, session: &str) -> Result<Vec<SleepPane>, String> {
+            self.calls.push(format!("list-panes {session}"));
+            let mut panes = self.panes.iter().filter(|pane| pane.session == session).cloned().collect::<Vec<_>>();
+            if self.mutate_pid_on_refresh && self.calls.iter().filter(|call| call.as_str() == "list-panes 01-nova").count() > 1 {
+                if let Some(pane) = panes.iter_mut().find(|pane| pane.pane_id == "%21") { pane.pane_pid = "422".to_owned(); }
+            }
+            Ok(panes)
+        }
+        fn sleep_capture_pane(&mut self, pane_id: &str) -> Result<String, String> {
+            self.calls.push(format!("capture-pane {pane_id}"));
+            Ok(self.captures.get(pane_id).cloned().unwrap_or_default())
+        }
         fn sleep_send_exit(&mut self, target: &str) -> Result<(), String> { self.calls.push(format!("send-exit {target}")); Ok(()) }
         fn sleep_wait_grace(&mut self) -> Result<(), String> { self.calls.push("wait3s".to_owned()); Ok(()) }
         fn sleep_kill_window(&mut self, target: &str) -> Result<(), String> { self.calls.push(format!("kill-window {target}")); for s in &mut self.sessions { s.windows.retain(|w| format!("{}:{}", s.name, w.name) != target); } Ok(()) }
+        fn sleep_kill_pane(&mut self, pane_id: &str) -> Result<(), String> { self.calls.push(format!("kill-pane {pane_id}")); self.panes.retain(|pane| pane.pane_id != pane_id); Ok(()) }
         fn sleep_save_tab_order(&mut self, session: &str, _windows: &[SleepWindow]) -> Result<(), String> { self.calls.push(format!("save-tab-order {session}")); Ok(()) }
         fn sleep_run_lifecycle(&mut self, resolved: &SleepResolved, requested: &str) -> Result<(), String> { self.calls.push(format!("lifecycle {requested} {}:{}", resolved.session, resolved.window)); Ok(()) }
         fn sleep_append_log(&mut self, requested: &str, window: &str) -> Result<(), String> { self.log.push(format!("{requested}:{window}")); Ok(()) }
@@ -355,6 +600,66 @@ mod sleep_tests {
         assert_eq!(out, include_str!("../../tests/fixtures/native-sleep/sleep-default.stdout"));
         assert_eq!(tmux.calls, ["save-tab-order 01-nova", "lifecycle nova 01-nova:nova-oracle", "send-exit 01-nova:nova-oracle", "wait3s", "kill-window 01-nova:nova-oracle", "snapshot sleep"]);
         assert_eq!(tmux.log, ["nova:nova-oracle"]);
+    }
+
+    #[test]
+    fn sleep_all_done_dry_run_is_hermetic_golden_and_non_mutating() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
+        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+        let mut tmux = SleepFakeTmux::sleep_all_done_fixture();
+        let out = sleep_run(&sleep_args(&["--all-done", "--dry-run"]), &mut tmux, sleep_fleet).expect("sleep all done dry-run");
+        assert_eq!(out, include_str!("../../tests/fixtures/native-sleep/sleep-all-done-dry-run.stdout"));
+        assert_eq!(tmux.calls, ["list-panes 01-nova", "capture-pane %21"]);
+        assert!(tmux.log.is_empty());
+        assert!(tmux.panes.iter().any(|pane| pane.pane_id == "%21"));
+    }
+
+    #[test]
+    fn sleep_all_done_live_validates_ownership_before_kill_and_uses_golden() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
+        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+        let mut tmux = SleepFakeTmux::sleep_all_done_fixture();
+        let out = sleep_run(&sleep_args(&["--all-done"]), &mut tmux, sleep_fleet).expect("sleep all done");
+        assert_eq!(out, include_str!("../../tests/fixtures/native-sleep/sleep-all-done-live.stdout"));
+        assert_eq!(
+            tmux.calls,
+            [
+                "list-panes 01-nova",
+                "capture-pane %21",
+                "list-panes 01-nova",
+                "capture-pane %21",
+                "save-tab-order 01-nova",
+                "list-panes 01-nova",
+                "capture-pane %21",
+                "kill-pane %21",
+                "snapshot sleep"
+            ]
+        );
+        assert_eq!(tmux.log, ["--all-done:worktree-task-"]);
+        assert!(!tmux.panes.iter().any(|pane| pane.pane_id == "%21"));
+        assert!(tmux.panes.iter().any(|pane| pane.pane_id == "%99"));
+    }
+
+    #[test]
+    fn sleep_all_done_refuses_pid_ownership_race_before_any_kill() {
+        let mut tmux = SleepFakeTmux::sleep_all_done_fixture();
+        tmux.mutate_pid_on_refresh = true;
+        let err = sleep_run(&sleep_args(&["--all-done"]), &mut tmux, sleep_fleet).unwrap_err();
+        assert!(err.contains("ownership changed"));
+        assert!(tmux.calls.iter().all(|call| !call.starts_with("kill-pane")));
+        assert!(tmux.log.is_empty());
+    }
+
+    #[test]
+    fn sleep_all_done_rejects_bad_pane_id_before_kill() {
+        let mut tmux = SleepFakeTmux::sleep_all_done_fixture();
+        tmux.panes[0].pane_id = "-bad".to_owned();
+        tmux.captures.insert("-bad".to_owned(), "[done — exit 0]\n".to_owned());
+        let err = sleep_run(&sleep_args(&["--all-done"]), &mut tmux, sleep_fleet).unwrap_err();
+        assert!(err.contains("pane id"));
+        assert!(tmux.calls.iter().all(|call| !call.starts_with("kill-pane")));
     }
 
     #[test]
