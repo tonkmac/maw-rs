@@ -375,8 +375,18 @@ mod tests {
         path
     }
 
+    fn worktrees_git_for_tests() -> PathBuf {
+        option_env!("PATH")
+            .and_then(|path| {
+                std::env::split_paths(path)
+                    .map(|dir| dir.join("git"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .unwrap_or_else(|| PathBuf::from("git"))
+    }
+
     fn worktrees_run(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = Command::new(worktrees_git_for_tests())
             .arg("-C")
             .arg(root)
             .args(args)
