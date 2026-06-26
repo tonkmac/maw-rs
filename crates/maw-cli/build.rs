@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug)]
 struct PartFile {
@@ -17,6 +18,8 @@ fn main() {
 }
 
 fn generate() -> io::Result<()> {
+    emit_build_info();
+
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set"));
     let core_impl_dir = manifest_dir.join("src").join("core_impl");
@@ -109,4 +112,29 @@ fn dispatch_const_number_from_line(line: &str) -> Option<u32> {
         return None;
     }
     rest[..digits_len].parse().ok()
+}
+
+fn emit_build_info() {
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs");
+    println!(
+        "cargo:rustc-env=MAW_RS_GIT_HASH={}",
+        git_output(&["rev-parse", "--short", "HEAD"])
+    );
+    println!(
+        "cargo:rustc-env=MAW_RS_BUILD_DATE={}",
+        git_output(&["log", "-1", "--format=%ci"])
+    );
+}
+
+fn git_output(args: &[&str]) -> String {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
