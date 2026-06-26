@@ -1,15 +1,36 @@
+#[derive(Clone, Copy)]
+pub(crate) struct TmuxSubcommandEntry {
+    names: &'static [&'static str],
+    handler: NativeHandler,
+}
+
+const TMUX_BUILTIN_SUBS: &[TmuxSubcommandEntry] = &[
+    TmuxSubcommandEntry { names: &["ls", "list"], handler: run_tmux_ls },
+    TmuxSubcommandEntry { names: &["peek"], handler: run_tmux_peek },
+    TmuxSubcommandEntry { names: &["split"], handler: run_tmux_split },
+    TmuxSubcommandEntry { names: &["attach"], handler: run_attach_plan },
+];
+
 fn run_tmux_command(argv: &[String]) -> CliOutput {
     let Some(sub) = argv.first().map(String::as_str) else { return tmux_usage(); };
-    match sub {
-        "ls" | "list" => run_tmux_ls(&argv[1..]),
-        "peek" => run_tmux_peek(&argv[1..]),
-        "split" => run_tmux_split(&argv[1..]),
-        "attach" => run_attach_plan(&argv[1..]),
-        "--help" | "-h" => tmux_usage(),
-        other => CliOutput { code: 1, stdout: String::new(), stderr: format!("maw tmux: unknown subcommand {other}\n") },
+    if matches!(sub, "--help" | "-h") {
+        return tmux_usage();
     }
+    tmux_subcommand_entries()
+        .find(|entry| entry.names.contains(&sub))
+        .map_or_else(
+            || CliOutput { code: 1, stdout: String::new(), stderr: format!("maw tmux: unknown subcommand {sub}\n") },
+            |entry| (entry.handler)(&argv[1..]),
+        )
 }
-fn tmux_usage() -> CliOutput { CliOutput { code: 0, stdout: "usage: maw tmux <ls|peek|split|attach> [...]\n".to_owned(), stderr: String::new() } }
+
+fn tmux_subcommand_entries() -> impl Iterator<Item = &'static TmuxSubcommandEntry> {
+    TMUX_BUILTIN_SUBS
+        .iter()
+        .chain(TMUX_SUB_FRAGMENTS.iter().copied().flatten())
+}
+
+fn tmux_usage() -> CliOutput { CliOutput { code: 0, stdout: "usage: maw tmux <ls|peek|split|attach|break> [...]\n".to_owned(), stderr: String::new() } }
 
 fn run_tmux_ls(argv: &[String]) -> CliOutput {
     let json = argv.iter().any(|arg| arg == "--json");
