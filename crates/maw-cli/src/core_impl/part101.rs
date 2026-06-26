@@ -441,14 +441,21 @@ fn plugins_tier_order(tier: maw_plugin_manifest::PluginTier) -> u8 {
 
 #[cfg(test)]
 mod plugins_tests {
-    use super::{current_epoch_seconds, plugins_run_command, DISPATCH_101};
+    use super::{plugins_run_command, DISPATCH_101};
 
     fn plugins_strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()
     }
 
     fn plugins_temp(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("maw-rs-plugins-{label}-{}", current_epoch_seconds()))
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "maw-rs-plugins-{label}-{}-{stamp}",
+            std::process::id()
+        ))
     }
 
     fn plugins_seed(root: &std::path::Path, name: &str, tier: &str) {
