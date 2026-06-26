@@ -67,7 +67,7 @@ fn write_maw_shim(dir: &Path, exit_code: u8) {
     write(
         &shim,
         format!(
-            "#!/bin/sh\nprintf 'MAW_FROM_RS=%s\\n' \"$MAW_FROM_RS\"\nprintf 'args=%s\\n' \"$*\"\nexit {exit_code}\n"
+            "#!/bin/sh\nprintf 'DELEGATED-MAW\\n'\nprintf 'MAW_FROM_RS=%s\\n' \"$MAW_FROM_RS\"\nprintf 'args=%s\\n' \"$*\"\nexit {exit_code}\n"
         ),
     )
     .expect("write maw shim");
@@ -84,7 +84,7 @@ fn write_maw_shim(dir: &Path, exit_code: u8) {
 }
 
 #[test]
-fn dispatcher_table_marks_native_and_fallback_commands() {
+fn dispatcher_table_marks_native_and_unknown_commands() {
     assert_eq!(dispatcher_status("ls"), DispatchKind::Native);
     assert_eq!(dispatcher_status("hey"), DispatchKind::Native);
     assert!(native_dispatch_commands().contains(&"ls"));
@@ -116,6 +116,47 @@ fn native_command_stays_native_without_invoking_maw_fallback() {
 }
 
 #[test]
+fn unknown_command_is_native_error_and_never_invokes_path_maw() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("unknown-native");
+    let bin_dir = root.join("bin");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&bin_dir).expect("bin dir");
+    create_dir_all(&plugins_dir).expect("plugins dir");
+    write_maw_shim(&bin_dir, 37);
+    std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+    std::env::remove_var("MAW_FROM_RS");
+    std::env::remove_var("MAW_RS_HEY_FALLBACK");
+
+    let output = run_cli(&args(&["__definitely_unknown_xyz__"]));
+
+    assert_eq!(
+        dispatcher_status("__definitely_unknown_xyz__"),
+        DispatchKind::NativeError
+    );
+    assert_eq!(output.code, 2, "{}", output.stdout);
+    assert!(output.stdout.is_empty(), "{}", output.stdout);
+    assert_eq!(
+        output.stderr,
+        include_str!("fixtures/zero-bun/unknown-command.stderr")
+    );
+    assert!(
+        !output.stderr.contains("DELEGATED-MAW"),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("failed to run maw fallback"),
+        "{}",
+        output.stderr
+    );
+
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn hey_can_still_fall_through_to_maw_when_safety_env_is_set() {
     let _guard = env_lock().lock().expect("env lock");
     let _restore = EnvRestore::capture();
@@ -136,7 +177,7 @@ fn hey_can_still_fall_through_to_maw_when_safety_env_is_set() {
     assert!(output.stderr.is_empty(), "{}", output.stderr);
     assert_eq!(
         output.stdout,
-        "MAW_FROM_RS=1\nargs=hey local:nova:claude ping\n"
+        "DELEGATED-MAW\nMAW_FROM_RS=1\nargs=hey local:nova:claude ping\n"
     );
 
     remove_dir_all(root).expect("cleanup");
@@ -175,7 +216,7 @@ fn loop_guard_returns_unknown_command_instead_of_falling_through() {
     assert_eq!(output.code, 2, "{}", output.stdout);
     assert!(output.stdout.is_empty(), "{}", output.stdout);
     assert!(
-        output.stderr.contains("unknown command: hey"),
+        output.stderr.contains("maw-rs: unknown command 'hey'"),
         "{}",
         output.stderr
     );
