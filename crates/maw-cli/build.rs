@@ -30,6 +30,7 @@ fn generate() -> io::Result<()> {
     let parts = collect_part_files(&core_impl_dir)?;
     let mut includes = String::new();
     let mut dispatch_numbers = Vec::new();
+    let mut tmux_sub_numbers = Vec::new();
 
     for part in &parts {
         println!("cargo:rerun-if-changed={}", part.path.display());
@@ -47,6 +48,16 @@ fn generate() -> io::Result<()> {
             );
             dispatch_numbers.push(dispatch_number);
         }
+        if let Some(tmux_sub_number) = find_tmux_sub_const_number(&contents) {
+            assert_eq!(
+                tmux_sub_number,
+                part.number,
+                "{} declares TMUX_SUB_{tmux_sub_number:02}, expected TMUX_SUB_{:02}",
+                part.path.display(),
+                part.number
+            );
+            tmux_sub_numbers.push(tmux_sub_number);
+        }
     }
 
     let mut fragments =
@@ -56,8 +67,16 @@ fn generate() -> io::Result<()> {
     }
     fragments.push_str("];\n");
 
+    let mut tmux_fragments =
+        String::from("#[allow(clippy::needless_borrow)]\npub(crate) const TMUX_SUB_FRAGMENTS: &[&[TmuxSubcommandEntry]] = &[\n");
+    for number in tmux_sub_numbers {
+        writeln!(tmux_fragments, "    &TMUX_SUB_{number:02},").expect("write to String");
+    }
+    tmux_fragments.push_str("];\n");
+
     fs::write(out_dir.join("parts_includes.rs"), includes)?;
     fs::write(out_dir.join("dispatch_fragments.rs"), fragments)?;
+    fs::write(out_dir.join("tmux_sub_fragments.rs"), tmux_fragments)?;
     Ok(())
 }
 
@@ -100,6 +119,10 @@ fn find_dispatch_const_number(contents: &str) -> Option<u32> {
     contents.lines().find_map(dispatch_const_number_from_line)
 }
 
+fn find_tmux_sub_const_number(contents: &str) -> Option<u32> {
+    contents.lines().find_map(tmux_sub_const_number_from_line)
+}
+
 fn dispatch_const_number_from_line(line: &str) -> Option<u32> {
     let line = line.trim_start();
     let rest = line
@@ -107,6 +130,20 @@ fn dispatch_const_number_from_line(line: &str) -> Option<u32> {
         .or_else(|| line.strip_prefix("pub const "))
         .or_else(|| line.strip_prefix("pub(crate) const "))?;
     let rest = rest.strip_prefix("DISPATCH_")?;
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 || !rest[digits_len..].starts_with(':') {
+        return None;
+    }
+    rest[..digits_len].parse().ok()
+}
+
+fn tmux_sub_const_number_from_line(line: &str) -> Option<u32> {
+    let line = line.trim_start();
+    let rest = line
+        .strip_prefix("const ")
+        .or_else(|| line.strip_prefix("pub const "))
+        .or_else(|| line.strip_prefix("pub(crate) const "))?;
+    let rest = rest.strip_prefix("TMUX_SUB_")?;
     let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
     if digits_len == 0 || !rest[digits_len..].starts_with(':') {
         return None;

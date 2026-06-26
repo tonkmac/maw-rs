@@ -127,6 +127,7 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "delete" | "rm" => team_delete(argv),
         "prune" => team_prune(argv),
         "shutdown" => team_shutdown(argv),
+        "resume" => team_resume(argv),
         "enter" | "send-enter" => team_enter_send_enter(argv),
         "add" | "task" | "done" | "assign" => team_task_ops241(argv),
         other if other.starts_with('-') => Err(format!("team: unknown argument {other}")),
