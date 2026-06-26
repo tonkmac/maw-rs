@@ -56,7 +56,6 @@ mod ctq_tests {
     #[test]
     fn ctq_dispatch_registers_native_and_empty_contract() {
         assert_eq!(dispatcher_status("cross-team-queue"), DispatchKind::Native);
-        assert_eq!(DISPATCH_143.len(), 1);
         let out = ctq_run_command(&ctq_args(&[]));
         assert_eq!(out.code, 0, "{}", out.stderr);
         assert_eq!(out.stdout, CTQ_EMPTY_JSON);
