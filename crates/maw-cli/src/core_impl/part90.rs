@@ -343,6 +343,10 @@ mod oracleworkon_tests {
                 argv: vec!["workon".to_owned(), "demo".to_owned()],
                 status: "fake".to_owned(),
                 message: None,
+                leader_argv: None,
+                swarm_argv: None,
+                pane: None,
+                swarm_skipped: None,
             })
         }
     }
