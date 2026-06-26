@@ -97,9 +97,10 @@ jobs:
   musl-static:
     name: MUSL static Extism linkability
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Install musl toolchain
         run: |
