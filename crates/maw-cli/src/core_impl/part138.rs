@@ -236,7 +236,7 @@ mod ping_tests133 {
     fn now() -> u128 { 42 }
 
     #[test]
-    fn ping_dispatch_registers_native() { assert_eq!(DISPATCH_138[0].command, "ping"); }
+    fn ping_dispatch_registers_native() { assert_eq!(dispatcher_status("ping"), DispatchKind::Native); }
 
     #[test]
     fn ping_all_renders_named_and_legacy_without_real_network() {
