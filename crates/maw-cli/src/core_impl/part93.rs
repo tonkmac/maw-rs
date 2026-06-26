@@ -12,7 +12,7 @@ const WORK_USAGE: &str = "usage: maw work <repo> [task] [--layout nested|legacy]
 const AWAKE_USAGE: &str = "usage: maw awake <name> [wake flags...]";
 const SCAFFOLD_USAGE: &str = "usage: maw scaffold <name> [--rust|--as] [--dest <path>] [--dry-run]";
 const NEW_USAGE: &str = "usage: maw new <name> [--rust|--as] [--dest <path>] [--dry-run]";
-const PROMOTE_USAGE: &str = "usage: maw promote <target> [--base <branch>] [--branch <branch>] [--dry-run]";
+const PROMOTE_USAGE: &str = "usage: maw promote <window> [--as <name>] [--attach] [--force]";
 const PREFLIGHT_USAGE: &str = "usage: maw preflight [path] [--json]";
 const SNAPSHOTS_USAGE: &str = "usage: maw snapshots [list|create|show] [name] [--json]";
 
@@ -33,9 +33,68 @@ struct ScaffoldOptionsNative {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PromoteOptionsNative {
     target: String,
-    base: String,
-    branch: Option<String>,
-    dry_run: bool,
+    as_session: Option<String>,
+    attach: bool,
+    force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromoteResolvedNative {
+    src_session: String,
+    src_window: String,
+    dst_session: String,
+    attach: bool,
+    force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromoteResolveResultNative {
+    Resolved { session: String, window: String },
+    None,
+    Ambiguous(Vec<PromoteCandidateNative>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromoteCandidateNative {
+    session: String,
+    window: String,
+}
+
+#[allow(dead_code)]
+trait PromoteTmuxNative {
+    fn promote_list_all(&mut self) -> Vec<TmuxSession>;
+    fn promote_list_windows(&mut self, session: &str) -> Result<Vec<maw_tmux::TmuxWindow>, String>;
+    fn promote_has_session(&mut self, name: &str) -> bool;
+    fn promote_caller_in_tmux(&self) -> bool;
+    fn promote_new_session(&mut self, name: &str, window: &str) -> Result<(), String>;
+    fn promote_move_window(&mut self, src: &str, dst: &str) -> Result<(), String>;
+    fn promote_kill_session(&mut self, name: &str) -> Result<(), String>;
+    fn promote_kill_window(&mut self, target: &str) -> Result<(), String>;
+    fn promote_switch_client(&mut self, session: &str) -> Result<(), String>;
+}
+
+struct PromoteSystemTmuxNative;
+
+impl PromoteTmuxNative for PromoteSystemTmuxNative {
+    fn promote_list_all(&mut self) -> Vec<TmuxSession> { TmuxClient::local().list_all() }
+
+    fn promote_list_windows(&mut self, session: &str) -> Result<Vec<maw_tmux::TmuxWindow>, String> {
+        promote_validate_tmux_name(session, "source session")?;
+        TmuxClient::local().list_windows(session).map_err(|error| error.to_string())
+    }
+
+    fn promote_has_session(&mut self, name: &str) -> bool {
+        if promote_validate_tmux_name(name, "destination session").is_err() { return false; }
+        TmuxClient::local().has_session(name)
+    }
+
+    fn promote_caller_in_tmux(&self) -> bool { std::env::var_os("TMUX").is_some() }
+
+    fn promote_new_session(&mut self, _name: &str, _window: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
+    fn promote_move_window(&mut self, _src: &str, _dst: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
+    fn promote_kill_session(&mut self, _name: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
+    fn promote_kill_window(&mut self, _target: &str) -> Result<(), String> { Err("promote: mutation deferred to #299 PR-B".to_owned()) }
+    fn promote_switch_client(&mut self, _session: &str) -> Result<(), String> { Err("promote: attach deferred to #299 PR-B".to_owned()) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,55 +329,149 @@ fn new_relabel_stdout(stdout: &str) -> String {
 }
 
 fn promote_run_command(argv: &[String]) -> CliOutput {
-    match promote_parse_args(argv) {
-        Ok(options) => CliOutput { code: 0, stdout: promote_render_plan(&options), stderr: String::new() },
+    let mut tmux = PromoteSystemTmuxNative;
+    promote_run_command_with(argv, &mut tmux)
+}
+
+fn promote_run_command_with(argv: &[String], tmux: &mut impl PromoteTmuxNative) -> CliOutput {
+    match promote_parse_args(argv).and_then(|options| promote_plan_no_mutation(&options, tmux)) {
+        Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
         Err(message) => promote_error(&message),
     }
 }
 
 fn promote_error(message: &str) -> CliOutput {
-    CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") }
+    CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}
+") }
 }
 
 fn promote_parse_args(argv: &[String]) -> Result<PromoteOptionsNative, String> {
     let mut target = None::<String>;
-    let mut base = "alpha".to_owned();
-    let mut branch = None::<String>;
-    let mut dry_run = false;
+    let mut as_session = None::<String>;
+    let mut attach = false;
+    let mut force = false;
     let mut index = 0_usize;
     while index < argv.len() {
         match argv[index].as_str() {
             "--help" | "-h" | "help" => return Err(PROMOTE_USAGE.to_owned()),
             "--" => return Err("promote: -- separator is not allowed".to_owned()),
-            "--dry-run" => dry_run = true,
-            "--base" => base = promote_take_value(argv, &mut index, "--base")?,
-            "--branch" => branch = Some(promote_take_value(argv, &mut index, "--branch")?),
-            value if value.starts_with("--base=") => base = promote_validate_ref(&value["--base=".len()..], "base")?,
-            value if value.starts_with("--branch=") => branch = Some(promote_validate_ref(&value["--branch=".len()..], "branch")?),
+            "--attach" => attach = true,
+            "--force" => force = true,
+            "--as" => as_session = Some(promote_take_session_value(argv, &mut index, "--as")?),
+            value if value.starts_with("--as=") => as_session = Some(promote_validate_session_name(&value["--as=".len()..], "--as")?),
             value if value.starts_with('-') => return Err(promote_flag_like(value)),
             value => promote_set_target(&mut target, value)?,
         }
         index += 1;
     }
-    Ok(PromoteOptionsNative { target: target.ok_or_else(|| PROMOTE_USAGE.to_owned())?, base, branch, dry_run })
+    Ok(PromoteOptionsNative { target: target.ok_or_else(|| PROMOTE_USAGE.to_owned())?, as_session, attach, force })
 }
 
-fn promote_take_value(argv: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+fn promote_take_session_value(argv: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
     let Some(value) = argv.get(*index + 1) else { return Err(format!("promote: {flag} requires a value")); };
     *index += 1;
-    promote_validate_ref(value, flag)
+    promote_validate_session_name(value, flag)
 }
 
 fn promote_set_target(slot: &mut Option<String>, value: &str) -> Result<(), String> {
     if slot.is_some() {
         return Err(PROMOTE_USAGE.to_owned());
     }
-    *slot = Some(promote_validate_ref(value, "target")?);
+    *slot = Some(promote_validate_target(value, "target")?);
     Ok(())
 }
 
-fn promote_validate_ref(value: &str, label: &str) -> Result<String, String> {
-    if value.is_empty() || value.trim() != value || value == "--" || value.starts_with('-') || value.contains("..") {
+fn promote_plan_no_mutation(options: &PromoteOptionsNative, tmux: &mut impl PromoteTmuxNative) -> Result<String, String> {
+    let sessions = tmux.promote_list_all();
+    let resolved = promote_resolve_target(&options.target, &sessions)?;
+    let PromoteResolveResultNative::Resolved { session: src_session, window: src_window } = resolved else {
+        return promote_resolution_error(&options.target, resolved);
+    };
+    promote_validate_tmux_name(&src_session, "source session")?;
+    promote_validate_tmux_name(&src_window, "source window")?;
+    let source_windows = tmux.promote_list_windows(&src_session).map_err(|error| format!("promote: cannot list windows in source session '{src_session}': {error}"))?;
+    if source_windows.len() <= 1 {
+        return Err(promote_only_window_error(&src_session, &src_window));
+    }
+    if !promote_window_exists(&source_windows, &src_window) {
+        return Err(format!("promote: source '{src_session}:{src_window}' disappeared before promote planning"));
+    }
+    let dst_session = promote_destination_session(options, &src_window)?;
+    let dst_exists = tmux.promote_has_session(&dst_session);
+    if dst_exists && !options.force {
+        return Err(promote_destination_exists_error(&options.target, &dst_session));
+    }
+    let resolved = PromoteResolvedNative { src_session, src_window, dst_session, attach: options.attach, force: options.force };
+    Ok(promote_render_deferred(&resolved, dst_exists, tmux.promote_caller_in_tmux()))
+}
+
+fn promote_resolve_target(target: &str, sessions: &[TmuxSession]) -> Result<PromoteResolveResultNative, String> {
+    promote_validate_target(target, "target")?;
+    let explicit_session = promote_target_session(target)?;
+    if let Some(explicit_window) = promote_target_window(target)? {
+        return promote_resolve_explicit(&explicit_session, &explicit_window, sessions);
+    }
+    let mut matches = promote_exact_window_matches(target, sessions);
+    if matches.is_empty() {
+        if let Some(canonical) = promote_strip_tmux_display_suffix(target) { matches = promote_exact_window_matches(canonical, sessions); }
+    }
+    Ok(match matches.len() {
+        0 => PromoteResolveResultNative::None,
+        1 => {
+            let candidate = matches.remove(0);
+            PromoteResolveResultNative::Resolved { session: candidate.session, window: candidate.window }
+        }
+        _ => PromoteResolveResultNative::Ambiguous(matches),
+    })
+}
+
+fn promote_resolve_explicit(session: &str, window: &str, sessions: &[TmuxSession]) -> Result<PromoteResolveResultNative, String> {
+    promote_validate_tmux_name(session, "source session")?;
+    promote_validate_tmux_name(window, "source window")?;
+    let Some(src_session) = sessions.iter().find(|candidate| candidate.name.eq_ignore_ascii_case(session)) else {
+        return Ok(PromoteResolveResultNative::Resolved { session: session.to_owned(), window: window.to_owned() });
+    };
+    if let Some(exact) = src_session.windows.iter().find(|candidate| candidate.name.eq_ignore_ascii_case(window)) {
+        return Ok(PromoteResolveResultNative::Resolved { session: src_session.name.clone(), window: exact.name.clone() });
+    }
+    if let Some(canonical) = promote_strip_tmux_display_suffix(window) {
+        if let Some(exact) = src_session.windows.iter().find(|candidate| candidate.name.eq_ignore_ascii_case(canonical)) {
+            return Ok(PromoteResolveResultNative::Resolved { session: src_session.name.clone(), window: exact.name.clone() });
+        }
+    }
+    Ok(PromoteResolveResultNative::Resolved { session: src_session.name.clone(), window: window.to_owned() })
+}
+
+fn promote_exact_window_matches(target: &str, sessions: &[TmuxSession]) -> Vec<PromoteCandidateNative> {
+    sessions.iter().flat_map(|session| {
+        session.windows.iter().filter(move |window| window.name == target).map(move |window| PromoteCandidateNative { session: session.name.clone(), window: window.name.clone() })
+    }).collect()
+}
+
+fn promote_resolution_error(target: &str, resolved: PromoteResolveResultNative) -> Result<String, String> {
+    match resolved {
+        PromoteResolveResultNative::None => Err(format!("promote: no window matches '{target}'")),
+        PromoteResolveResultNative::Ambiguous(candidates) => {
+            let mut message = format!("promote: '{target}' matches {} windows", candidates.len());
+            for candidate in candidates {
+                let _ = write!(message, "
+  [90m• {}:{}[0m", candidate.session, candidate.window);
+            }
+            let _ = write!(message, "
+  [90muse: maw promote <session>:<window>[0m");
+            Err(message)
+        }
+        PromoteResolveResultNative::Resolved { .. } => unreachable!("resolved handled by caller"),
+    }
+}
+
+fn promote_destination_session(options: &PromoteOptionsNative, src_window: &str) -> Result<String, String> {
+    let destination = if let Some(value) = &options.as_session { promote_validate_session_name(value, "--as")? } else { wake_session_name(src_window) };
+    promote_validate_session_name(&destination, "destination session")
+}
+
+fn promote_validate_target(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty() || value.trim() != value || value == "--" || value.starts_with('-') || value.contains('\0') {
         return Err(format!("promote {label} must be non-empty, unpadded, and not start with '-'"));
     }
     if value.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
@@ -327,22 +480,68 @@ fn promote_validate_ref(value: &str, label: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-fn promote_flag_like(value: &str) -> String {
-    format!("\"{value}\" looks like a flag, not a promote target.\n  {PROMOTE_USAGE}")
+fn promote_validate_session_name(value: &str, label: &str) -> Result<String, String> {
+    promote_validate_target(value, label)?;
+    promote_validate_tmux_name(value, label)?;
+    Ok(value.to_owned())
 }
 
-fn promote_render_plan(options: &PromoteOptionsNative) -> String {
-    let branch = options.branch.as_deref().unwrap_or(&options.target);
+fn promote_validate_tmux_name(value: &str, label: &str) -> Result<(), String> {
+    wake_validate_tmux_name(value, label).map_err(|_| format!("promote: invalid {label}"))
+}
+
+fn promote_target_session(target: &str) -> Result<String, String> {
+    let session = target.split(':').next().unwrap_or(target);
+    promote_validate_tmux_name(session, "source session")?;
+    Ok(session.to_owned())
+}
+
+fn promote_target_window(target: &str) -> Result<Option<String>, String> {
+    let window = target.split(':').skip(1).collect::<Vec<_>>().join(":");
+    let trimmed = window.trim();
+    if trimmed.is_empty() { return Ok(None); }
+    promote_validate_tmux_name(trimmed, "source window")?;
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn promote_strip_tmux_display_suffix(window: &str) -> Option<&str> {
+    if window.ends_with('-') && window.len() > 1 { Some(&window[..window.len() - 1]) } else { None }
+}
+
+fn promote_window_exists(windows: &[maw_tmux::TmuxWindow], name: &str) -> bool {
+    windows.iter().any(|window| window.name == name)
+}
+
+fn promote_only_window_error(src_session: &str, src_window: &str) -> String {
+    format!("promote refused — '{src_window}' is the only window in session '{src_session}'.
+  [90mthat would just be a session rename, not an eject.[0m
+  [90muse: tmux rename-session -t {src_session} <new-name>[0m")
+}
+
+fn promote_destination_exists_error(target: &str, dst_session: &str) -> String {
+    format!("promote refused — session '{dst_session}' already exists.
+  [90muse: maw promote {target} --as <new-name>[0m
+  [90mor:  maw promote {target} --force[0m  (merges into existing)")
+}
+
+fn promote_render_deferred(resolved: &PromoteResolvedNative, dst_exists: bool, caller_in_tmux: bool) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "promote plan:");
-    let _ = writeln!(out, "  target: {}", options.target);
-    let _ = writeln!(out, "  branch: {branch}");
-    let _ = writeln!(out, "  base: {}", options.base);
-    if options.dry_run {
-        let _ = writeln!(out, "  mode: dry-run");
+    let _ = writeln!(out, "promote-mutation-deferred");
+    let _ = writeln!(out, "  source: {}:{}", resolved.src_session, resolved.src_window);
+    let _ = writeln!(out, "  destination: {}", resolved.dst_session);
+    let _ = writeln!(out, "  destination-exists: {dst_exists}");
+    let _ = writeln!(out, "  force: {}", resolved.force);
+    let _ = writeln!(out, "  attach: {}", resolved.attach);
+    if resolved.attach && !caller_in_tmux {
+        let _ = writeln!(out, "  attach-note: caller is not in tmux; switch-client remains deferred");
     }
-    out.push_str("  note: native promote is plan-only until maw-js promote workflow parity is available.\n");
+    out.push_str("  note: tmux move-window + rollback lands in #299 PR-B
+");
     out
+}
+
+fn promote_flag_like(value: &str) -> String {
+    format!("\"{value}\" looks like a flag, not a promote target.\n  {PROMOTE_USAGE}")
 }
 
 fn preflight_run_command(argv: &[String]) -> CliOutput {
@@ -579,6 +778,82 @@ mod work_bundle_tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    #[derive(Default)]
+    struct PromoteFakeTmux {
+        sessions: Vec<TmuxSession>,
+        existing: std::collections::BTreeSet<String>,
+        caller_in_tmux: bool,
+        calls: Vec<String>,
+        mutation_calls: Vec<String>,
+    }
+
+    impl PromoteFakeTmux {
+        fn promote_fixture() -> Self {
+            Self {
+                sessions: vec![
+                    TmuxSession {
+                        name: "77-mawjs".to_owned(),
+                        windows: vec![promote_test_window("mawjs-oracle"), promote_test_window("test-cli")],
+                    },
+                    TmuxSession {
+                        name: "scratch".to_owned(),
+                        windows: vec![promote_test_window("scratch")],
+                    },
+                ],
+                caller_in_tmux: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl PromoteTmuxNative for PromoteFakeTmux {
+        fn promote_list_all(&mut self) -> Vec<TmuxSession> {
+            self.calls.push("list-all".to_owned());
+            self.sessions.clone()
+        }
+
+        fn promote_list_windows(&mut self, session: &str) -> Result<Vec<maw_tmux::TmuxWindow>, String> {
+            self.calls.push(format!("list-windows {session}"));
+            self.sessions.iter().find(|item| item.name == session).map(|item| item.windows.clone()).ok_or_else(|| "no such session".to_owned())
+        }
+
+        fn promote_has_session(&mut self, name: &str) -> bool {
+            self.calls.push(format!("has-session {name}"));
+            self.existing.contains(name)
+        }
+
+        fn promote_caller_in_tmux(&self) -> bool { self.caller_in_tmux }
+
+        fn promote_new_session(&mut self, name: &str, window: &str) -> Result<(), String> {
+            self.mutation_calls.push(format!("new-session {name}:{window}"));
+            Ok(())
+        }
+
+        fn promote_move_window(&mut self, src: &str, dst: &str) -> Result<(), String> {
+            self.mutation_calls.push(format!("move-window {src} {dst}"));
+            Ok(())
+        }
+
+        fn promote_kill_session(&mut self, name: &str) -> Result<(), String> {
+            self.mutation_calls.push(format!("kill-session {name}"));
+            Ok(())
+        }
+
+        fn promote_kill_window(&mut self, target: &str) -> Result<(), String> {
+            self.mutation_calls.push(format!("kill-window {target}"));
+            Ok(())
+        }
+
+        fn promote_switch_client(&mut self, session: &str) -> Result<(), String> {
+            self.mutation_calls.push(format!("switch-client {session}"));
+            Ok(())
+        }
+    }
+
+    fn promote_test_window(name: &str) -> maw_tmux::TmuxWindow {
+        maw_tmux::TmuxWindow { index: 0, name: name.to_owned(), active: false, cwd: None }
+    }
+
     #[test]
     fn work_dispatch_registers_seven_commands() {
         assert_eq!(DISPATCH_93.len(), 7);
@@ -614,11 +889,59 @@ mod work_bundle_tests {
     }
 
     #[test]
-    fn promote_is_guarded_plan_only() {
-        let out = promote_run_command(&work_args(&["agents/task", "--base", "alpha", "--dry-run"]));
+    fn promote_resolves_and_defers_without_mutation_golden() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
+        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        let out = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated", "--attach"]), &mut tmux);
         assert_eq!(out.code, 0, "{}", out.stderr);
-        assert!(out.stdout.contains("promote plan:"));
-        assert!(out.stdout.contains("plan-only"));
+        assert_eq!(out.stdout, include_str!("../../tests/fixtures/native-promote/promote-deferred.stdout"));
+        assert_eq!(tmux.calls, ["list-all", "list-windows 77-mawjs", "has-session isolated"]);
+        assert!(tmux.mutation_calls.is_empty());
+    }
+
+    #[test]
+    fn promote_refuses_ambiguous_and_destination_exists_without_mutation() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
+        std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.sessions.push(TmuxSession { name: "other".to_owned(), windows: vec![promote_test_window("test-cli")] });
+        let ambiguous = promote_run_command_with(&work_args(&["test-cli"]), &mut tmux);
+        assert_eq!(ambiguous.code, 1);
+        assert_eq!(ambiguous.stderr, include_str!("../../tests/fixtures/native-promote/promote-ambiguous.stderr"));
+        assert!(tmux.mutation_calls.is_empty());
+
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        tmux.existing.insert("isolated".to_owned());
+        let exists = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "isolated"]), &mut tmux);
+        assert_eq!(exists.code, 1);
+        assert_eq!(exists.stderr, include_str!("../../tests/fixtures/native-promote/promote-dst-exists.stderr"));
+        assert!(tmux.mutation_calls.is_empty());
+    }
+
+    #[test]
+    fn promote_refuses_only_window_and_bad_inputs_before_mutation() {
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        let solo = promote_run_command_with(&work_args(&["scratch:scratch", "--as", "isolated"]), &mut tmux);
+        assert_eq!(solo.code, 1);
+        assert!(solo.stderr.contains("only window in session 'scratch'"));
+        assert!(tmux.mutation_calls.is_empty());
+
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        let bad_as = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--as", "-bad"]), &mut tmux);
+        assert_eq!(bad_as.code, 1);
+        assert!(bad_as.stderr.contains("not start with '-'") || bad_as.stderr.contains("looks like a flag"));
+        assert!(tmux.calls.is_empty());
+        assert!(tmux.mutation_calls.is_empty());
+
+        let mut tmux = PromoteFakeTmux::promote_fixture();
+        let old_shape = promote_run_command_with(&work_args(&["77-mawjs:test-cli", "--base", "alpha"]), &mut tmux);
+        assert_eq!(old_shape.code, 1);
+        assert!(old_shape.stderr.contains("looks like a flag"));
+        assert!(tmux.calls.is_empty());
+        assert!(tmux.mutation_calls.is_empty());
     }
 
     #[test]
