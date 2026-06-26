@@ -246,7 +246,7 @@ fn oracleworkon_render_plan(options: &OracleworkonOptions) -> String {
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_SPLIT)
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_TILED)
     {
-        out.push_str("  note: daemon/attach orchestration flags parsed natively; execution remains plan-only until serve orchestration parity lands.\n");
+        out.push_str("  note: simple workon execution is live; advanced daemon/attach orchestration remains deferred to #295 PR-B.\n");
     }
     out
 }
@@ -342,6 +342,7 @@ mod oracleworkon_tests {
                 target: request.target,
                 argv: vec!["workon".to_owned(), "demo".to_owned()],
                 status: "fake".to_owned(),
+                message: None,
             })
         }
     }
@@ -440,7 +441,7 @@ esac
         let args = oracleworkon_strings(&["demo", "--task", "feat", "--dry-run", "--engine", "codex", "--prompt", "ship it", "--with", "nova", "--split"]);
         let output = oracleworkon_run(&args, oracleworkon_fleet).expect("plan");
         assert!(output.contains("maw workon demo feat --layout nested"));
-        assert!(output.contains("daemon/attach orchestration flags"));
+        assert!(output.contains("advanced daemon/attach orchestration remains deferred to #295 PR-B"));
     }
 
     #[test]
