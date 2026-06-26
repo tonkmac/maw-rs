@@ -209,9 +209,17 @@ fn forwarderror_local(
 
 async fn forwarderror_peer(peer_url: &str, peer_target: &str, node: Option<&str>, original_target: &str, message: &str, last: u32, config: &HeyConfig) -> CliOutput {
     if let Err(message) = forwarderror_validate_transport_target(peer_target) { return forwarderror_error(2, &message); }
-    if let Some(output) = forwarderror_fake_peer(peer_url, peer_target, node, original_target, message, last) { return output; }
-    let send_args = SendArgs { target: peer_target.to_owned(), text: message.to_owned(), inbox: None, from: None };
-    let output = send_peer_message("forward-error", peer_url, peer_target, &send_args, config).await;
+    let send_args = SendArgs { target: peer_target.to_owned(), text: message.to_owned(), inbox: None, from: None, approve: false, trust: false };
+    let output = match send_acl_gate_peer("forward-error", peer_target, &send_args, config) {
+        SendAclGateResult::Proceed { stderr_prefix } => {
+            if let Some(output) = forwarderror_fake_peer(peer_url, peer_target, node, original_target, message, last) {
+                send_acl_apply_proceed_stderr(output, &stderr_prefix)
+            } else {
+                send_acl_deliver_peer_message("forward-error", peer_url, peer_target, &send_args, config, stderr_prefix).await
+            }
+        }
+        SendAclGateResult::Queued(output) | SendAclGateResult::Reject(output) => return output,
+    };
     if output.code == 0 { forwarderror_success(last, original_target) } else { output }
 }
 

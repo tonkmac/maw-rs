@@ -160,9 +160,17 @@ async fn talkto_peer(
     thread: Option<&TalktoThreadResult>,
 ) -> CliOutput {
     if let Err(message) = talkto_validate_transport_target(target) { return talkto_saved_or_error(&message, thread); }
-    if let Some(output) = talkto_fake_peer(peer_url, target, node, args, notification, thread) { return output; }
-    let send_args = SendArgs { target: target.to_owned(), text: notification.to_owned(), inbox: None, from: None };
-    let mut output = send_peer_message("talk-to", peer_url, target, &send_args, config).await;
+    let send_args = SendArgs { target: target.to_owned(), text: notification.to_owned(), inbox: None, from: None, approve: false, trust: false };
+    let mut output = match send_acl_gate_peer("talk-to", target, &send_args, config) {
+        SendAclGateResult::Proceed { stderr_prefix } => {
+            if let Some(output) = talkto_fake_peer(peer_url, target, node, args, notification, thread) {
+                send_acl_apply_proceed_stderr(output, &stderr_prefix)
+            } else {
+                send_acl_deliver_peer_message("talk-to", peer_url, target, &send_args, config, stderr_prefix).await
+            }
+        }
+        SendAclGateResult::Queued(output) | SendAclGateResult::Reject(output) => return output,
+    };
     if output.code == 0 {
         output.stdout = format!("✓ thread #{} + sent → {}:{}\n", thread.map_or("?".to_owned(), |item| item.id.to_string()), node.unwrap_or("peer"), target);
         output.stderr.push_str(&talkto_thread_stub_warning(thread));
