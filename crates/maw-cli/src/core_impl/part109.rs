@@ -12,6 +12,20 @@ struct ScopeNativeRecord {
     ttl: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ScopeAclDecision {
+    Allow,
+    Queue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct ScopeAclTrustPair {
+    sender: String,
+    target: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ScopeArgs {
     subcommand: Option<String>,
@@ -283,13 +297,61 @@ fn scope_delete_record(name: &str) -> Result<bool, String> {
 
 fn scope_list_records() -> Result<Vec<ScopeNativeRecord>, String> {
     std::fs::create_dir_all(scope_native_dir()).map_err(|error| format!("scope: create scopes dir: {error}"))?;
+    Ok(scope_acl_load_scopes())
+}
+
+#[allow(dead_code)]
+fn scope_acl_evaluate(
+    sender: &str,
+    target: &str,
+    scopes: &[ScopeNativeRecord],
+    trust: &[ScopeAclTrustPair],
+) -> ScopeAclDecision {
+    if sender == target {
+        return ScopeAclDecision::Allow;
+    }
+    if scopes
+        .iter()
+        .any(|scope| scope_acl_scope_contains_pair(scope, sender, target))
+    {
+        return ScopeAclDecision::Allow;
+    }
+    if trust
+        .iter()
+        .any(|pair| scope_acl_trust_pair_matches(pair, sender, target))
+    {
+        return ScopeAclDecision::Allow;
+    }
+    ScopeAclDecision::Queue
+}
+
+#[allow(dead_code)]
+fn scope_acl_scope_contains_pair(scope: &ScopeNativeRecord, sender: &str, target: &str) -> bool {
+    let has_sender = scope.members.iter().any(|member| member == sender);
+    let has_target = scope.members.iter().any(|member| member == target);
+    has_sender && has_target
+}
+
+#[allow(dead_code)]
+fn scope_acl_trust_pair_matches(pair: &ScopeAclTrustPair, sender: &str, target: &str) -> bool {
+    (pair.sender == sender && pair.target == target)
+        || (pair.sender == target && pair.target == sender)
+}
+
+fn scope_acl_load_scopes() -> Vec<ScopeNativeRecord> {
+    scope_acl_load_scopes_from_dir(&scope_native_dir())
+}
+
+fn scope_acl_load_scopes_from_dir(dir: &std::path::Path) -> Vec<ScopeNativeRecord> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(scope_native_dir()).map_err(|error| format!("scope: read scopes dir: {error}"))?;
     for entry in entries.flatten() {
         scope_maybe_push_record(entry.path(), &mut out);
     }
     out.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(out)
+    out
 }
 
 fn scope_maybe_push_record(path: std::path::PathBuf, out: &mut Vec<ScopeNativeRecord>) {
@@ -388,4 +450,96 @@ fn scope_now_iso_utc() -> String {
     }
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs());
     format!("{seconds}")
+}
+
+#[cfg(test)]
+mod scope_acl_tests {
+    use super::*;
+
+    fn scope_acl_record(name: &str, members: &[&str]) -> ScopeNativeRecord {
+        ScopeNativeRecord {
+            name: name.to_owned(),
+            members: members.iter().map(|member| (*member).to_owned()).collect(),
+            lead: members.first().map(|member| (*member).to_owned()),
+            created: "2026-06-26T00:00:00.000Z".to_owned(),
+            ttl: None,
+        }
+    }
+
+    fn scope_acl_trust(sender: &str, target: &str) -> ScopeAclTrustPair {
+        ScopeAclTrustPair {
+            sender: sender.to_owned(),
+            target: target.to_owned(),
+        }
+    }
+
+    fn scope_acl_temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!(
+            "maw-rs-scope-acl-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn scope_acl_write_json(path: &std::path::Path, value: &ScopeNativeRecord) {
+        let parent = path.parent().expect("scope path parent");
+        std::fs::create_dir_all(parent).expect("create temp scope dir");
+        let json = serde_json::to_string_pretty(value).expect("scope json");
+        std::fs::write(path, format!("{json}\n")).expect("write scope json");
+    }
+
+    #[test]
+    fn scope_acl_allows_self_sender() {
+        let decision = scope_acl_evaluate("alice", "alice", &[], &[]);
+        assert_eq!(decision, ScopeAclDecision::Allow);
+    }
+
+    #[test]
+    fn scope_acl_allows_same_scope_members() {
+        let scopes = vec![scope_acl_record("team", &["alice", "bob"])];
+        let decision = scope_acl_evaluate("alice", "bob", &scopes, &[]);
+        assert_eq!(decision, ScopeAclDecision::Allow);
+    }
+
+    #[test]
+    fn scope_acl_allows_symmetric_trust_pair_from_param() {
+        let trust = vec![scope_acl_trust("alice", "bob")];
+        assert_eq!(
+            scope_acl_evaluate("alice", "bob", &[], &trust),
+            ScopeAclDecision::Allow
+        );
+        assert_eq!(
+            scope_acl_evaluate("bob", "alice", &[], &trust),
+            ScopeAclDecision::Allow
+        );
+    }
+
+    #[test]
+    fn scope_acl_queues_non_shared_without_trust() {
+        let scopes = vec![scope_acl_record("team", &["alice", "carol"])];
+        let decision = scope_acl_evaluate("alice", "bob", &scopes, &[]);
+        assert_eq!(decision, ScopeAclDecision::Queue);
+    }
+
+    #[test]
+    fn scope_acl_load_scopes_returns_empty_for_missing_dir() {
+        let dir = scope_acl_temp_dir("missing").join("scopes");
+        let rows = scope_acl_load_scopes_from_dir(&dir);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn scope_acl_load_scopes_ignores_malformed_and_sorts_by_name() {
+        let dir = scope_acl_temp_dir("load").join("scopes");
+        scope_acl_write_json(&dir.join("zeta.json"), &scope_acl_record("zeta", &["z"]));
+        scope_acl_write_json(&dir.join("alpha.json"), &scope_acl_record("alpha", &["a"]));
+        std::fs::write(dir.join("bad.json"), "{not json").expect("write malformed json");
+        std::fs::write(dir.join("note.txt"), "not a scope").expect("write non-json file");
+
+        let rows = scope_acl_load_scopes_from_dir(&dir);
+        let names = rows.iter().map(|scope| scope.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
 }
