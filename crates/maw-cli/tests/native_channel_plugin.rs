@@ -481,10 +481,67 @@ fn channel_setup_imessage_matches_golden_with_fake_darwin() {
 }
 
 #[test]
-fn channel_setup_github_is_plan_only_stub_no_external_tools() {
+fn channel_setup_github_clones_with_fake_ghq_and_defers_writes() {
     let root = channel_temp_dir("setup-github");
     let repo = channel_empty_repo(&root);
-    channel_assert_golden(
+    let ghq_root = root.join("ghq");
+    fs::create_dir_all(&ghq_root).expect("ghq root");
+    let ghq_log = root.join("ghq.log");
+    let output = channel_command_with_env(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-git",
+            "github:ARRA-01/claude-channel-relay",
+            "--pass",
+            "github/hermes-token",
+        ],
+        &[
+            (
+                "MAW_RS_CHANNEL_FAKE_GHQ_ROOT",
+                ghq_root.to_str().expect("ghq root utf8"),
+            ),
+            (
+                "MAW_RS_CHANNEL_FAKE_GHQ_GET_LOG",
+                ghq_log.to_str().expect("ghq log utf8"),
+            ),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    let normalized = stdout.replace(&ghq_root.display().to_string(), "<GHQ_ROOT>");
+    assert_eq!(
+        normalized,
+        include_str!("fixtures/native-channel/channel-setup-github-clone.stdout")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+    assert_eq!(
+        fs::read_to_string(&ghq_log).expect("ghq log"),
+        "ghq get https://github.com/ARRA-01/claude-channel-relay\n"
+    );
+    assert!(ghq_root
+        .join("github.com/ARRA-01/claude-channel-relay")
+        .is_dir());
+    assert!(!root
+        .join("home/.claude/channels/hermes-git/config.json")
+        .exists());
+}
+
+#[test]
+fn channel_setup_github_locate_existing_skips_clone() {
+    let root = channel_temp_dir("setup-github-existing");
+    let repo = channel_empty_repo(&root);
+    let ghq_root = root.join("ghq");
+    fs::create_dir_all(ghq_root.join("github.com/ARRA-01/claude-channel-relay"))
+        .expect("existing repo");
+    let ghq_log = root.join("ghq.log");
+    let output = channel_command_with_env(
         &root,
         &repo,
         &[
@@ -493,8 +550,51 @@ fn channel_setup_github_is_plan_only_stub_no_external_tools() {
             "hermes-git",
             "github:ARRA-01/claude-channel-relay",
         ],
-        include_str!("fixtures/native-channel/channel-setup-github-stub.stdout"),
+        &[
+            (
+                "MAW_RS_CHANNEL_FAKE_GHQ_ROOT",
+                ghq_root.to_str().expect("ghq root utf8"),
+            ),
+            (
+                "MAW_RS_CHANNEL_FAKE_GHQ_GET_LOG",
+                ghq_log.to_str().expect("ghq log utf8"),
+            ),
+        ],
     );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("repo already present"));
+    assert!(!ghq_log.exists(), "existing repo must not run ghq get");
+}
+
+#[test]
+fn channel_setup_github_clone_failure_writes_no_config() {
+    let root = channel_temp_dir("setup-github-fail");
+    let repo = channel_empty_repo(&root);
+    let ghq_root = root.join("ghq");
+    fs::create_dir_all(&ghq_root).expect("ghq root");
+    let output = channel_command_with_env(
+        &root,
+        &repo,
+        &[
+            "channel",
+            "setup",
+            "hermes-git",
+            "github:ARRA-01/claude-channel-relay",
+        ],
+        &[
+            (
+                "MAW_RS_CHANNEL_FAKE_GHQ_ROOT",
+                ghq_root.to_str().expect("ghq root utf8"),
+            ),
+            ("MAW_RS_CHANNEL_FAKE_GHQ_GET_FAIL", "1"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+    assert!(String::from_utf8(output.stderr)
+        .expect("stderr")
+        .contains("ghq get failed"));
     assert!(!root
         .join("home/.claude/channels/hermes-git/config.json")
         .exists());
