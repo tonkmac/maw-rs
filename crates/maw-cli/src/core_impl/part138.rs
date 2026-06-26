@@ -1,4 +1,4 @@
-const DISPATCH_133: &[DispatcherEntry] = &[DispatcherEntry { command: "ping", handler: Handler::Sync(ping_run_command) }];
+const DISPATCH_138: &[DispatcherEntry] = &[DispatcherEntry { command: "ping", handler: Handler::Sync(ping_run_command) }];
 
 const PING_USAGE: &str = "usage: maw ping [node] — ping all peers or a specific node";
 const PING_AUTH_STATUS_PATH: &str = "/api/auth/status";
@@ -236,7 +236,7 @@ mod ping_tests133 {
     fn now() -> u128 { 42 }
 
     #[test]
-    fn ping_dispatch_registers_native() { assert_eq!(DISPATCH_133[0].command, "ping"); }
+    fn ping_dispatch_registers_native() { assert_eq!(DISPATCH_138[0].command, "ping"); }
 
     #[test]
     fn ping_all_renders_named_and_legacy_without_real_network() {
