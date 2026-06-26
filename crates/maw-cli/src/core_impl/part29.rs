@@ -4,6 +4,8 @@ struct SendArgs {
     text: String,
     inbox: Option<bool>,
     from: Option<String>,
+    approve: bool,
+    trust: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,7 +62,7 @@ async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutp
             peer_url,
             target,
             node: _,
-        } => send_peer_message(command, &peer_url, &target, &send_args, &config).await,
+        } => gated_send_peer_message(command, &peer_url, &target, &send_args, &config).await,
         RouteResult::Error { detail, hint, .. } => CliOutput {
             code: 2,
             stdout: String::new(),
@@ -73,15 +75,230 @@ async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutp
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SendAclGateResult {
+    Proceed { stderr_prefix: String },
+    Queued(CliOutput),
+    Reject(CliOutput),
+}
+
+async fn gated_send_peer_message(
+    command: &str,
+    peer_url: &str,
+    target: &str,
+    args: &SendArgs,
+    config: &HeyConfig,
+) -> CliOutput {
+    match send_acl_gate_peer(command, target, args, config) {
+        SendAclGateResult::Proceed { stderr_prefix } => send_acl_deliver_peer_message(command, peer_url, target, args, config, stderr_prefix).await,
+        SendAclGateResult::Queued(output) | SendAclGateResult::Reject(output) => output,
+    }
+}
+
+async fn send_acl_deliver_peer_message(
+    command: &str,
+    peer_url: &str,
+    target: &str,
+    args: &SendArgs,
+    config: &HeyConfig,
+    stderr_prefix: String,
+) -> CliOutput {
+    send_acl_apply_proceed_stderr(send_peer_message(command, peer_url, target, args, config).await, &stderr_prefix)
+}
+
+fn send_acl_apply_proceed_stderr(mut output: CliOutput, stderr_prefix: &str) -> CliOutput {
+    if !stderr_prefix.is_empty() {
+        output.stderr = format!("{stderr_prefix}{}", output.stderr);
+    }
+    output
+}
+
+fn send_acl_gate_peer(
+    command: &str,
+    target: &str,
+    args: &SendArgs,
+    config: &HeyConfig,
+) -> SendAclGateResult {
+    if args.trust && !args.approve {
+        return SendAclGateResult::Reject(CliOutput {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!("{command}: --trust requires --approve\n"),
+        });
+    }
+    let sender = match send_acl_sender(args, config) {
+        Ok(sender) => sender,
+        Err(message) => {
+            return SendAclGateResult::Reject(CliOutput {
+                code: 2,
+                stdout: String::new(),
+                stderr: format!("{command}: {message}\n"),
+            })
+        }
+    };
+    let target = send_acl_actor_from_target(target);
+    if args.approve || std::env::var("MAW_ACL_BYPASS").ok().as_deref() == Some("1") {
+        let mut stderr_prefix = String::new();
+        if args.approve && args.trust {
+            if let Err(error) = scope_trust_add_to_path(&scope_trust_path(), &sender, &target, &inbox_iso_label(inbox_now_ms())) {
+                let _ = writeln!(
+                    stderr_prefix,
+                    "warn: ACL trust add failed, allowing send: {error} — fix {}",
+                    scope_trust_path().display()
+                );
+            }
+        }
+        return SendAclGateResult::Proceed { stderr_prefix };
+    }
+    let evaluation = match send_acl_evaluate_loaded(&sender, &target) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return SendAclGateResult::Proceed {
+                stderr_prefix: format!("warn: ACL check failed, allowing send: {error}\n"),
+            }
+        }
+    };
+    match evaluation {
+        ScopeAclDecision::Allow => SendAclGateResult::Proceed {
+            stderr_prefix: String::new(),
+        },
+        ScopeAclDecision::Queue => match send_acl_queue_pending(&sender, &target, args) {
+            Ok(output) => SendAclGateResult::Queued(output),
+            Err(error) => SendAclGateResult::Proceed {
+                stderr_prefix: format!("warn: ACL queue failed, allowing send: {error}\n"),
+            },
+        },
+    }
+}
+
+fn send_acl_sender(args: &SendArgs, config: &HeyConfig) -> Result<String, String> {
+    if let Some(explicit) = args.from.as_deref() {
+        let wire = validate_wire_from(explicit)?;
+        return send_acl_oracle_component(&wire);
+    }
+    send_acl_validate_actor(config.oracle.as_deref().unwrap_or(DEFAULT_ORACLE))
+}
+
+fn send_acl_oracle_component(wire_from: &str) -> Result<String, String> {
+    let oracle = wire_from
+        .split_once(':')
+        .map_or(wire_from, |(oracle, _node)| oracle);
+    send_acl_validate_actor(oracle)
+}
+
+fn send_acl_actor_from_target(target: &str) -> String {
+    target
+        .split_once(':')
+        .map_or(target, |(oracle, _rest)| oracle)
+        .to_owned()
+}
+
+fn send_acl_validate_actor(value: &str) -> Result<String, String> {
+    scope_trust_validate_actor("ACL actor", value).map_err(|error| format!("ACL actor rejected: {error}"))
+}
+
+fn send_acl_evaluate_loaded(sender: &str, target: &str) -> Result<ScopeAclDecision, String> {
+    let scopes = send_acl_load_scopes_strict()?;
+    let trust = send_acl_load_trust_pairs_strict()?;
+    if scopes.is_empty() {
+        return Ok(ScopeAclDecision::Allow);
+    }
+    Ok(scope_acl_evaluate(sender, target, &scopes, &trust))
+}
+
+fn send_acl_load_scopes_strict() -> Result<Vec<ScopeNativeRecord>, String> {
+    let dir = scope_native_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut scopes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("ACL check failed, allowing send: read {}: {error} — fix {}", dir.display(), dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {error} — fix {}", path.display(), path.display()))?;
+        let scope = serde_json::from_str::<ScopeNativeRecord>(&body)
+            .map_err(|error| format!("parse {}: {error} — fix {}", path.display(), path.display()))?;
+        scopes.push(scope);
+    }
+    scopes.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(scopes)
+}
+
+fn send_acl_load_trust_pairs_strict() -> Result<Vec<ScopeAclTrustPair>, String> {
+    let path = scope_trust_path();
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|error| format!("parse {}: {error} — fix {}", path.display(), path.display()))?;
+    let Some(items) = value.as_array() else {
+        return Err(format!("parse {}: expected array — fix {}", path.display(), path.display()));
+    };
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let entry = scope_trust_entry_from_json(item)
+            .ok_or_else(|| format!("parse {}: invalid trust entry — fix {}", path.display(), path.display()))?;
+        entries.push(entry);
+    }
+    Ok(scope_trust_pairs(&entries))
+}
+
+fn send_acl_queue_pending(sender: &str, target: &str, args: &SendArgs) -> Result<CliOutput, String> {
+    let env = inbox_real_env();
+    let id = send_acl_pending_id()?;
+    let message = InboxPendingMessage {
+        id: id.clone(),
+        sender: sender.to_owned(),
+        target: target.to_owned(),
+        query: Some(args.target.clone()),
+        sent_at: inbox_iso_label(inbox_now_ms()),
+        status: "pending".to_owned(),
+        message: args.text.clone(),
+    };
+    inbox_write_pending(&inbox_state_pending_dir(&env), &message)?;
+    Ok(CliOutput {
+        code: 0,
+        stdout: format!(
+            "queued pending ACL approval: {id}\n  sender: {sender}\n  target: {target}\n  review: maw inbox show-pending {id}\n  approve: maw inbox approve {id}\n"
+        ),
+        stderr: String::new(),
+    })
+}
+
+fn send_acl_pending_id() -> Result<String, String> {
+    let suffix = send_acl_random_hex6().unwrap_or_else(|| {
+        format!(
+            "{:06x}",
+            (current_epoch_seconds() ^ u64::from(std::process::id())) & 0x00ff_ffff
+        )
+    });
+    inbox_pending_id(inbox_now_ms(), &suffix)
+}
+
+fn send_acl_random_hex6() -> Option<String> {
+    let mut bytes = [0_u8; 3];
+    let mut file = std::fs::File::open("/dev/urandom").ok()?;
+    std::io::Read::read_exact(&mut file, &mut bytes).ok()?;
+    Some(hex_bytes(&bytes))
+}
+
 fn parse_send_args(command: &str, argv: &[String]) -> Result<SendArgs, String> {
     let mut inbox = None;
     let mut from = None;
     let mut positional = Vec::new();
+    let mut approve = false;
+    let mut trust = false;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
             "--inbox" => inbox = Some(true),
             "--no-inbox" => inbox = Some(false),
+            "--approve" => approve = true,
+            "--trust" => trust = true,
             "--from" => {
                 let Some(value) = argv.get(index + 1) else {
                     return Err(format!("{command}: missing --from value"));
@@ -97,6 +314,9 @@ fn parse_send_args(command: &str, argv: &[String]) -> Result<SendArgs, String> {
         }
         index += 1;
     }
+    if trust && !approve {
+        return Err(format!("{command}: --trust requires --approve"));
+    }
     if positional.len() < 2 {
         return Err(format!("{command}: target and message are required"));
     }
@@ -105,6 +325,8 @@ fn parse_send_args(command: &str, argv: &[String]) -> Result<SendArgs, String> {
         text: positional[1..].join(" "),
         inbox,
         from,
+        approve,
+        trust,
     })
 }
 
@@ -113,7 +335,7 @@ fn send_usage_error(command: &str, message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs {command} <target> <message> [--inbox|--no-inbox] [--from <oracle:node>]\n"
+            "{message}\nusage: maw-rs {command} <target> <message> [--inbox|--no-inbox] [--from <oracle:node>] [--approve] [--trust]\n"
         ),
     }
 }
@@ -799,4 +1021,215 @@ fn format_reply_list(body: &str) -> String {
     lines.push(String::new());
     lines.push(format!("{total} pending request(s)"));
     ensure_trailing_newline(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod send_acl_hotpath_tests {
+    use super::*;
+
+    struct SendAclEnvGuard {
+        _home: EnvVarRestore,
+        _maw_home: EnvVarRestore,
+        _config: EnvVarRestore,
+        _state: EnvVarRestore,
+        _bypass: EnvVarRestore,
+        root: std::path::PathBuf,
+    }
+
+    impl SendAclEnvGuard {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let root = std::env::temp_dir().join(format!("maw-send-acl-{name}-{}-{nanos}", std::process::id()));
+            let _ = std::fs::create_dir_all(root.join("home"));
+            let _ = std::fs::create_dir_all(root.join("config"));
+            let _ = std::fs::create_dir_all(root.join("state"));
+            let guard = Self {
+                _home: EnvVarRestore::capture("HOME"),
+                _maw_home: EnvVarRestore::capture("MAW_HOME"),
+                _config: EnvVarRestore::capture("MAW_CONFIG_DIR"),
+                _state: EnvVarRestore::capture("MAW_STATE_DIR"),
+                _bypass: EnvVarRestore::capture("MAW_ACL_BYPASS"),
+                root: root.clone(),
+            };
+            std::env::set_var("HOME", root.join("home"));
+            std::env::remove_var("MAW_HOME");
+            std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+            std::env::set_var("MAW_STATE_DIR", root.join("state"));
+            std::env::remove_var("MAW_ACL_BYPASS");
+            guard
+        }
+    }
+
+    fn send_acl_config(oracle: &str) -> HeyConfig {
+        HeyConfig { node: Some("node-a".to_owned()), oracle: Some(oracle.to_owned()), route: RouteConfig::default() }
+    }
+
+    fn send_acl_args(target: &str, text: &str) -> SendArgs {
+        SendArgs { target: target.to_owned(), text: text.to_owned(), inbox: None, from: None, approve: false, trust: false }
+    }
+
+    fn send_acl_write_scope(name: &str, members: &[&str]) {
+        let dir = scope_native_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = ScopeNativeRecord { name: name.to_owned(), members: members.iter().map(|member| (*member).to_owned()).collect(), lead: None, created: "2026-06-26T00:00:00.000Z".to_owned(), ttl: None };
+        std::fs::write(dir.join(format!("{name}.json")), serde_json::to_string_pretty(&scope).unwrap()).unwrap();
+    }
+
+    fn send_acl_assert_proceed(result: SendAclGateResult) -> String {
+        match result {
+            SendAclGateResult::Proceed { stderr_prefix } => stderr_prefix,
+            other => panic!("expected proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_acl_no_scope_same_scope_and_trusted_allow_peer_send() {
+        let _lock = env_test_lock().lock().unwrap();
+        let _env = SendAclEnvGuard::new("allow");
+        let config = send_acl_config("alice");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config)), "");
+
+        send_acl_write_scope("team", &["alice", "bob"]);
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config)), "");
+
+        std::fs::remove_file(scope_native_path("team")).unwrap();
+        scope_trust_add_to_path(&scope_trust_path(), "alice", "bob", "2026-06-26T00:00:00.000Z").unwrap();
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config)), "");
+    }
+
+    #[test]
+    fn send_acl_cross_scope_queues_without_body_or_peer_key() {
+        let _lock = env_test_lock().lock().unwrap();
+        let env = SendAclEnvGuard::new("queue");
+        send_acl_write_scope("team", &["alice", "carol"]);
+        let args = send_acl_args("remote-bob", "SECRET_BODY token=abc123");
+        let result = send_acl_gate_peer("hey", "bob", &args, &send_acl_config("alice"));
+        let output = match result { SendAclGateResult::Queued(output) => output, other => panic!("expected queue, got {other:?}") };
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains("queued pending ACL approval"));
+        assert!(output.stdout.contains("sender: alice"));
+        assert!(output.stdout.contains("target: bob"));
+        assert!(output.stdout.contains("maw inbox approve"));
+        assert!(!output.stdout.contains("SECRET_BODY"));
+        assert!(!output.stdout.contains("abc123"));
+        assert!(!env.root.join("state").join("peer-key").exists());
+        let pending_dir = env.root.join("state").join("pending");
+        let files = std::fs::read_dir(pending_dir).unwrap().collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn send_acl_approve_bypass_and_human_only_trust_rules() {
+        let _lock = env_test_lock().lock().unwrap();
+        let _env = SendAclEnvGuard::new("approve");
+        send_acl_write_scope("team", &["alice", "carol"]);
+        let config = send_acl_config("alice");
+
+        let mut approve = send_acl_args("remote-bob", "hello");
+        approve.approve = true;
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &approve, &config)), "");
+        assert!(!scope_trust_path().exists());
+
+        approve.trust = true;
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &approve, &config)), "");
+        let trusted = scope_trust_load_from_path(&scope_trust_path());
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted[0].sender, "alice");
+        assert_eq!(trusted[0].target, "bob");
+
+        let err = parse_send_args("hey", &send_acl_vec(&["bob", "hello", "--trust"])).unwrap_err();
+        assert!(err.contains("--trust requires --approve"));
+    }
+
+    #[test]
+    fn send_acl_env_bypass_is_read_only_and_writes_no_trust() {
+        let _lock = env_test_lock().lock().unwrap();
+        let _env = SendAclEnvGuard::new("bypass");
+        send_acl_write_scope("team", &["alice", "carol"]);
+        std::env::set_var("MAW_ACL_BYPASS", "1");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice"))), "");
+        assert!(!scope_trust_path().exists());
+        assert_eq!(std::env::var("MAW_ACL_BYPASS").as_deref(), Ok("1"));
+    }
+
+    #[test]
+    fn send_acl_corrupt_acl_fails_open_with_loud_warning() {
+        let _lock = env_test_lock().lock().unwrap();
+        let _env = SendAclEnvGuard::new("corrupt");
+        let dir = scope_native_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.json"), "{not json").unwrap();
+        let stderr = send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice")));
+        assert!(stderr.contains("warn: ACL check failed, allowing send"));
+        assert!(stderr.contains("broken.json"));
+        assert!(stderr.contains("fix"));
+
+        std::fs::remove_file(dir.join("broken.json")).unwrap();
+        std::fs::write(scope_trust_path(), "{not json").unwrap();
+        let stderr = send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice")));
+        assert!(stderr.contains("warn: ACL check failed, allowing send"));
+        assert!(stderr.contains("scope-trust.json"));
+    }
+
+    #[test]
+    fn send_acl_parser_accepts_approve_and_rejects_trust_alone() {
+        let parsed = parse_send_args("hey", &send_acl_vec(&["bob", "hello", "--approve", "--trust"])).unwrap();
+        assert!(parsed.approve);
+        assert!(parsed.trust);
+        let output = send_usage_error("hey", "hey: --trust requires --approve");
+        assert_eq!(output.code, 2);
+        assert!(output.stderr.contains("[--approve] [--trust]"));
+    }
+
+
+    #[test]
+    fn send_acl_notify_cross_scope_queues_before_peer_transport() {
+        let _lock = env_test_lock().lock().unwrap();
+        let env = SendAclEnvGuard::new("notify-callsite");
+        send_acl_write_scope("team", &["alice", "carol"]);
+        let config = send_acl_config("alice");
+        let args = NotifyArgs {
+            target: "remote-bob".to_owned(),
+            text: "SECRET_NOTIFY token=abc123".to_owned(),
+            from: None,
+            approve: false,
+            trust: false,
+            force: false,
+        };
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(notify_peer("http://127.0.0.1:1", "bob", &args, &config));
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains("queued pending ACL approval"));
+        assert!(!output.stdout.contains("SECRET_NOTIFY"));
+        assert!(!output.stdout.contains("abc123"));
+        assert!(!env.root.join("state").join("peer-key").exists());
+        assert_eq!(std::fs::read_dir(env.root.join("state").join("pending")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn send_acl_talkto_cross_scope_queues_before_fake_or_real_transport() {
+        let _lock = env_test_lock().lock().unwrap();
+        let env = SendAclEnvGuard::new("talkto-callsite");
+        let _fake = EnvVarRestore::capture("MAW_RS_TALKTO_FAKE_PEER_LOG");
+        let fake_log = env.root.join("talkto-peer.jsonl");
+        std::env::set_var("MAW_RS_TALKTO_FAKE_PEER_LOG", &fake_log);
+        send_acl_write_scope("team", &["alice", "carol"]);
+        let config = send_acl_config("alice");
+        let args = TalktoArgs { recipient: "remote-bob".to_owned(), message: "SECRET_TALK token=abc123".to_owned(), force: false };
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(talkto_peer("http://127.0.0.1:1", "bob", Some("remote"), &args, "SECRET_TALK token=abc123", &config, None));
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains("queued pending ACL approval"));
+        assert!(!output.stdout.contains("SECRET_TALK"));
+        assert!(!output.stdout.contains("abc123"));
+        assert!(!fake_log.exists(), "ACL queue must happen before fake/real peer transport");
+        assert!(!env.root.join("state").join("peer-key").exists());
+        assert_eq!(std::fs::read_dir(env.root.join("state").join("pending")).unwrap().count(), 1);
+    }
+
+    fn send_acl_vec(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
 }

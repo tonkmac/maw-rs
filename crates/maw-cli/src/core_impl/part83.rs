@@ -97,8 +97,15 @@ fn notify_local(args: &NotifyArgs, resolved_target: &str, config: &HeyConfig) ->
 }
 
 async fn notify_peer(peer_url: &str, target: &str, args: &NotifyArgs, config: &HeyConfig) -> CliOutput {
-    let send_args = SendArgs { target: target.to_owned(), text: args.text.clone(), inbox: Some(true), from: args.from.clone() };
-    let mut output = send_peer_message("notify", peer_url, target, &send_args, config).await;
+    let send_args = SendArgs {
+        target: target.to_owned(),
+        text: args.text.clone(),
+        inbox: Some(true),
+        from: args.from.clone(),
+        approve: args.approve,
+        trust: args.trust,
+    };
+    let mut output = gated_send_peer_message("notify", peer_url, target, &send_args, config).await;
     if output.code == 0 && args.force { output.stderr.push_str("\x1b[90mnote: --force is not meaningful for notify (delivery is always inbox-only).\x1b[0m\n"); }
     output
 }
