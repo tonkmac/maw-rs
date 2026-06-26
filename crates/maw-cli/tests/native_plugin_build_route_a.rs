@@ -61,6 +61,14 @@ fn plugin_build_route_a_builds_and_extism_loads_fixture() {
     let plugin = maw_plugin_manifest::load_manifest_from_dir(&plugin_dir)
         .expect("load manifest")
         .expect("plugin loaded");
+    assert_eq!(
+        plugin
+            .manifest
+            .target
+            .map(maw_plugin_manifest::PluginTarget::as_str),
+        Some("wasm")
+    );
+    assert_eq!(plugin.kind.as_str(), "wasm");
     let mut runtime = maw_plugin_manifest::ExtismWasmInvokeRuntime::default();
     let result = maw_plugin_manifest::invoke_plugin(
         &plugin,
