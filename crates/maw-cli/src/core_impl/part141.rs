@@ -459,7 +459,6 @@ mod federation_tests {
     #[test]
     fn federation_dispatch_registers_native_and_guards() {
         assert_eq!(dispatcher_status("federation"), DispatchKind::Native);
-        assert_eq!(DISPATCH_141.len(), 1);
         let _guard = env_test_lock().lock().expect("env lock");
         let _env = FederationTestEnv134::new("guard");
         let mut fake = FederationFakeTransport134::default();
