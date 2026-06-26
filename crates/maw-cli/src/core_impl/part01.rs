@@ -13,11 +13,12 @@ use maw_auth::{
     sign_headers_v3_at, sign_hmac_sig, sign_request_v3, trust_key, verify, verify_auto_pair_proof,
     verify_consent_pin, verify_hmac_sig, verify_request, ApprovedBy, AutoPairAddOutcome,
     AutoPairIdentity, AutoPairInput, ConsentAction, ConsentApprovalResult, ConsentRequestArgs,
-    ConsentRequestResult, ConsentStatus, ConsentStore, FromAddressConfig, FromVerifyDecision,
+    ConsentRequestResult, ConsentStatus, ConsentStore, Ed25519TofuStore, FromAddressConfig, FromVerifyDecision,
     Headers, LookupResult, PairAcceptInput, PairApiAcceptResult, PairApiAutoResult, PairApiConfig,
     PairApiGenerateResult, PairApiProbeResult, PairApiStatusResult, PairCodeStore, PairEntry,
-    PeerPendingRequest, PeerPostResult, PendingRequest, RecentHelloStore, TrustEntry,
-    VerifyRequestArgs, DEFAULT_ORACLE, PAIR_CODE_ALPHABET, WINDOW_SEC,
+    PeerPendingRequest, PeerPostResult, PendingRequest, RecentHelloStore, RequestAuthDecision,
+    RequestAuthParts, TrustEntry, VerifyRequestArgs, DEFAULT_ORACLE, PAIR_CODE_ALPHABET,
+    WINDOW_SEC,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -938,6 +939,8 @@ fn run_auth_plan(argv: &[String]) -> CliOutput {
             body,
             cached_pubkey,
             headers,
+            peer_ip,
+            workspace_key_env,
         } => run_auth_verify_request(
             plan_json,
             method,
@@ -946,6 +949,8 @@ fn run_auth_plan(argv: &[String]) -> CliOutput {
             body,
             cached_pubkey,
             headers,
+            peer_ip,
+            workspace_key_env,
         ),
     }
 }

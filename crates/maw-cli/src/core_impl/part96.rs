@@ -23,6 +23,8 @@ const AUTH_VALUE_FLAGS: &[&str] = &[
     "--secret",
     "--payload",
     "--header",
+    "--peer-ip",
+    "--workspace-key-env",
 ];
 
 const AUTH_CONSENT_MUTATING_SUBCOMMANDS: &[&str] = &[
@@ -154,6 +156,164 @@ mod auth_native_tests {
         assert_eq!(output.code, 2);
         assert!(output.stderr.contains("no auto-approve"));
         assert!(!output.stderr.contains("fake-test-token"));
+    }
+
+
+    const AUTH_D2_NOW: &str = "1700000000";
+    const AUTH_D2_FROM: &str = "mawjs:m5";
+    const AUTH_D2_SECRET: &str = "d2-test-workspace-secret";
+    const AUTH_D2_ENV: &str = "MAW_TEST_D2_WORKSPACE_KEY";
+    const AUTH_D2_ED25519_PUBKEY: &str =
+        "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+    const AUTH_D2_ED25519_SIG: &str = concat!(
+        "d232e00767facc77aca0eaaf2ebc18dc3c608639430f93167679805c7e3ccf69",
+        "f15a856c7d8f4eddf64730cc61d4ccc0c28ca91b9a9df1a5016c628d737b3a0f"
+    );
+
+    fn auth_d2_hmac_headers(method: &str, path: &str, body: &str) -> Vec<String> {
+        let now = AUTH_D2_NOW.parse::<i64>().expect("fixed now");
+        let body_hash = hash_body(Some(body.as_bytes()));
+        let payload = build_from_sign_payload(AUTH_D2_FROM, now, method, path, &body_hash);
+        let signature = sign_hmac_sig(AUTH_D2_SECRET, &payload);
+        vec![
+            "--header".to_owned(),
+            format!("x-maw-from={AUTH_D2_FROM}"),
+            "--header".to_owned(),
+            format!("x-maw-timestamp={AUTH_D2_NOW}"),
+            "--header".to_owned(),
+            format!("x-maw-signature-v3={signature}"),
+        ]
+    }
+
+    fn auth_run_d2(args: &[String]) -> CliOutput {
+        auth_run_command(args)
+    }
+
+    fn auth_d2_ed25519_args(cached_pubkey: Option<&str>) -> Vec<String> {
+        let mut args = vec![
+            "verify-request".to_owned(),
+            "--method".to_owned(),
+            "POST".to_owned(),
+            "--path".to_owned(),
+            "/triggers/fire".to_owned(),
+            "--now".to_owned(),
+            AUTH_D2_NOW.to_owned(),
+            "--body".to_owned(),
+            "{\"event\":\"agent-idle\"}".to_owned(),
+            "--peer-ip".to_owned(),
+            "198.51.100.10".to_owned(),
+            "--header".to_owned(),
+            format!("x-maw-from={AUTH_D2_FROM}"),
+            "--header".to_owned(),
+            format!("x-maw-timestamp={AUTH_D2_NOW}"),
+            "--header".to_owned(),
+            format!("x-maw-ed25519-signature={AUTH_D2_ED25519_SIG}"),
+            "--header".to_owned(),
+            format!("x-maw-ed25519-pubkey={AUTH_D2_ED25519_PUBKEY}"),
+            "--plan-json".to_owned(),
+        ];
+        if let Some(pubkey) = cached_pubkey {
+            args.extend(["--cached-pubkey".to_owned(), pubkey.to_owned()]);
+        }
+        args
+    }
+
+    #[test]
+    fn auth_verify_request_d2_loopback_accepts_no_credentials() {
+        let output = auth_run_command(&auth_args(&[
+            "verify-request",
+            "--peer-ip",
+            "127.0.0.1",
+            "--now",
+            AUTH_D2_NOW,
+            "--plan-json",
+        ]));
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("\"mode\":\"d2\""));
+        assert!(output.stdout.contains("\"kind\":\"accept\""));
+        assert!(output.stdout.contains("\"who\":\"loopback\""));
+    }
+
+    #[test]
+    fn auth_verify_request_d2_rejects_xff_spoof_on_non_loopback_peer() {
+        let output = auth_run_command(&auth_args(&[
+            "verify-request",
+            "--peer-ip",
+            "198.51.100.10",
+            "--now",
+            AUTH_D2_NOW,
+            "--header",
+            "x-forwarded-for=127.0.0.1",
+            "--plan-json",
+        ]));
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("\"kind\":\"reject\""));
+        assert!(output.stdout.contains("\"reason\":\"missing-credentials\""));
+        assert!(!output.stdout.contains("loopback"));
+    }
+
+    #[test]
+    fn auth_verify_request_d2_hmac_uses_workspace_key_env_and_redacts_secret() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture(AUTH_D2_ENV);
+        std::env::set_var(AUTH_D2_ENV, AUTH_D2_SECRET);
+        let mut args = vec![
+            "verify-request".to_owned(),
+            "--method".to_owned(),
+            "POST".to_owned(),
+            "--path".to_owned(),
+            "/api/send".to_owned(),
+            "--now".to_owned(),
+            AUTH_D2_NOW.to_owned(),
+            "--body".to_owned(),
+            "body".to_owned(),
+            "--peer-ip".to_owned(),
+            "198.51.100.10".to_owned(),
+            "--workspace-key-env".to_owned(),
+            AUTH_D2_ENV.to_owned(),
+            "--plan-json".to_owned(),
+        ];
+        args.extend(auth_d2_hmac_headers("POST", "/api/send", "body"));
+        let output = auth_run_d2(&args);
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("\"kind\":\"accept\""));
+        assert!(output.stdout.contains("\"who\":\"hmac-v3:mawjs:m5\""));
+        assert!(!output.stdout.contains(AUTH_D2_SECRET));
+        assert!(!output.stderr.contains(AUTH_D2_SECRET));
+    }
+
+    #[test]
+    fn auth_verify_request_d2_ed25519_accepts_in_memory_tofu_first_contact() {
+        let output = auth_run_d2(&auth_d2_ed25519_args(None));
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("\"kind\":\"accept\""));
+        assert!(output.stdout.contains("\"who\":\"ed25519:mawjs:m5\""));
+    }
+
+    #[test]
+    fn auth_verify_request_d2_ed25519_pin_mismatch_rejects_without_repin() {
+        let other_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let output = auth_run_d2(&auth_d2_ed25519_args(Some(other_key)));
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("\"kind\":\"reject\""));
+        assert!(output.stdout.contains("\"reason\":\"ed25519-pin-mismatch\""));
+        assert!(!output.stdout.contains(AUTH_D2_ED25519_PUBKEY));
+    }
+
+    #[test]
+    fn auth_verify_request_d2_rejects_secret_literal_env_name_shape() {
+        let output = auth_run_command(&auth_args(&[
+            "verify-request",
+            "--workspace-key-env",
+            "ghp_not_an_env_name",
+            "--peer-ip",
+            "198.51.100.10",
+        ]));
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "reject\n");
+        assert!(!output.stdout.contains("ghp_not_an_env_name"));
     }
 
     #[test]
