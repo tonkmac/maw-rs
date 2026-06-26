@@ -1,4 +1,4 @@
-const DISPATCH_135: &[DispatcherEntry] = &[DispatcherEntry { command: "consent", handler: Handler::Sync(run_consent_command_135) }];
+const DISPATCH_142: &[DispatcherEntry] = &[DispatcherEntry { command: "consent", handler: Handler::Sync(run_consent_command_135) }];
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
