@@ -1,9 +1,6 @@
-const DISPATCH_122: &[DispatcherEntry] = &[
-    DispatcherEntry { command: "team", handler: Handler::Sync(team_run_command) },
-    DispatcherEntry { command: "t", handler: Handler::Sync(team_run_command) },
-];
+const DISPATCH_122: &[DispatcherEntry] = &[];
 
-const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|invite|up|bring|apply|reassign|liveness|down|remove|delete|rm|prune|shutdown>";
+const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|invite|up|bring|apply|reassign|liveness|down|remove|delete|rm|prune|shutdown|enter|send-enter|add|task|done|assign>";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +26,8 @@ struct TeamMember122 {
     agent_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tmux_pane_id: Option<String>,
+    #[serde(default, rename = "agentId", skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +127,8 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "delete" | "rm" => team_delete(argv),
         "prune" => team_prune(argv),
         "shutdown" => team_shutdown(argv),
+        "enter" | "send-enter" => team_enter_send_enter(argv),
+        "add" | "task" | "done" | "assign" => team_task_ops241(argv),
         other if other.starts_with('-') => Err(format!("team: unknown argument {other}")),
         _ => Err(TEAM_USAGE.to_owned()),
     }
@@ -170,13 +171,9 @@ fn team_status(argv: &[String]) -> Result<String, String> {
 }
 
 fn team_tasks(argv: &[String]) -> Result<String, String> {
-    let team = team_team_arg(argv, 1)?;
-    let tasks = team_read_tasks(&team);
-    if tasks.is_empty() { return Ok(format!("\x1b[36mℹ\x1b[0m no tasks for team \"{team}\"\n")); }
-    let mut out = format!("\x1b[36mℹ\x1b[0m tasks for team \"{team}\" ({}):\n", tasks.len());
-    for task in tasks { team_push_task_row(&mut out, &task); }
-    Ok(out)
+    team_task_ops241(argv)
 }
+
 
 fn team_oracle_members(argv: &[String]) -> Result<String, String> {
     let team = team_team_arg(argv, 1)?;
@@ -389,13 +386,6 @@ fn team_read_tasks(team: &str) -> Vec<TeamTask122> {
     out
 }
 
-fn team_push_task_row(out: &mut String, task: &TeamTask122) {
-    use std::fmt::Write as _;
-    let status = match task.status.as_str() { "completed" => "\x1b[32mcompleted\x1b[0m", "in_progress" => "\x1b[36min_progress\x1b[0m", _ => "\x1b[33mpending\x1b[0m" };
-    let assignee = if task.assignee.is_empty() { String::new() } else { format!(" → {}", task.assignee) };
-    writeln!(out, "  #{}  [{}]  {}{}", task.id, status, task.subject, assignee).expect("write string");
-}
-
 fn team_read_oracle_registry(team: &str) -> Option<TeamOracleRegistry122> {
     let primary = team_state_dir().join("teams").join(team).join("oracle-members.json");
     let legacy = team_maw_home_dir().join("config").join("teams").join(team).join("oracle-members.json");
@@ -596,7 +586,8 @@ mod team_tests {
     }
 
     #[test]
-    fn team_dispatch_fragment_owns_team() {
-        assert_eq!(DISPATCH_122[0].command, "team");
+    fn team_dispatch_fragment_moved_to_part240() {
+        assert!(DISPATCH_122.is_empty());
+        assert_eq!(DISPATCH_240[0].command, "team");
     }
 }
