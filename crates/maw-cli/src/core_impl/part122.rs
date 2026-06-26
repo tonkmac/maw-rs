@@ -1,9 +1,6 @@
-const DISPATCH_122: &[DispatcherEntry] = &[
-    DispatcherEntry { command: "team", handler: Handler::Sync(team_run_command) },
-    DispatcherEntry { command: "t", handler: Handler::Sync(team_run_command) },
-];
+const DISPATCH_122: &[DispatcherEntry] = &[];
 
-const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|invite|up|bring|apply|reassign|liveness|down|remove|delete|rm|prune|shutdown>";
+const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|invite|up|bring|apply|reassign|liveness|down|remove|delete|rm|prune|shutdown|enter|send-enter>";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +26,8 @@ struct TeamMember122 {
     agent_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tmux_pane_id: Option<String>,
+    #[serde(default, rename = "agentId", skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +127,7 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "delete" | "rm" => team_delete(argv),
         "prune" => team_prune(argv),
         "shutdown" => team_shutdown(argv),
+        "enter" | "send-enter" => team_enter_send_enter(argv),
         other if other.starts_with('-') => Err(format!("team: unknown argument {other}")),
         _ => Err(TEAM_USAGE.to_owned()),
     }
@@ -596,7 +596,8 @@ mod team_tests {
     }
 
     #[test]
-    fn team_dispatch_fragment_owns_team() {
-        assert_eq!(DISPATCH_122[0].command, "team");
+    fn team_dispatch_fragment_moved_to_part240() {
+        assert!(DISPATCH_122.is_empty());
+        assert_eq!(DISPATCH_240[0].command, "team");
     }
 }
