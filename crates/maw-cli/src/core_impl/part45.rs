@@ -119,26 +119,86 @@ fn archive_render_and_apply(entry: &ArchiveFleetEntry, options: &ArchiveOptions)
 
     let mut out = String::new();
     let _ = writeln!(out, "\n  \x1b[36m⚰️  Archiving\x1b[0m — {}\n", options.oracle);
-    archive_render_soul_sync(&mut out, entry, options);
+    archive_render_soul_sync(&mut out, entry, repo_slug, options)?;
     archive_render_disable(&mut out, entry, options)?;
     archive_render_repo_archive(&mut out, repo_slug, options)?;
     archive_render_death_certificate(&mut out, entry, options);
     Ok(out)
 }
 
-fn archive_render_soul_sync(out: &mut String, entry: &ArchiveFleetEntry, options: &ArchiveOptions) {
+fn archive_render_soul_sync(
+    out: &mut String,
+    entry: &ArchiveFleetEntry,
+    repo_slug: &str,
+    options: &ArchiveOptions,
+) -> Result<(), String> {
+    let mut host = SoulsyncSystemHost;
+    let fleet = load_native_fleet();
+    let github_root = ghq_root().join("github.com");
+    soul_sync_archive_render_soul_sync_with(out, entry, repo_slug, options, &mut host, &fleet, &github_root)
+}
+
+fn soul_sync_archive_render_soul_sync_with(
+    out: &mut String,
+    entry: &ArchiveFleetEntry,
+    repo_slug: &str,
+    options: &ArchiveOptions,
+    host: &mut impl SoulsyncHost,
+    fleet: &[NativeFleetSession],
+    github_root: &std::path::Path,
+) -> Result<(), String> {
     if entry.session.sync_peers.is_empty() {
         let _ = writeln!(out, "  \x1b[90m○\x1b[0m no sync_peers configured — knowledge stays local");
-    } else if options.dry_run {
+        return Ok(());
+    }
+    if options.dry_run {
         let _ = writeln!(
             out,
             "  \x1b[36m⬡\x1b[0m [dry-run] would soul-sync to {}",
             entry.session.sync_peers.join(", ")
         );
-    } else {
-        let _ = writeln!(out, "  \x1b[36m⏳\x1b[0m final soul-sync to peers...");
-        let _ = writeln!(out, "  \x1b[33m⚠\x1b[0m soul-sync not yet implemented in maw-rs native archive");
+        return Ok(());
     }
+
+    archive_require_yes(options)?;
+    let _ = writeln!(out, "  \x1b[36m⏳\x1b[0m final soul-sync to peers...");
+    if repo_slug.is_empty() {
+        let _ = writeln!(out, "  \x1b[33m⚠\x1b[0m soul-sync failed: oracle repo not configured");
+        return Ok(());
+    }
+    let oracle_path = soul_sync_archive_repo_path(github_root, repo_slug)?;
+    if !oracle_path.exists() {
+        let _ = writeln!(
+            out,
+            "  \x1b[33m⚠\x1b[0m soul-sync failed: oracle repo not found at {}",
+            oracle_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut total = 0_usize;
+    for peer in &entry.session.sync_peers {
+        let peer = soulsync_validate_name(peer, "peer")?;
+        let Some(peer_path) = soulsync_resolve_oracle_path(&peer, fleet, github_root) else {
+            let _ = writeln!(out, "  \x1b[33m⚠\x1b[0m {peer}: repo not found, skipping");
+            continue;
+        };
+        let result = soulsync_sync_oracle_vaults(&oracle_path, &peer_path, &options.oracle, &peer, host);
+        total += result.total;
+        soulsync_render_oracle_result(out, &result);
+    }
+    soulsync_render_total(out, total, "synced");
+    let _ = writeln!(out, "  \x1b[32m✓\x1b[0m soul-sync complete");
+    Ok(())
+}
+
+fn soul_sync_archive_repo_path(github_root: &std::path::Path, repo_slug: &str) -> Result<std::path::PathBuf, String> {
+    archive_validate_repo_slug(repo_slug)?;
+    let mut path = github_root.to_path_buf();
+    for part in repo_slug.split('/') {
+        path.push(part);
+    }
+    Ok(path)
 }
 
 fn archive_render_disable(out: &mut String, entry: &ArchiveFleetEntry, options: &ArchiveOptions) -> Result<(), String> {
@@ -244,6 +304,62 @@ mod archive_tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    #[derive(Clone)]
+    struct ArchiveSoulsyncFakeHost {
+        now: String,
+    }
+
+    impl SoulsyncHost for ArchiveSoulsyncFakeHost {
+        fn soulsync_current_dir(&mut self) -> std::path::PathBuf { std::path::PathBuf::from(".") }
+        fn soulsync_tmux_cwd(&mut self) -> Option<std::path::PathBuf> { None }
+        fn soulsync_git_common_dir(&mut self, _: &std::path::Path) -> Option<std::path::PathBuf> { None }
+        fn soulsync_git_top_level(&mut self, _: &std::path::Path) -> Option<std::path::PathBuf> { None }
+        fn soulsync_now(&mut self) -> String { self.now.clone() }
+    }
+
+    struct ArchiveEnvRestore {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl ArchiveEnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for ArchiveEnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.old.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn archive_session(name: &str, repo: &str, peers: &[&str]) -> NativeFleetSession {
+        NativeFleetSession {
+            name: name.to_owned(),
+            windows: vec![NativeFleetWindow { name: name.to_owned(), repo: repo.to_owned() }],
+            sync_peers: peers.iter().map(|value| (*value).to_owned()).collect(),
+            project_repos: Vec::new(),
+        }
+    }
+
+    fn archive_write(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, text).expect("write");
+    }
+
+    fn archive_temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("maw-rs-archive-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
     #[test]
     fn archive_parse_help_and_flags() {
         assert!(archive_parse_args(&archive_strings(&["--help"])).expect("parse").is_none());
@@ -271,4 +387,91 @@ mod archive_tests {
         assert_eq!(archive_session_oracle_name("neo"), "neo");
         assert_eq!(archive_session_oracle_name("dev-neo"), "dev-neo");
     }
+
+    #[test]
+    fn archive_soul_sync_copies_new_memory_only_matches_golden_without_js_ref() {
+        let _env = ArchiveEnvRestore::set("MAW_JS_REF_DIR", "/nonexistent");
+        let root = archive_temp_root("soul-sync-golden");
+        let github_root = root.join("github.com");
+        let neo = github_root.join("org/neo-oracle");
+        let trinity = github_root.join("org/trinity-oracle");
+        archive_write(&neo.join("ψ/memory/learnings/new.md"), "new learning");
+        archive_write(&neo.join("ψ/memory/learnings/existing.md"), "source should not overwrite");
+        archive_write(&neo.join("ψ/identity.json"), r#"{"secret":true}"#);
+        archive_write(&neo.join("ψ/vault/secret.txt"), "vault secret");
+        archive_write(&trinity.join("ψ/memory/learnings/existing.md"), "keep destination");
+
+        let entry = ArchiveFleetEntry {
+            file: "01-neo.json".to_owned(),
+            path: root.join("fleet/01-neo.json"),
+            session: archive_session("01-neo", "org/neo-oracle", &["trinity"]),
+        };
+        let options = ArchiveOptions { oracle: "neo".to_owned(), dry_run: false, yes: true };
+        let fleet = vec![
+            archive_session("01-neo", "org/neo-oracle", &["trinity"]),
+            archive_session("02-trinity", "org/trinity-oracle", &[]),
+        ];
+        let mut host = ArchiveSoulsyncFakeHost { now: "2026-06-26T00:00:00.000Z".to_owned() };
+        let mut out = String::new();
+
+        soul_sync_archive_render_soul_sync_with(
+            &mut out,
+            &entry,
+            "org/neo-oracle",
+            &options,
+            &mut host,
+            &fleet,
+            &github_root,
+        )
+        .expect("sync");
+
+        assert_eq!(out, include_str!("../../tests/fixtures/native-archive/soul-sync.stdout"));
+        assert_eq!(std::fs::read_to_string(trinity.join("ψ/memory/learnings/new.md")).expect("copied"), "new learning");
+        assert_eq!(
+            std::fs::read_to_string(trinity.join("ψ/memory/learnings/existing.md")).expect("preserved"),
+            "keep destination"
+        );
+        assert!(!trinity.join("ψ/identity.json").exists(), "identity files must not be copied");
+        assert!(!trinity.join("ψ/vault/secret.txt").exists(), "vault secrets must not be copied");
+        let log = std::fs::read_to_string(trinity.join("ψ/.soul-sync/sync.log")).expect("sync log");
+        assert!(log.contains("2026-06-26T00:00:00.000Z | neo → trinity | 1 files | 1 learnings"));
+        assert!(!log.contains("secret"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_soul_sync_refuses_real_mutation_without_yes() {
+        let root = archive_temp_root("soul-sync-no-yes");
+        let github_root = root.join("github.com");
+        let neo = github_root.join("org/neo-oracle");
+        let trinity = github_root.join("org/trinity-oracle");
+        archive_write(&neo.join("ψ/memory/learnings/new.md"), "new learning");
+        std::fs::create_dir_all(&trinity).expect("peer repo");
+        let entry = ArchiveFleetEntry {
+            file: "01-neo.json".to_owned(),
+            path: root.join("fleet/01-neo.json"),
+            session: archive_session("01-neo", "org/neo-oracle", &["trinity"]),
+        };
+        let options = ArchiveOptions { oracle: "neo".to_owned(), dry_run: false, yes: false };
+        let fleet = vec![archive_session("02-trinity", "org/trinity-oracle", &[])];
+        let mut host = ArchiveSoulsyncFakeHost { now: "2026-06-26T00:00:00.000Z".to_owned() };
+        let mut out = String::new();
+
+        let error = soul_sync_archive_render_soul_sync_with(
+            &mut out,
+            &entry,
+            "org/neo-oracle",
+            &options,
+            &mut host,
+            &fleet,
+            &github_root,
+        )
+        .expect_err("requires --yes");
+
+        assert!(error.contains("without --yes"));
+        assert!(out.is_empty());
+        assert!(!trinity.join("ψ/memory/learnings/new.md").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }
