@@ -33,6 +33,24 @@ fn parse_manifest_happy_path_matches_maw_js_tests() {
     assert_eq!(manifest.sdk, "^1.0.0");
     assert_eq!(manifest.cli, None);
 
+    let wasm_target = parse_manifest(
+        &json!({ "name": "wasm-target", "version": "1.0.0", "wasm": "plugin.wasm", "sdk": "*", "target": "wasm" })
+            .to_string(),
+        &dir,
+    )
+    .expect("target wasm manifest");
+    assert_eq!(wasm_target.target, Some(PluginTarget::Wasm));
+    assert_eq!(wasm_target.wasm, Some("plugin.wasm".to_owned()));
+
+    let wasm_entry_target = parse_manifest(
+        &json!({ "name": "wasm-entry-target", "version": "1.0.0", "entry": "plugin.wasm", "sdk": "*", "target": "wasm" })
+            .to_string(),
+        &dir,
+    )
+    .expect("target wasm entry manifest");
+    assert_eq!(wasm_entry_target.target, Some(PluginTarget::Wasm));
+    assert_eq!(wasm_entry_target.entry, Some("plugin.wasm".to_owned()));
+
     let manifest = parse_manifest(
         &json!({
             "name": "full-plugin",
