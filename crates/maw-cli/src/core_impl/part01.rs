@@ -150,7 +150,7 @@ pub struct CliOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchKind {
     Native,
-    BunFallback,
+    NativeError,
 }
 
 type NativeHandler = fn(&[String]) -> CliOutput;
@@ -172,7 +172,7 @@ pub(crate) struct DispatcherEntry {
 enum DispatchTarget {
     Native(NativeHandler),
     AsyncNative(AsyncHandler),
-    BunFallback,
+    UnknownCommand,
 }
 
 const DISPATCH_01: &[DispatcherEntry] = &[
@@ -241,7 +241,7 @@ const DISPATCH_01: &[DispatcherEntry] = &[
 pub fn dispatcher_status(command: &str) -> DispatchKind {
     match dispatcher_target(command) {
         DispatchTarget::Native(_) | DispatchTarget::AsyncNative(_) => DispatchKind::Native,
-        DispatchTarget::BunFallback => DispatchKind::BunFallback,
+        DispatchTarget::UnknownCommand => DispatchKind::NativeError,
     }
 }
 
@@ -330,7 +330,7 @@ fn dispatcher_entries() -> impl Iterator<Item = &'static DispatcherEntry> {
 fn dispatcher_target(command: &str) -> DispatchTarget {
     dispatcher_entries()
         .find(|entry| entry.command == command)
-        .map_or(DispatchTarget::BunFallback, |entry| match entry.handler {
+        .map_or(DispatchTarget::UnknownCommand, |entry| match entry.handler {
             Handler::Sync(handler) => DispatchTarget::Native(handler),
             Handler::Async(handler) => DispatchTarget::AsyncNative(handler),
         })
@@ -358,13 +358,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     match dispatcher_target(command) {
         DispatchTarget::Native(handler) => handler(&argv[1..]),
         DispatchTarget::AsyncNative(handler) => run_async_handler_blocking(handler, &argv[1..]),
-        DispatchTarget::BunFallback => dispatch_cli_plugin(argv).unwrap_or_else(|| {
-            if has_partial_plugin_command_match(argv) {
-                unknown_command(command)
-            } else {
-                dispatch_bun_fallback(argv, command)
-            }
-        }),
+        DispatchTarget::UnknownCommand => dispatch_cli_plugin_or_unknown(argv, command),
     }
 }
 
@@ -382,13 +376,7 @@ pub async fn run_cli_async(argv: &[String]) -> CliOutput {
     match dispatcher_target(command) {
         DispatchTarget::Native(handler) => handler(&argv[1..]),
         DispatchTarget::AsyncNative(handler) => handler(argv[1..].to_vec()).await,
-        DispatchTarget::BunFallback => dispatch_cli_plugin(argv).unwrap_or_else(|| {
-            if has_partial_plugin_command_match(argv) {
-                unknown_command(command)
-            } else {
-                dispatch_bun_fallback(argv, command)
-            }
-        }),
+        DispatchTarget::UnknownCommand => dispatch_cli_plugin_or_unknown(argv, command),
     }
 }
 
@@ -440,6 +428,10 @@ fn run_async_dispatch_test(args: Vec<String>) -> Pin<Box<dyn Future<Output = Cli
 }
 
 
+fn dispatch_cli_plugin_or_unknown(argv: &[String], command: &str) -> CliOutput {
+    dispatch_cli_plugin(argv).unwrap_or_else(|| unknown_command(command))
+}
+
 fn dispatch_bun_fallback(argv: &[String], command: &str) -> CliOutput {
     if std::env::var_os("MAW_FROM_RS").is_some() {
         return unknown_command(command);
@@ -467,30 +459,8 @@ fn unknown_command(command: &str) -> CliOutput {
     CliOutput {
         code: 2,
         stdout: String::new(),
-        stderr: format!("unknown command: {command}\n{}", usage_text()),
+        stderr: format!("maw-rs: unknown command '{command}'\nsee maw-rs --help\n"),
     }
-}
-
-fn has_partial_plugin_command_match(argv: &[String]) -> bool {
-    let options = DiscoverPackagesOptions {
-        runtime_version: "1.0.0".to_owned(),
-        ..DiscoverPackagesOptions::default()
-    };
-    discover_packages(&options)
-        .plugins
-        .iter()
-        .filter(|plugin| !plugin.disabled)
-        .any(|plugin| plugin_cli_command_starts_with(plugin, argv))
-}
-
-fn plugin_cli_command_starts_with(plugin: &LoadedPlugin, argv: &[String]) -> bool {
-    let Some(command) = plugin.manifest.cli.as_ref().map(|cli| cli.command.as_str()) else {
-        return false;
-    };
-    let Some(first_command_part) = command.split_whitespace().next() else {
-        return false;
-    };
-    argv.first().is_some_and(|arg| arg == first_command_part)
 }
 
 fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {

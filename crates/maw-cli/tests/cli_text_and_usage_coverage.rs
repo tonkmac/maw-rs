@@ -37,7 +37,7 @@ fn top_level_help_and_unknown_command_branches_are_covered() {
     assert_ok_text(&["-h"], "usage: maw-rs");
     assert_eq!(
         dispatcher_status("definitely-not-a-command"),
-        DispatchKind::BunFallback
+        DispatchKind::NativeError
     );
 }
 

@@ -153,7 +153,7 @@ fn unknown_plugin_command_falls_through_to_cli_error() {
     assert_eq!(partial.code, 2, "{}", partial.stdout);
     assert!(partial.stdout.is_empty(), "{}", partial.stdout);
     assert!(
-        partial.stderr.contains("unknown command: weather"),
+        partial.stderr.contains("maw-rs: unknown command 'weather'"),
         "{}",
         partial.stderr
     );
