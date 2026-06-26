@@ -171,7 +171,7 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
     fn serveengine_timeout_is_generic() {
         let root = temp_dir("timeout");
         let bin = root.join("maw-sleep");
-        fs::write(&bin, "#!/bin/sh\nsleep 2\n").expect("script");
+        fs::write(&bin, "#!/bin/sh\n/bin/sleep 2\n").expect("script");
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).expect("chmod");
         let err = serveengine_run_with_timeout(&bin, &[], &root, Duration::from_millis(10))
             .expect_err("timeout");
