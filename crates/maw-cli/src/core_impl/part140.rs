@@ -1,4 +1,4 @@
-const DISPATCH_134: &[DispatcherEntry] = &[
+const DISPATCH_140: &[DispatcherEntry] = &[
     DispatcherEntry { command: "workspace", handler: Handler::Sync(run_workspace_command) },
     DispatcherEntry { command: "ws", handler: Handler::Sync(run_workspace_command) },
 ];
