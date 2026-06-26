@@ -97,6 +97,7 @@ pub struct PluginEngineServe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginTarget {
     Js,
+    Wasm,
 }
 
 impl PluginTarget {
@@ -104,6 +105,7 @@ impl PluginTarget {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Js => "js",
+            Self::Wasm => "wasm",
         }
     }
 }

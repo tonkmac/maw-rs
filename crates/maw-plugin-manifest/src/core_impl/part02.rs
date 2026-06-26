@@ -10,18 +10,13 @@ pub fn parse_target(manifest: &Value) -> Result<Option<PluginTarget>, String> {
     let Some(target_string) = target.as_str() else {
         return Err("plugin.json: target must be a string".to_owned());
     };
-    if target_string == "wasm" {
-        return Err(
-            "plugin.json: target \"wasm\" not yet supported (Phase C). Use target \"js\" for now."
-                .to_owned(),
-        );
+    match target_string {
+        "js" => Ok(Some(PluginTarget::Js)),
+        "wasm" => Ok(Some(PluginTarget::Wasm)),
+        _ => Err(format!(
+            "plugin.json: unknown target {target} (expected \"js\" or \"wasm\")"
+        )),
     }
-    if target_string != "js" {
-        return Err(format!(
-            "plugin.json: unknown target {target} (expected \"js\")"
-        ));
-    }
-    Ok(Some(PluginTarget::Js))
 }
 
 /// Parse optional `capabilityNamespaces`.

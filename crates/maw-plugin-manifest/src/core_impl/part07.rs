@@ -85,10 +85,10 @@ pub fn build_js_plugin_dir(dir: &Path, emit_types: bool) -> Result<PluginBuildSu
     let manifest = parse_manifest(&text, dir)?;
     let target = raw.get("target").and_then(Value::as_str).unwrap_or("js");
     if target == "wasm" {
-        return Err("target \"wasm\" not yet supported (Phase C). Use target \"js\" for now.".to_owned());
+        return Err("target \"wasm\" is handled by native Rust WASM build route".to_owned());
     }
     if target != "js" {
-        return Err(format!("unknown target {} (expected \"js\")", json_value_display(raw.get("target"))));
+        return Err(format!("unknown target {} (expected \"js\" or \"wasm\")", json_value_display(raw.get("target"))));
     }
 
     let entry = manifest.entry.as_deref().unwrap_or("./src/index.ts");

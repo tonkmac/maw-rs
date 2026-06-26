@@ -6,5 +6,6 @@
   "cli": {
     "command": "route-probe",
     "help": "Invoke route-probe"
-  }
+  },
+  "target": "wasm"
 }

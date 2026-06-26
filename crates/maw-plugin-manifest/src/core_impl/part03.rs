@@ -258,6 +258,8 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
     let wasm = parse_declared_manifest_file(object, "wasm", dir)?;
     let entry = parse_declared_manifest_file(object, "entry", dir)?;
     let entry_export = parse_entry_export(object)?;
+    let target = parse_target(&raw)?;
+    validate_target_payload(target, wasm.as_deref(), entry.as_deref())?;
 
     let capability_namespaces = parse_capability_namespaces(&raw)?;
     let extra_namespaces: Vec<&str> = capability_namespaces
@@ -294,13 +296,36 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
         module: parse_module(&raw)?,
         transport: parse_transport(&raw)?,
         engine: parse_engine(&raw)?,
-        target: parse_target(&raw)?,
+        target,
         capability_namespaces,
         capabilities,
         capability_warnings,
         dependencies: parse_dependencies(&raw)?,
         artifact: parse_artifact(&raw)?,
     })
+}
+
+fn validate_target_payload(
+    target: Option<PluginTarget>,
+    wasm: Option<&str>,
+    entry: Option<&str>,
+) -> Result<(), String> {
+    if target != Some(PluginTarget::Wasm) {
+        return Ok(());
+    }
+    let entry_is_wasm = entry.is_some_and(|entry| {
+        Path::new(entry)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+    });
+    if wasm.is_some() || entry_is_wasm {
+        Ok(())
+    } else {
+        Err(
+            "plugin.json: target \"wasm\" requires a wasm file (Phase C); JS entry plugins must use target \"js\""
+                .to_owned(),
+        )
+    }
 }
 
 /// Load and validate `plugin.json` from a plugin directory.
