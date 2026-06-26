@@ -101,10 +101,19 @@ trait InboxSender {
 
 struct InboxSystemSender;
 
+fn inbox_self_bin() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("MAW_RS_SELF_BIN")
+        .map(std::path::PathBuf::from)
+        .map_or_else(
+            || std::env::current_exe().map_err(|error| format!("inbox: current_exe failed: {error}")),
+            Ok,
+        )
+}
+
 impl InboxSender for InboxSystemSender {
     fn inbox_send(&mut self, query: &str, message: &str) -> Result<(), String> {
         inbox_validate_target_arg(query, "query")?;
-        let output = std::process::Command::new("maw")
+        let output = std::process::Command::new(inbox_self_bin()?)
             .args(["hey", "--", query, message])
             .output()
             .map_err(|error| format!("inbox: failed to execute maw hey: {error}"))?;
@@ -118,7 +127,7 @@ impl InboxSender for InboxSystemSender {
 
     fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
         inbox_validate_target_arg(query, "query")?;
-        let output = std::process::Command::new("maw")
+        let output = std::process::Command::new(inbox_self_bin()?)
             .args(["hey", "--", query, message])
             .env("MAW_ACL_BYPASS", "1")
             .output()
