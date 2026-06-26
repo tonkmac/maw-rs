@@ -32,6 +32,7 @@ struct RunPeerResponse {
 struct RunPeerDeps<'a, P: RunPeerTransport> {
     peer: &'a mut P,
     config: &'a HeyConfig,
+    from: Option<&'a str>,
     peer_key: fn() -> Result<String, String>,
     now: fn() -> i64,
 }
@@ -140,18 +141,25 @@ fn run_run(
     peer_key: fn() -> Result<String, String>,
     now: fn() -> i64,
 ) -> Result<String, (i32, String)> {
+    run_run_with_from(argv, tmux, peer, config, None, peer_key, now)
+}
+
+fn run_run_with_from(
+    argv: &[String],
+    tmux: &mut impl RunTmux,
+    peer: &mut impl RunPeerTransport,
+    config: &HeyConfig,
+    from: Option<&str>,
+    peer_key: fn() -> Result<String, String>,
+    now: fn() -> i64,
+) -> Result<String, (i32, String)> {
     let parsed = run_parse_args(argv).map_err(|message| (2, message))?;
     run_validate_target_query(&parsed.target).map_err(|message| (2, message))?;
     run_validate_command_text(&parsed.text).map_err(|message| (2, message))?;
     match resolve_route_target(&parsed.target, &config.route, &tmux.run_sessions()) {
         RouteResult::Local { target } | RouteResult::SelfNode { target } => run_local(&target, &parsed.text, tmux),
         RouteResult::Peer { peer_url, target, node } => {
-            let mut deps = RunPeerDeps {
-                peer,
-                config,
-                peer_key,
-                now,
-            };
+            let mut deps = RunPeerDeps { peer, config, from, peer_key, now };
             run_peer(&node, &peer_url, &target, &parsed.text, &mut deps)
         }
         RouteResult::Error { detail, hint, .. } => Err((2, run_route_error(&detail, hint))),
@@ -179,7 +187,7 @@ fn run_peer(
     run_validate_node(node).map_err(|message| (2, message))?;
     run_validate_peer_url(peer_url).map_err(|message| (2, message))?;
     run_validate_tmux_target(target).map_err(|message| (2, message))?;
-    let from = resolve_hey_wire_from(None, deps.config).map_err(|message| (2, message))?;
+    let from = resolve_hey_wire_from(deps.from, deps.config).map_err(|message| (2, message))?;
     let request = RunPeerRequest {
         node: node.to_owned(),
         peer_url: peer_url.to_owned(),
@@ -462,20 +470,24 @@ mod run_tests {
 
     fn run_config() -> HeyConfig {
         HeyConfig {
-            node: Some("localnode".to_owned()),
-            oracle: Some("gm-bo".to_owned()),
+            node: Some("test-node".to_owned()),
+            oracle: Some("test-oracle".to_owned()),
             route: RouteConfig::default(),
         }
     }
 
     fn run_peer_config() -> HeyConfig {
+        run_peer_config_with_identity("test-oracle", "test-node")
+    }
+
+    fn run_peer_config_with_identity(oracle: &str, node: &str) -> HeyConfig {
         let mut agents = HashMap::new();
         agents.insert("remote".to_owned(), "peer1".to_owned());
         HeyConfig {
-            node: Some("localnode".to_owned()),
-            oracle: Some("gm-bo".to_owned()),
+            node: Some(node.to_owned()),
+            oracle: Some(oracle.to_owned()),
             route: RouteConfig {
-                node: Some("localnode".to_owned()),
+                node: Some(node.to_owned()),
                 named_peers: vec![RouteNamedPeer { name: "peer1".to_owned(), url: "http://peer.example".to_owned() }],
                 peers: Vec::new(),
                 agents,
@@ -553,13 +565,22 @@ mod run_tests {
     fn run_peer_posts_pane_keys_with_enter_true() {
         let mut tmux = RunFakeTmux::default();
         let mut peer = RunFakePeer { response_target: Some("remote:0.0".to_owned()), ..RunFakePeer::default() };
-        let output = run_run(&run_strings(&["remote", "echo", "hi"]), &mut tmux, &mut peer, &run_peer_config(), run_key, run_now)
-            .expect("peer");
+        let config = run_peer_config_with_identity("test-oracle", "test-node");
+        let output = run_run_with_from(
+            &run_strings(&["remote", "echo", "hi"]),
+            &mut tmux,
+            &mut peer,
+            &config,
+            Some("test-oracle:test-node"),
+            run_key,
+            run_now,
+        )
+        .expect("peer");
         assert!(output.contains("⚡ peer1 → remote:0.0"));
         assert_eq!(peer.requests.len(), 1);
         assert_eq!(peer.requests[0].target, "remote");
         assert_eq!(peer.requests[0].text, "echo hi");
-        assert_eq!(peer.requests[0].from, "gm-bo:localnode");
+        assert_eq!(peer.requests[0].from, "test-oracle:test-node");
         assert!(tmux.enters.is_empty());
     }
 
@@ -580,7 +601,7 @@ mod run_tests {
 
     #[test]
     fn run_curl_argv_has_separator_before_url() {
-        let headers = sign_headers_v3_at("key", "gm-bo:localnode", "POST", RUN_PANE_KEYS_PATH, Some(b"{}"), run_now()).expect("headers");
+        let headers = sign_headers_v3_at("key", "test-oracle:test-node", "POST", RUN_PANE_KEYS_PATH, Some(b"{}"), run_now()).expect("headers");
         let argv = run_curl_argv("http://peer.example/", &headers, "{}").expect("argv");
         let sep = argv.iter().position(|arg| arg == "--").expect("separator");
         assert_eq!(argv[sep + 1], "http://peer.example/api/pane-keys");
