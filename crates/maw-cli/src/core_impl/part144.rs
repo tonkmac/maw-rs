@@ -1,4 +1,4 @@
-const DISPATCH_136: &[DispatcherEntry] = &[
+const DISPATCH_144: &[DispatcherEntry] = &[
     DispatcherEntry { command: "triggers", handler: Handler::Sync(run_triggers_command_136) },
     DispatcherEntry { command: "trigger", handler: Handler::Sync(run_triggers_command_136) },
 ];
