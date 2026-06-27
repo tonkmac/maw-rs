@@ -25,6 +25,8 @@ const NON_LOOPBACK_TEST_PEER: SocketAddr =
 
 struct ServeState {
     cached_pubkey: Option<String>,
+    peer_pubkeys: Vec<ServePeerPubkey>,
+    workspace_key: Option<String>,
     workspaces: Mutex<WorkspaceStore>,
     requests: Mutex<RequestReplyStore>,
     #[cfg(test)]
@@ -41,6 +43,12 @@ struct ServeArgs {
     host: String,
     port: u16,
     cached_pubkey: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServePeerPubkey {
+    from: String,
+    pubkey: String,
 }
 
 fn run_serve_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
@@ -78,7 +86,9 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         }
     };
     let app = serve_router(ServeState {
-        cached_pubkey: args.cached_pubkey.or_else(load_inbound_peer_pubkey),
+        cached_pubkey: args.cached_pubkey,
+        peer_pubkeys: load_inbound_peer_pubkeys(),
+        workspace_key: load_serve_workspace_key(),
         workspaces: Mutex::new(WorkspaceStore::default()),
         requests: Mutex::new(RequestReplyStore::default()),
         #[cfg(test)]
@@ -205,7 +215,7 @@ fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedSta
     let core = crate::serve_core::ServecoreSharedState::default()
         .servecore_with_engine(Arc::new(crate::serve_core::ServecoreNativeEngine))
         .servecore_with_agents_node(load_hey_config().node)
-        .servecore_with_auth(state.cached_pubkey.clone(), state.cached_pubkey.clone());
+        .servecore_with_auth(state.workspace_key.clone(), None);
     #[cfg(not(test))]
     let core = core.servecore_with_process_auth_pins();
     #[cfg(test)]
@@ -689,12 +699,23 @@ fn verify_protected_request(
         return None;
     }
     let now = verify_now(state);
+    let auth_headers = extract_auth_headers(headers);
+    let cached_pubkey = match resolve_request_cached_pubkey(state, &auth_headers) {
+        Ok(pubkey) => pubkey,
+        Err(decision) => {
+            return Some((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized", "decision": decision})),
+            )
+                .into_response());
+        }
+    };
     let decision = verify_request(&VerifyRequestArgs {
         method: method.as_str().to_owned(),
         path: path_and_query(uri),
-        headers: extract_auth_headers(headers),
+        headers: auth_headers,
         body: Some(body.to_vec()),
-        cached_pubkey: state.cached_pubkey.clone(),
+        cached_pubkey,
         now,
     });
     if maw_auth::is_refuse_decision(&decision) {
@@ -852,41 +873,184 @@ fn agent_key(node_id: &str, name: &str) -> String {
     format!("{node_id}:{name}")
 }
 
-fn load_inbound_peer_pubkey() -> Option<String> {
-    if let Ok(value) = std::env::var("MAW_PEER_PUBKEY") {
-        if !value.trim().is_empty() {
-            return Some(value.trim().to_owned());
+fn load_serve_workspace_key() -> Option<String> {
+    if let Ok(value) = std::env::var("MAW_FEDERATION_TOKEN") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_owned());
         }
     }
+    let env = real_xdg_env();
+    let path = maw_config_path(&env, &["maw.config.json"]);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    value
+        .get("federationToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn load_inbound_peer_pubkeys() -> Vec<ServePeerPubkey> {
     let env = real_xdg_env();
     let paths = [
         maw_state_path(&env, &["peers.json"]),
         maw_config_path(&env, &["maw.config.json"]),
     ];
-    paths
-        .iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .find_map(|value| find_first_pubkey(&value))
+    let mut entries = Vec::new();
+    for path in paths {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        collect_peer_pubkeys(&value, None, &mut entries);
+    }
+    entries
 }
 
-fn find_first_pubkey(value: &Value) -> Option<String> {
+fn resolve_request_cached_pubkey(
+    state: &ServeState,
+    headers: &Headers,
+) -> Result<Option<String>, &'static str> {
+    if let Some(pubkey) = state
+        .cached_pubkey
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(pubkey.to_owned()));
+    }
+    let Some(from) = request_from_sign_sender(headers) else {
+        return Ok(None);
+    };
+    state
+        .peer_pubkeys
+        .iter()
+        .find(|entry| entry.from == from)
+        .map(|entry| Some(entry.pubkey.clone()))
+        .ok_or("refuse-missing-peer-key")
+}
+
+fn request_from_sign_sender(headers: &Headers) -> Option<String> {
+    let from = headers.get("x-maw-from").unwrap_or_default().trim();
+    if from.is_empty() {
+        return None;
+    }
+    let has_v3 = !headers
+        .get("x-maw-signature-v3")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        && !headers
+            .get("x-maw-timestamp")
+            .unwrap_or_default()
+            .trim()
+            .is_empty();
+    let has_legacy = !headers
+        .get("x-maw-signature")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        && !headers
+            .get("x-maw-signed-at")
+            .unwrap_or_default()
+            .trim()
+            .is_empty();
+    (has_v3 || has_legacy).then(|| from.to_owned())
+}
+
+fn collect_peer_pubkeys(value: &Value, key_hint: Option<&str>, entries: &mut Vec<ServePeerPubkey>) {
     match value {
         Value::Object(map) => {
-            for key in ["pubkey", "pubKey", "peerKey", "publicKey"] {
-                if let Some(found) = map
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                {
-                    return Some(found.to_owned());
+            if let Some(pubkey) = object_pubkey(value) {
+                for from in object_from_identities(value, key_hint) {
+                    entries.push(ServePeerPubkey {
+                        from,
+                        pubkey: pubkey.clone(),
+                    });
                 }
             }
-            map.values().find_map(find_first_pubkey)
+            for (key, child) in map {
+                collect_peer_pubkeys(child, Some(key), entries);
+            }
         }
-        Value::Array(items) => items.iter().find_map(find_first_pubkey),
-        _ => None,
+        Value::Array(items) => {
+            for item in items {
+                collect_peer_pubkeys(item, key_hint, entries);
+            }
+        }
+        Value::String(pubkey) => {
+            if let Some(from) = key_hint.and_then(normalize_from_identity) {
+                let pubkey = pubkey.trim();
+                if !pubkey.is_empty() {
+                    entries.push(ServePeerPubkey {
+                        from,
+                        pubkey: pubkey.to_owned(),
+                    });
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+fn object_pubkey(value: &Value) -> Option<String> {
+    let map = value.as_object()?;
+    ["pubkey", "pubKey", "peerKey", "publicKey"]
+        .into_iter()
+        .find_map(|key| map.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn object_from_identities(value: &Value, key_hint: Option<&str>) -> Vec<String> {
+    let mut identities = Vec::new();
+    if let Some(from) = key_hint.and_then(normalize_from_identity) {
+        identities.push(from);
+    }
+    if let Some(map) = value.as_object() {
+        for key in ["from", "fromAddress", "sender", "identity"] {
+            if let Some(from) = map
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(normalize_from_identity)
+            {
+                identities.push(from);
+            }
+        }
+        if let (Some(oracle), Some(node)) = (
+            map.get("oracle").and_then(Value::as_str),
+            map.get("node").and_then(Value::as_str),
+        ) {
+            if let Some(from) = normalize_from_identity(&format!("{}:{}", oracle.trim(), node.trim())) {
+                identities.push(from);
+            }
+        }
+    }
+    identities.sort();
+    identities.dedup();
+    identities
+}
+
+fn normalize_from_identity(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (oracle, node) = value.split_once(':')?;
+    let oracle = oracle.trim();
+    let node = node.trim();
+    if oracle.is_empty()
+        || node.is_empty()
+        || oracle.starts_with('-')
+        || node.starts_with('-')
+        || oracle.bytes().any(|byte| byte.is_ascii_control())
+        || node.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+    Some(format!("{oracle}:{node}"))
 }
 
 #[derive(Default, Deserialize)]
@@ -1132,6 +1296,8 @@ mod serve_tests {
     fn serve_test_app(trust_store_path: std::path::PathBuf) -> Router {
         serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
+            peer_pubkeys: Vec::new(),
+            workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -1183,6 +1349,199 @@ mod serve_tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    fn serve_test_app_with_o6_keys(
+        keys: Vec<ServePeerPubkey>,
+        now: i64,
+        peer_addr_override: Option<SocketAddr>,
+    ) -> Router {
+        serve_router(ServeState {
+            cached_pubkey: None,
+            peer_pubkeys: keys,
+            workspace_key: Some("capture-test-token-393av2".to_owned()),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            peer_addr_override,
+            now_override: Some(now),
+            serve_core_state_override: None,
+            trust_store_path: serve_test_trust_store_path("o6"),
+        })
+    }
+
+    fn captured_send_fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/serve-auth/maw-js-hey-captured-api-send.json"
+        ))
+        .expect("captured maw-js fixture")
+    }
+
+    fn captured_send_key() -> ServePeerPubkey {
+        let fixture = captured_send_fixture();
+        ServePeerPubkey {
+            from: fixture["headers"]["X-Maw-From"]
+                .as_str()
+                .expect("from")
+                .to_owned(),
+            pubkey: fixture["testPeerKey"].as_str().expect("peer key").to_owned(),
+        }
+    }
+
+    fn captured_send_request() -> axum::http::Request<Body> {
+        let fixture = captured_send_fixture();
+        let method = fixture["method"].as_str().expect("method");
+        let path = fixture["path"].as_str().expect("path");
+        let body = fixture["body"].as_str().expect("body");
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        for (name, value) in fixture["headers"].as_object().expect("headers") {
+            builder = builder.header(name.as_str(), value.as_str().expect("header value"));
+        }
+        let mut request = builder.body(Body::from(body.to_owned())).expect("request");
+        request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+        request
+    }
+
+    fn signed_json_request(
+        method: &str,
+        path: &str,
+        body: &'static str,
+        key: &str,
+        from: &str,
+        now: i64,
+    ) -> axum::http::Request<Body> {
+        let headers = sign_headers_v3_at(key, from, method, path, Some(body.as_bytes()), now)
+            .expect("sign v3");
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers.to_btree_map() {
+            builder = builder.header(name, value);
+        }
+        let mut request = builder.body(Body::from(body)).expect("request");
+        request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+        request
+    }
+
+    #[tokio::test]
+    async fn serve_o6_live_router_accepts_captured_maw_js_send_for_exact_from_key() {
+        let app = serve_test_app_with_o6_keys(
+            vec![
+                ServePeerPubkey {
+                    from: "other-oracle:other-node".to_owned(),
+                    pubkey: "wrong-first-peer-key".to_owned(),
+                },
+                captured_send_key(),
+            ],
+            1_782_553_858,
+            Some(NON_LOOPBACK_TEST_PEER),
+        );
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["state"], "queued");
+        assert_eq!(payload["target"], "capture-agent");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_live_router_rejects_captured_maw_js_send_when_exact_from_key_missing() {
+        let app = serve_test_app_with_o6_keys(
+            vec![ServePeerPubkey {
+                from: "other-oracle:other-node".to_owned(),
+                pubkey: "wrong-first-peer-key".to_owned(),
+            }],
+            1_782_553_858,
+            Some(NON_LOOPBACK_TEST_PEER),
+        );
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-missing-peer-key");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_live_router_rejects_captured_maw_js_send_with_wrong_from_key() {
+        let mut key = captured_send_key();
+        key.pubkey = "wrong-peer-key-393av2".to_owned();
+        let app = serve_test_app_with_o6_keys(vec![key], 1_782_553_858, Some(NON_LOOPBACK_TEST_PEER));
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-mismatch");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_live_router_rejects_captured_maw_js_send_with_expired_timestamp() {
+        let app = serve_test_app_with_o6_keys(
+            vec![captured_send_key()],
+            1_782_554_500,
+            Some(NON_LOOPBACK_TEST_PEER),
+        );
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-skew");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_live_router_loopback_bypasses_from_key_resolution_separately() {
+        let app = serve_test_app_with_o6_keys(
+            Vec::new(),
+            1_782_553_858,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_152)),
+        );
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["state"], "queued");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_from_aware_key_resolution_also_unblocks_api_feed() {
+        let app = serve_test_app_with_o6_keys(
+            vec![ServePeerPubkey {
+                from: FROM.to_owned(),
+                pubkey: KEY.to_owned(),
+            }],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+        );
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/feed",
+                r#"{"event":"hello"}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("feed response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+    }
+
     async fn spawn_test_server() -> SocketAddr {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1190,6 +1549,8 @@ mod serve_tests {
         let addr = listener.local_addr().expect("local addr");
         let app = serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
+            peer_pubkeys: Vec::new(),
+            workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -1459,6 +1820,8 @@ mod serve_tests {
             }]);
         let app = serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
+            peer_pubkeys: Vec::new(),
+            workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
