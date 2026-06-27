@@ -160,6 +160,18 @@ fn verify_workspace_hmac(parts: &RequestAuthParts, body_hash: &str) -> Result<Op
     Err("signature-invalid".to_owned())
 }
 
+fn from_verify_candidate_paths(path: &str) -> Vec<String> {
+    let primary = if path.is_empty() { "/" } else { path };
+    let mut paths = vec![primary.to_owned()];
+    if primary.starts_with('/') && primary != "/api" && !primary.starts_with("/api/") {
+        let api_prefixed = format!("/api{primary}");
+        if !paths.iter().any(|path| path == &api_prefixed) {
+            paths.push(api_prefixed);
+        }
+    }
+    paths
+}
+
 fn verify_cached_from_sign(
     parts: &RequestAuthParts,
     signed: &SignedInput,
@@ -180,15 +192,17 @@ fn verify_cached_from_sign(
         if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
             return Err("timestamp-out-of-window".to_owned());
         }
-        let payload = build_from_sign_payload(
-            &signed.from,
-            signed_at_sec,
-            &parts.method,
-            &parts.path,
-            body_hash,
-        );
-        if verify_hmac_sig(cached, &payload, &signed.v3_sig) {
-            return Ok(Some(format!("from-sign:{}", signed.from)));
+        for path in from_verify_candidate_paths(&parts.path) {
+            let payload = build_from_sign_payload(
+                &signed.from,
+                signed_at_sec,
+                &parts.method,
+                &path,
+                body_hash,
+            );
+            if verify_hmac_sig(cached, &payload, &signed.v3_sig) {
+                return Ok(Some(format!("from-sign:{}", signed.from)));
+            }
         }
         return Err("pin-mismatch".to_owned());
     }
@@ -200,15 +214,17 @@ fn verify_cached_from_sign(
         if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
             return Err("timestamp-out-of-window".to_owned());
         }
-        let payload = build_legacy_from_sign_payload(
-            &signed.from,
-            &signed.legacy_signed_at,
-            &parts.method,
-            &parts.path,
-            body_hash,
-        );
-        if verify_hmac_sig(cached, &payload, &signed.legacy_sig) {
-            return Ok(Some(format!("from-sign:{}", signed.from)));
+        for path in from_verify_candidate_paths(&parts.path) {
+            let payload = build_legacy_from_sign_payload(
+                &signed.from,
+                &signed.legacy_signed_at,
+                &parts.method,
+                &path,
+                body_hash,
+            );
+            if verify_hmac_sig(cached, &payload, &signed.legacy_sig) {
+                return Ok(Some(format!("from-sign:{}", signed.from)));
+            }
         }
         return Err("pin-mismatch".to_owned());
     }
@@ -283,29 +299,36 @@ fn verify_from_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     }
 
     let body_hash = hash_body(args.body.as_deref());
-    let payload = if signed.has_v3_sig {
-        build_from_sign_payload(
-            &signed.from,
-            signed_at_sec,
-            &args.method,
-            &args.path,
-            &body_hash,
-        )
-    } else {
-        build_legacy_from_sign_payload(
-            &signed.from,
-            &signed.legacy_signed_at,
-            &args.method,
-            &args.path,
-            &body_hash,
-        )
-    };
     let signature = if signed.has_v3_sig {
         &signed.v3_sig
     } else {
         &signed.legacy_sig
     };
-    if !verify_hmac_sig(cached, &payload, signature) {
+    let mut verified = false;
+    for path in from_verify_candidate_paths(&args.path) {
+        let payload = if signed.has_v3_sig {
+            build_from_sign_payload(
+                &signed.from,
+                signed_at_sec,
+                &args.method,
+                &path,
+                &body_hash,
+            )
+        } else {
+            build_legacy_from_sign_payload(
+                &signed.from,
+                &signed.legacy_signed_at,
+                &args.method,
+                &path,
+                &body_hash,
+            )
+        };
+        if verify_hmac_sig(cached, &payload, signature) {
+            verified = true;
+            break;
+        }
+    }
+    if !verified {
         return FromVerifyDecision::RefuseMismatch {
             reason: "signature-invalid".to_owned(),
             from: signed.from,
@@ -401,14 +424,21 @@ fn verify_ed25519_serve_request(
         Err(reason) => return auth_reject(reason),
     };
     let body_hash = hash_body(parts.body.as_deref());
-    let payload = build_from_sign_payload(
-        &signed.from,
-        signed_at_sec,
-        &parts.method,
-        &parts.path,
-        &body_hash,
-    );
-    if !verify_ed25519_signature(&key_hex, payload.as_bytes(), signature_hex) {
+    let mut verified = false;
+    for path in from_verify_candidate_paths(&parts.path) {
+        let payload = build_from_sign_payload(
+            &signed.from,
+            signed_at_sec,
+            &parts.method,
+            &path,
+            &body_hash,
+        );
+        if verify_ed25519_signature(&key_hex, payload.as_bytes(), signature_hex) {
+            verified = true;
+            break;
+        }
+    }
+    if !verified {
         return auth_reject("ed25519-signature-invalid");
     }
     if let Err(reason) = ed25519_pin_verified_key(parts, &signed.from, &key_hex) {
@@ -751,9 +781,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        consent_status_str, constant_time_eq, parse_iso_millis, parse_second_millis,
-        sign_hmac_sig, timestamp_seconds, verify_auto_pair_proof, verify_hmac_sig, AutoPairIdentity,
-        ConsentStatus,
+        consent_status_str, constant_time_eq, from_verify_candidate_paths, parse_iso_millis,
+        parse_second_millis, sign_hmac_sig, timestamp_seconds, verify_auto_pair_proof,
+        verify_hmac_sig, AutoPairIdentity, ConsentStatus,
     };
 
     #[test]
@@ -766,6 +796,26 @@ mod tests {
         assert!(!super::is_protected("/api/plugins", "GET"));
         assert!(!super::is_protected("/api/identity", "GET"));
         assert!(!super::is_protected("/api/triggers", "GET"));
+    }
+
+    #[test]
+    fn from_verify_candidate_paths_add_api_variant_without_double_prefix() {
+        assert_eq!(
+            from_verify_candidate_paths("/send"),
+            vec!["/send".to_owned(), "/api/send".to_owned()]
+        );
+        assert_eq!(
+            from_verify_candidate_paths("/api/send"),
+            vec!["/api/send".to_owned()]
+        );
+        assert_eq!(
+            from_verify_candidate_paths("/"),
+            vec!["/".to_owned(), "/api/".to_owned()]
+        );
+        assert_eq!(
+            from_verify_candidate_paths("relative"),
+            vec!["relative".to_owned()]
+        );
     }
 
     #[test]

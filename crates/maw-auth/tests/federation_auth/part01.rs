@@ -369,6 +369,29 @@ fn verify_request_rejects_wrong_token_pin_mismatch_and_expired_real_maw_js_fixtu
 }
 
 #[test]
+fn verify_request_from_sign_accepts_real_maw_js_api_path_when_receiver_path_is_stripped() {
+    let fixture = maw_js_hmac_fixture();
+    let mut stripped = maw_js_hmac_request();
+    stripped.path = "/triggers/fire".to_owned();
+    stripped.workspace_key = None;
+    stripped.cached_pubkey = Some(fixture["peerKey"].as_str().expect("peer key").to_owned());
+
+    assert_eq!(
+        maw_auth::verify_request(&stripped),
+        maw_auth::RequestAuthDecision::Accept {
+            who: "from-sign:nova:codex4".to_owned()
+        }
+    );
+
+    let mut wrong_key = stripped.clone();
+    wrong_key.cached_pubkey = Some("wrong-peer-key-393av3".to_owned());
+    assert_eq!(
+        maw_auth::verify_request(&wrong_key).reason(),
+        Some("pin-mismatch")
+    );
+}
+
+#[test]
 fn verify_request_supports_fleet_v1_v2_and_legacy_newline_without_slot_conflation() {
     use maw_auth::{build_legacy_from_sign_payload, hash_body, sign_hmac_sig, RequestAuthParts};
     use std::net::{IpAddr, Ipv4Addr};
@@ -421,6 +444,36 @@ fn verify_request_supports_fleet_v1_v2_and_legacy_newline_without_slot_conflatio
         now: NOW,
     };
     assert!(maw_auth::verify_request(&legacy).is_accept());
+}
+
+#[test]
+fn verify_request_legacy_from_sign_accepts_api_path_when_receiver_path_is_stripped() {
+    use maw_auth::RequestAuthParts;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let body = b"{\"event\":\"legacy\"}";
+    let body_hash = hash_body(Some(body));
+    let signed_at = "2023-11-14T22:13:20.000Z";
+    let payload =
+        build_legacy_from_sign_payload(FROM, signed_at, "POST", "/api/triggers/fire", &body_hash);
+    let signature = sign_hmac_sig(PEER_KEY, &payload);
+    let decision = maw_auth::verify_request(&RequestAuthParts {
+        method: "POST".to_owned(),
+        path: "/triggers/fire".to_owned(),
+        headers: Headers::new([
+            ("x-maw-from", FROM),
+            ("x-maw-signature", signature.as_str()),
+            ("x-maw-signed-at", signed_at),
+            ("x-maw-auth-version", "v3"),
+        ]),
+        body: Some(body.to_vec()),
+        peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+        workspace_key: None,
+        cached_pubkey: Some(PEER_KEY.to_owned()),
+        ed25519_pins: None,
+        now: NOW,
+    });
+    assert!(decision.is_accept(), "{decision:?}");
 }
 
 const ED25519_PUBKEY_HEX: &str =
@@ -500,6 +553,64 @@ fn verify_request_ed25519_from_sign_accepts_byte_exact_804_vector_and_pins_tofu(
     );
     let guard = pins.lock().expect("test pin lock");
     assert_eq!(guard.pinned(FROM), Some(ED25519_PUBKEY_HEX));
+}
+
+#[test]
+fn verify_request_ed25519_accepts_api_path_when_receiver_path_is_stripped() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use maw_auth::{Ed25519TofuStore, RequestAuthParts};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Mutex},
+    };
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        out
+    }
+
+    let body = b"{\"event\":\"ed25519-api-path\"}";
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_hex = hex_lower(verifying_key.as_bytes());
+    let payload = build_from_sign_payload(
+        FROM,
+        NOW,
+        "POST",
+        "/api/triggers/fire",
+        &hash_body(Some(body)),
+    );
+    let signature = signing_key.sign(payload.as_bytes());
+    let signature_hex = hex_lower(&signature.to_bytes());
+    let pins = Arc::new(Mutex::new(Ed25519TofuStore::default()));
+
+    let decision = maw_auth::verify_request(&RequestAuthParts {
+        method: "POST".to_owned(),
+        path: "/triggers/fire".to_owned(),
+        headers: Headers::new([
+            ("x-maw-from", FROM),
+            ("x-maw-ed25519-signature", signature_hex.as_str()),
+            ("x-maw-ed25519-pubkey", pubkey_hex.as_str()),
+            ("x-maw-timestamp", &NOW.to_string()),
+            ("x-maw-auth-version", "ed25519"),
+        ]),
+        body: Some(body.to_vec()),
+        peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+        workspace_key: None,
+        cached_pubkey: None,
+        ed25519_pins: Some(pins),
+        now: NOW,
+    });
+    assert_eq!(
+        decision,
+        maw_auth::RequestAuthDecision::Accept {
+            who: format!("ed25519:{FROM}")
+        }
+    );
 }
 
 #[test]
