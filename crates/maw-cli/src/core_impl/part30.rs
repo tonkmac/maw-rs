@@ -19,6 +19,9 @@ use std::net::Ipv4Addr;
 
 const DEFAULT_SERVE_PORT: u16 = 3456;
 const DEFAULT_SERVE_BIND: &str = "0.0.0.0";
+const SERVE_FEED_MAX: usize = 200;
+const SERVE_LOG_TEXT_MAX: usize = 2_000;
+const SERVE_LOG_ERROR_MAX: usize = 1_000;
 #[cfg(test)]
 const NON_LOOPBACK_TEST_PEER: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 49_152);
@@ -29,6 +32,8 @@ struct ServeState {
     workspace_key: Option<String>,
     workspaces: Mutex<WorkspaceStore>,
     requests: Mutex<RequestReplyStore>,
+    delivery: Arc<dyn ServeDelivery>,
+    feed: Mutex<Vec<Value>>,
     #[cfg(test)]
     peer_addr_override: Option<SocketAddr>,
     #[cfg(test)]
@@ -36,6 +41,32 @@ struct ServeState {
     #[cfg(test)]
     serve_core_state_override: Option<crate::serve_core::ServecoreSharedState>,
     trust_store_path: std::path::PathBuf,
+}
+
+trait ServeDelivery: Send + Sync {
+    fn route_sessions(&self) -> Result<Vec<RouteSession>, String>;
+    fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String>;
+    fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String>;
+}
+
+struct ServeSystemDelivery;
+
+impl ServeDelivery for ServeSystemDelivery {
+    fn route_sessions(&self) -> Result<Vec<RouteSession>, String> {
+        let mut tmux = TmuxClient::local();
+        Ok(route_sessions_from_tmux(&mut tmux))
+    }
+
+    fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String> {
+        let mut tmux = TmuxClient::local();
+        tmux.send_keys_literal(target, text).map_err(|error| error.to_string())?;
+        tmux.send_enter(target).map_err(|error| error.to_string())
+    }
+
+    fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {
+        let mut tmux = TmuxClient::local();
+        tmux.capture(target, Some(lines)).map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +122,8 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         workspace_key: load_serve_workspace_key(),
         workspaces: Mutex::new(WorkspaceStore::default()),
         requests: Mutex::new(RequestReplyStore::default()),
+        delivery: Arc::new(ServeSystemDelivery),
+        feed: Mutex::new(Vec::new()),
         #[cfg(test)]
         peer_addr_override: None,
         #[cfg(test)]
@@ -273,23 +306,321 @@ async fn api_send(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(response) = verify_protected_request(&state, peer, &method, &uri, &headers, &body) {
-        response
-    } else {
-        let parsed = serde_json::from_slice::<SendBody>(&body).unwrap_or_default();
-        Json(json!({
-            "ok": true,
-            "target": parsed.target.unwrap_or_else(|| "unknown".to_owned()),
-            "text": parsed.text.unwrap_or_default(),
-            "source": "maw-rs",
-            "state": "queued"
-        }))
-        .into_response()
+    match verify_protected_request_outcome(&state, peer, &method, &uri, &headers, &body) {
+        ProtectedRequestOutcome::Accept => serve_deliver_send(&state, &headers, &body),
+        ProtectedRequestOutcome::Reject { decision, response } => {
+            serve_log_lifecycle(
+                &state,
+                json!({
+                    "kind": "message",
+                    "direction": "inbound",
+                    "state": "failed",
+                    "event": "auth-reject",
+                    "decision": serve_truncate(&decision, SERVE_LOG_ERROR_MAX),
+                    "route": "auth",
+                    "source": "serve",
+                }),
+            );
+            response
+        }
     }
 }
 
-async fn api_feed_get() -> impl IntoResponse {
-    Json(json!({"events": [], "total": 0, "active_oracles": []}))
+async fn api_feed_get(
+    State(state): State<Arc<ServeState>>,
+    Query(query): Query<FeedQuery>,
+) -> impl IntoResponse {
+    let events = serve_feed_snapshot(&state, query.limit);
+    let mut active_oracles = Vec::<String>::new();
+    for event in &events {
+        if let Some(oracle) = event.get("oracle").and_then(Value::as_str) {
+            if !active_oracles.iter().any(|item| item == oracle) {
+                active_oracles.push(oracle.to_owned());
+            }
+        }
+    }
+    Json(json!({"events": events, "total": events.len(), "active_oracles": active_oracles}))
+}
+
+
+fn serve_deliver_send(
+    state: &ServeState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> axum::response::Response {
+    let parsed = serde_json::from_slice::<SendBody>(body).unwrap_or_default();
+    let target = parsed.target.clone().unwrap_or_default();
+    let message = serve_send_message(&parsed);
+    let raw_from = header_to_string(headers, "x-maw-from");
+    let from = (!raw_from.trim().is_empty()).then_some(raw_from);
+    let config = load_hey_config();
+    let log_from = from.clone().unwrap_or_else(|| serve_local_identity(&config));
+    let log_to = serve_local_identity(&config);
+
+    if target.trim().is_empty() {
+        serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, "empty-target", "validate");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "empty-target", "state": "failed"})),
+        )
+            .into_response();
+    }
+
+    if parsed.inbox.unwrap_or(false) {
+        serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, "receiver-inbox-not-yet-native", "inbox");
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "ok": false,
+                "error": "receiver-inbox-not-yet-native",
+                "target": target,
+                "state": "failed"
+            })),
+        )
+            .into_response();
+    }
+
+    let sessions = match state.delivery.route_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, &error, "route-list");
+            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", &target, &error);
+        }
+    };
+
+    match resolve_route_target(&target, &config.route, &sessions) {
+        RouteResult::Local { target: resolved } | RouteResult::SelfNode { target: resolved } => {
+            let context = ServeDeliverContext {
+                config: &config,
+                from: from.as_deref(),
+                log_from: &log_from,
+                log_to: &log_to,
+                requested: &target,
+                resolved: &resolved,
+                message: &message,
+            };
+            serve_deliver_local(state, &context)
+        }
+        RouteResult::Peer { node, .. } => {
+            let error = format!("peer-forward-unavailable:{node}");
+            serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, &error, "peer-forward");
+            serve_delivery_error(StatusCode::BAD_GATEWAY, "peer-forward-unavailable", &target, &error)
+        }
+        RouteResult::Error { reason, detail, .. } => {
+            let error = format!("{reason}: {detail}");
+            serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, &error, "resolve");
+            serve_delivery_error(StatusCode::NOT_FOUND, &reason, &target, &detail)
+        }
+    }
+}
+
+struct ServeDeliverContext<'a> {
+    config: &'a HeyConfig,
+    from: Option<&'a str>,
+    log_from: &'a str,
+    log_to: &'a str,
+    requested: &'a str,
+    resolved: &'a str,
+    message: &'a str,
+}
+
+fn serve_deliver_local(
+    state: &ServeState,
+    context: &ServeDeliverContext<'_>,
+) -> axum::response::Response {
+    let fresh_sessions = match state.delivery.route_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou-list");
+            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", context.requested, &error);
+        }
+    };
+    if !serve_resolved_target_exists(&fresh_sessions, context.resolved) {
+        let error = format!("target disappeared before delivery: {}", context.resolved);
+        serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou");
+        return serve_delivery_error(StatusCode::NOT_FOUND, "target-disappeared", context.requested, &error);
+    }
+
+    let outbound = format_local_hey_message(context.message, context.config, context.from);
+    if let Err(error) = state.delivery.send_literal_enter(context.resolved, &outbound) {
+        serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "tmux-send");
+        return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-send-failed", context.resolved, &error);
+    }
+
+    let capture = state.delivery.capture_tail(context.resolved, 8).unwrap_or_default();
+    let state_name = if capture.contains("Press up to edit queued messages") {
+        "queued"
+    } else {
+        "delivered"
+    };
+    let last_line = serve_last_nonempty_line(&capture);
+    serve_log_lifecycle(
+        state,
+        json!({
+            "kind": "context.message",
+            "direction": "inbound",
+            "state": state_name,
+            "route": "local",
+            "context.from": serve_truncate(context.log_from, SERVE_LOG_TEXT_MAX),
+            "to": serve_truncate(context.log_to, SERVE_LOG_TEXT_MAX),
+            "target": context.resolved,
+            "requestedTarget": context.requested,
+            "text": serve_truncate(context.message, SERVE_LOG_TEXT_MAX),
+            "oracle": serve_oracle_from_target(context.requested),
+            "lastLine": serve_truncate(&last_line, SERVE_LOG_TEXT_MAX),
+            "source": "maw-rs-native",
+        }),
+    );
+    Json(json!({
+        "ok": true,
+        "target": context.resolved,
+        "text": context.message,
+        "source": "maw-rs",
+        "state": state_name,
+        "lastLine": last_line,
+    }))
+    .into_response()
+}
+
+fn serve_delivery_error(
+    status: StatusCode,
+    error: &str,
+    target: &str,
+    detail: &str,
+) -> axum::response::Response {
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "error": error,
+            "target": target,
+            "detail": serve_truncate(detail, SERVE_LOG_ERROR_MAX),
+            "state": "failed"
+        })),
+    )
+        .into_response()
+}
+
+fn serve_log_delivery_failed(
+    state: &ServeState,
+    target: &str,
+    message: &str,
+    from: &str,
+    to: &str,
+    error: &str,
+    route: &str,
+) {
+    serve_log_lifecycle(
+        state,
+        json!({
+            "kind": "message",
+            "direction": "inbound",
+            "state": "failed",
+            "route": route,
+            "from": serve_truncate(from, SERVE_LOG_TEXT_MAX),
+            "to": serve_truncate(to, SERVE_LOG_TEXT_MAX),
+            "target": target,
+            "text": serve_truncate(message, SERVE_LOG_TEXT_MAX),
+            "oracle": serve_oracle_from_target(target),
+            "error": serve_truncate(error, SERVE_LOG_ERROR_MAX),
+            "source": "maw-rs-native",
+        }),
+    );
+}
+
+fn serve_log_lifecycle(state: &ServeState, event: Value) {
+    match state.feed.lock() {
+        Ok(mut feed) => serve_push_feed_event(&mut feed, event),
+        Err(poisoned) => {
+            let mut feed = poisoned.into_inner();
+            serve_push_feed_event(&mut feed, event);
+        }
+    }
+}
+
+fn serve_push_feed_event(feed: &mut Vec<Value>, mut event: Value) {
+    if let Value::Object(map) = &mut event {
+        map.insert("timestamp".to_owned(), json!(unix_seconds()));
+    }
+    feed.push(event);
+    if feed.len() > SERVE_FEED_MAX {
+        let drain = feed.len() - SERVE_FEED_MAX;
+        feed.drain(0..drain);
+    }
+}
+
+fn serve_feed_snapshot(state: &ServeState, limit: Option<usize>) -> Vec<Value> {
+    let events = match state.feed.lock() {
+        Ok(feed) => feed.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(limit) = limit {
+        let start = events.len().saturating_sub(limit);
+        events[start..].to_vec()
+    } else {
+        events
+    }
+}
+
+fn serve_send_message(body: &SendBody) -> String {
+    let text = body.text.clone().unwrap_or_default();
+    match &body.attachments {
+        Some(attachments) if !attachments.is_empty() => {
+            let mut parts = attachments.clone();
+            parts.push(text);
+            parts.join("\n")
+        }
+        _ => text,
+    }
+}
+
+fn serve_resolved_target_exists(sessions: &[RouteSession], target: &str) -> bool {
+    if target.starts_with('%') {
+        return false;
+    }
+    let (session_name, window_part) = target.split_once(':').unwrap_or((target, ""));
+    let Some(session) = sessions.iter().find(|session| session.name == session_name) else {
+        return false;
+    };
+    if window_part.is_empty() {
+        return true;
+    }
+    let window_part = window_part.split('.').next().unwrap_or(window_part);
+    session.windows.iter().any(|window| {
+        window.index.to_string() == window_part || window.name.eq_ignore_ascii_case(window_part)
+    })
+}
+
+fn serve_last_nonempty_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim_end()
+        .to_owned()
+}
+
+fn serve_truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut out = value.chars().take(max.saturating_sub(1)).collect::<String>();
+    out.push('…');
+    out
+}
+
+fn serve_local_identity(config: &HeyConfig) -> String {
+    let node = config.node.as_deref().unwrap_or("local");
+    let oracle = config.oracle.as_deref().unwrap_or(DEFAULT_ORACLE);
+    format!("{node}:{oracle}")
+}
+
+fn serve_oracle_from_target(target: &str) -> String {
+    target
+        .split([':', '.'])
+        .next()
+        .unwrap_or(target)
+        .to_owned()
 }
 
 async fn api_feed_post(
@@ -388,9 +719,31 @@ async fn api_health() -> impl IntoResponse {
     Json(json!({"ok": true, "source": "maw-rs", "server": "local", "port": DEFAULT_SERVE_PORT}))
 }
 
-async fn api_message_ledger(Query(query): Query<MessageLedgerQuery>) -> impl IntoResponse {
-    let _ = (query.limit, query.from, query.to, query.direction, query.state, query.q, query.json);
-    Json(json!({"ok": true, "messages": [], "total": 0, "source": "maw-rs-native"}))
+async fn api_message_ledger(
+    State(state): State<Arc<ServeState>>,
+    Query(query): Query<MessageLedgerQuery>,
+) -> impl IntoResponse {
+    let _ = query.json;
+    let mut messages = serve_feed_snapshot(&state, None)
+        .into_iter()
+        .filter(|event| event.get("kind").and_then(Value::as_str) == Some("message"))
+        .filter(|event| query.from.as_ref().is_none_or(|from| event.get("from").and_then(Value::as_str) == Some(from.as_str())))
+        .filter(|event| query.to.as_ref().is_none_or(|to| event.get("to").and_then(Value::as_str) == Some(to.as_str())))
+        .filter(|event| query.direction.as_ref().is_none_or(|direction| event.get("direction").and_then(Value::as_str) == Some(direction.as_str())))
+        .filter(|event| query.state.as_ref().is_none_or(|state| event.get("state").and_then(Value::as_str) == Some(state.as_str())))
+        .filter(|event| {
+            query.q.as_ref().is_none_or(|q| {
+                let haystack = event.to_string().to_lowercase();
+                haystack.contains(&q.to_lowercase())
+            })
+        })
+        .collect::<Vec<_>>();
+    let total = messages.len();
+    if let Some(limit) = query.limit {
+        let start = messages.len().saturating_sub(limit);
+        messages = messages[start..].to_vec();
+    }
+    Json(json!({"ok": true, "messages": messages, "total": total, "source": "maw-rs-native"}))
 }
 
 async fn api_requests(
@@ -694,20 +1047,45 @@ fn verify_protected_request(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Option<axum::response::Response> {
+    match verify_protected_request_outcome(state, peer, method, uri, headers, body) {
+        ProtectedRequestOutcome::Accept => None,
+        ProtectedRequestOutcome::Reject { response, .. } => Some(response),
+    }
+}
+
+enum ProtectedRequestOutcome {
+    Accept,
+    Reject {
+        decision: String,
+        response: axum::response::Response,
+    },
+}
+
+fn verify_protected_request_outcome(
+    state: &ServeState,
+    peer: SocketAddr,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> ProtectedRequestOutcome {
     let effective_peer = effective_peer_addr(state, peer);
     if maw_auth::is_loopback(Some(&effective_peer.ip().to_string())) {
-        return None;
+        return ProtectedRequestOutcome::Accept;
     }
     let now = verify_now(state);
     let auth_headers = extract_auth_headers(headers);
     let cached_pubkey = match resolve_request_cached_pubkey(state, &auth_headers) {
         Ok(pubkey) => pubkey,
         Err(decision) => {
-            return Some((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "unauthorized", "decision": decision})),
-            )
-                .into_response());
+            return ProtectedRequestOutcome::Reject {
+                decision: decision.to_string(),
+                response: (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "unauthorized", "decision": decision})),
+                )
+                    .into_response(),
+            };
         }
     };
     let decision = verify_request(&VerifyRequestArgs {
@@ -719,13 +1097,17 @@ fn verify_protected_request(
         now,
     });
     if maw_auth::is_refuse_decision(&decision) {
-        return Some((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized", "decision": decision.kind()})),
-        )
-            .into_response());
+        let kind = decision.kind().to_owned();
+        return ProtectedRequestOutcome::Reject {
+            decision: kind.clone(),
+            response: (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized", "decision": kind})),
+            )
+                .into_response(),
+        };
     }
-    None
+    ProtectedRequestOutcome::Accept
 }
 
 #[cfg(test)]
@@ -1057,6 +1439,13 @@ fn normalize_from_identity(value: &str) -> Option<String> {
 struct SendBody {
     target: Option<String>,
     text: Option<String>,
+    inbox: Option<bool>,
+    attachments: Option<Vec<String>>,
+}
+
+#[derive(Default, Deserialize)]
+struct FeedQuery {
+    limit: Option<usize>,
 }
 
 #[derive(Default)]
@@ -1284,6 +1673,93 @@ mod serve_tests {
     const KEY: &str = "test-peer-key-0123456789";
     const FROM: &str = "sender-oracle:sender-node";
 
+    #[derive(Default)]
+    struct FakeServeDelivery {
+        sessions: Mutex<Vec<Vec<RouteSession>>>,
+        sends: Mutex<Vec<(String, String)>>,
+        captures: Mutex<HashMap<String, String>>,
+        send_error: Mutex<Option<String>>,
+        list_error: Mutex<Option<String>>,
+    }
+
+    impl FakeServeDelivery {
+        fn with_capture_agent() -> Self {
+            let fake = Self::default();
+            fake.set_sessions(vec![vec![
+                serve_test_session("capture-agent", 0, "capture-agent"),
+                serve_test_session("remote-oracle", 0, "remote-oracle"),
+            ]]);
+            fake.set_capture("capture-agent:0", "[capture] delivered\n");
+            fake.set_capture("remote-oracle:0", "[capture] delivered\n");
+            fake
+        }
+
+        fn set_sessions(&self, sessions: Vec<Vec<RouteSession>>) {
+            *self.sessions.lock().expect("sessions") = sessions;
+        }
+
+        fn set_capture(&self, target: &str, capture: &str) {
+            self.captures
+                .lock()
+                .expect("captures")
+                .insert(target.to_owned(), capture.to_owned());
+        }
+
+        fn sends(&self) -> Vec<(String, String)> {
+            self.sends.lock().expect("sends").clone()
+        }
+    }
+
+    impl ServeDelivery for FakeServeDelivery {
+        fn route_sessions(&self) -> Result<Vec<RouteSession>, String> {
+            if let Some(error) = self.list_error.lock().expect("list error").clone() {
+                return Err(error);
+            }
+            let mut sessions = self.sessions.lock().expect("sessions");
+            if sessions.len() > 1 {
+                return Ok(sessions.remove(0));
+            }
+            Ok(sessions.first().cloned().unwrap_or_default())
+        }
+
+        fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String> {
+            if let Some(error) = self.send_error.lock().expect("send error").clone() {
+                return Err(error);
+            }
+            self.sends
+                .lock()
+                .expect("sends")
+                .push((target.to_owned(), text.to_owned()));
+            Ok(())
+        }
+
+        fn capture_tail(&self, target: &str, _lines: u32) -> Result<String, String> {
+            Ok(self
+                .captures
+                .lock()
+                .expect("captures")
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| "[capture] delivered\n".to_owned()))
+        }
+    }
+
+    fn serve_test_session(name: &str, index: u32, window: &str) -> RouteSession {
+        RouteSession {
+            name: name.to_owned(),
+            source: None,
+            windows: vec![RouteWindow {
+                index,
+                name: window.to_owned(),
+                active: true,
+            }],
+        }
+    }
+
+    fn serve_test_delivery() -> Arc<dyn ServeDelivery> {
+        Arc::new(FakeServeDelivery::with_capture_agent())
+    }
+
 
     fn serve_test_trust_store_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1300,6 +1776,8 @@ mod serve_tests {
             workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
+            delivery: serve_test_delivery(),
+            feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
             serve_core_state_override: None,
@@ -1354,12 +1832,23 @@ mod serve_tests {
         now: i64,
         peer_addr_override: Option<SocketAddr>,
     ) -> Router {
+        serve_test_app_with_o6_keys_and_delivery(keys, now, peer_addr_override, serve_test_delivery())
+    }
+
+    fn serve_test_app_with_o6_keys_and_delivery(
+        keys: Vec<ServePeerPubkey>,
+        now: i64,
+        peer_addr_override: Option<SocketAddr>,
+        delivery: Arc<dyn ServeDelivery>,
+    ) -> Router {
         serve_router(ServeState {
             cached_pubkey: None,
             peer_pubkeys: keys,
             workspace_key: Some("capture-test-token-393av2".to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
+            delivery,
+            feed: Mutex::new(Vec::new()),
             peer_addr_override,
             now_override: Some(now),
             serve_core_state_override: None,
@@ -1442,8 +1931,8 @@ mod serve_tests {
         let payload = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         assert_eq!(payload["ok"], true);
-        assert_eq!(payload["state"], "queued");
-        assert_eq!(payload["target"], "capture-agent");
+        assert_eq!(payload["state"], "delivered");
+        assert_eq!(payload["target"], "capture-agent:0");
     }
 
     #[tokio::test]
@@ -1512,7 +2001,91 @@ mod serve_tests {
         let status = response.status();
         let payload = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{payload}");
-        assert_eq!(payload["state"], "queued");
+        assert_eq!(payload["state"], "delivered");
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_inbox_true_returns_501_without_tmux_send() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![ServePeerPubkey {
+                from: FROM.to_owned(),
+                pubkey: KEY.to_owned(),
+            }],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"hello","inbox":true}"#;
+        let response = app
+            .clone()
+            .oneshot(signed_json_request("POST", "/api/send", body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("inbox response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{payload}");
+        assert_eq!(payload["state"], "failed");
+        assert_eq!(payload["error"], "receiver-inbox-not-yet-native");
+        assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_toctou_refuses_disappeared_target_before_send() {
+        let delivery = Arc::new(FakeServeDelivery::default());
+        delivery.set_sessions(vec![
+            vec![serve_test_session("capture-agent", 0, "capture-agent")],
+            Vec::new(),
+        ]);
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            Vec::new(),
+            1_782_553_858,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_152)),
+            delivery.clone(),
+        );
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+        assert_eq!(payload["error"], "target-disappeared");
+        assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_auth_reject_is_logged_without_delivery() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![ServePeerPubkey {
+                from: "other-oracle:other-node".to_owned(),
+                pubkey: "wrong-first-peer-key".to_owned(),
+            }],
+            1_782_553_858,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let rejected = app
+            .clone()
+            .oneshot(captured_send_request())
+            .await
+            .expect("captured send response");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let feed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/feed")
+                    .body(Body::empty())
+                    .expect("feed request"),
+            )
+            .await
+            .expect("feed");
+        let payload = response_json(feed).await;
+        assert_eq!(payload["events"][0]["state"], "failed");
+        assert_eq!(payload["events"][0]["decision"], "refuse-missing-peer-key");
+        assert!(delivery.sends().is_empty());
     }
 
     #[tokio::test]
@@ -1553,6 +2126,8 @@ mod serve_tests {
             workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
+            delivery: serve_test_delivery(),
+            feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
             serve_core_state_override: None,
@@ -1578,7 +2153,7 @@ mod serve_tests {
         let addr = spawn_test_server().await;
         let client = reqwest::Client::builder().build().expect("client");
         let url = format!("http://{addr}/api/send");
-        let body = r#"{"target":"remote-oracle","text":"hello","inbox":true}"#;
+        let body = r#"{"target":"remote-oracle","text":"hello"}"#;
         let timestamp = 1_782_277_200_i64;
         let headers = sign_headers_v3_at(
             KEY,
@@ -1600,7 +2175,7 @@ mod serve_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response.json::<Value>().await.expect("json");
         assert_eq!(payload["ok"], true);
-        assert_eq!(payload["state"], "queued");
+        assert_eq!(payload["state"], "delivered");
 
         let response = client
             .post(&url)
@@ -1824,6 +2399,8 @@ mod serve_tests {
             workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
+            delivery: serve_test_delivery(),
+            feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
             serve_core_state_override: Some(fake_core),
