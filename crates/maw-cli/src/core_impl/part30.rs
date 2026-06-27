@@ -390,7 +390,16 @@ fn serve_deliver_send(
 
     match resolve_route_target(&target, &config.route, &sessions) {
         RouteResult::Local { target: resolved } | RouteResult::SelfNode { target: resolved } => {
-            serve_deliver_local(state, &config, from.as_deref(), &log_from, &log_to, &target, &resolved, &message)
+            let context = ServeDeliverContext {
+                config: &config,
+                from: from.as_deref(),
+                log_from: &log_from,
+                log_to: &log_to,
+                requested: &target,
+                resolved: &resolved,
+                message: &message,
+            };
+            serve_deliver_local(state, &context)
         }
         RouteResult::Peer { node, .. } => {
             let error = format!("peer-forward-unavailable:{node}");
@@ -405,36 +414,40 @@ fn serve_deliver_send(
     }
 }
 
+struct ServeDeliverContext<'a> {
+    config: &'a HeyConfig,
+    from: Option<&'a str>,
+    log_from: &'a str,
+    log_to: &'a str,
+    requested: &'a str,
+    resolved: &'a str,
+    message: &'a str,
+}
+
 fn serve_deliver_local(
     state: &ServeState,
-    config: &HeyConfig,
-    from: Option<&str>,
-    log_from: &str,
-    log_to: &str,
-    requested: &str,
-    resolved: &str,
-    message: &str,
+    context: &ServeDeliverContext<'_>,
 ) -> axum::response::Response {
     let fresh_sessions = match state.delivery.route_sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
-            serve_log_delivery_failed(state, requested, message, log_from, log_to, &error, "toctou-list");
-            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", requested, &error);
+            serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou-list");
+            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", context.requested, &error);
         }
     };
-    if !serve_resolved_target_exists(&fresh_sessions, resolved) {
-        let error = format!("target disappeared before delivery: {resolved}");
-        serve_log_delivery_failed(state, requested, message, log_from, log_to, &error, "toctou");
-        return serve_delivery_error(StatusCode::NOT_FOUND, "target-disappeared", requested, &error);
+    if !serve_resolved_target_exists(&fresh_sessions, context.resolved) {
+        let error = format!("target disappeared before delivery: {}", context.resolved);
+        serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou");
+        return serve_delivery_error(StatusCode::NOT_FOUND, "target-disappeared", context.requested, &error);
     }
 
-    let outbound = format_local_hey_message(message, config, from);
-    if let Err(error) = state.delivery.send_literal_enter(resolved, &outbound) {
-        serve_log_delivery_failed(state, requested, message, log_from, log_to, &error, "tmux-send");
-        return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-send-failed", resolved, &error);
+    let outbound = format_local_hey_message(context.message, context.config, context.from);
+    if let Err(error) = state.delivery.send_literal_enter(context.resolved, &outbound) {
+        serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "tmux-send");
+        return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-send-failed", context.resolved, &error);
     }
 
-    let capture = state.delivery.capture_tail(resolved, 8).unwrap_or_default();
+    let capture = state.delivery.capture_tail(context.resolved, 8).unwrap_or_default();
     let state_name = if capture.contains("Press up to edit queued messages") {
         "queued"
     } else {
@@ -444,24 +457,24 @@ fn serve_deliver_local(
     serve_log_lifecycle(
         state,
         json!({
-            "kind": "message",
+            "kind": "context.message",
             "direction": "inbound",
             "state": state_name,
             "route": "local",
-            "from": serve_truncate(log_from, SERVE_LOG_TEXT_MAX),
-            "to": serve_truncate(log_to, SERVE_LOG_TEXT_MAX),
-            "target": resolved,
-            "requestedTarget": requested,
-            "text": serve_truncate(message, SERVE_LOG_TEXT_MAX),
-            "oracle": serve_oracle_from_target(requested),
+            "context.from": serve_truncate(context.log_from, SERVE_LOG_TEXT_MAX),
+            "to": serve_truncate(context.log_to, SERVE_LOG_TEXT_MAX),
+            "target": context.resolved,
+            "requestedTarget": context.requested,
+            "text": serve_truncate(context.message, SERVE_LOG_TEXT_MAX),
+            "oracle": serve_oracle_from_target(context.requested),
             "lastLine": serve_truncate(&last_line, SERVE_LOG_TEXT_MAX),
             "source": "maw-rs-native",
         }),
     );
     Json(json!({
         "ok": true,
-        "target": resolved,
-        "text": message,
+        "target": context.resolved,
+        "text": context.message,
         "source": "maw-rs",
         "state": state_name,
         "lastLine": last_line,
