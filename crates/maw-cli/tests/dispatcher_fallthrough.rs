@@ -12,8 +12,14 @@ fn env_lock() -> &'static Mutex<()> {
 
 struct EnvRestore {
     maw_from_rs: Option<OsString>,
+    home: Option<OsString>,
+    maw_home: Option<OsString>,
     maw_plugins_dir: Option<OsString>,
     maw_rs_hey_fallback: Option<OsString>,
+    maw_rs_notify_fallback: Option<OsString>,
+    maw_rs_send_fallback: Option<OsString>,
+    maw_rs_talkto_fallback: Option<OsString>,
+    maw_rs_talkto_no_thread: Option<OsString>,
     path: Option<OsString>,
 }
 
@@ -21,8 +27,14 @@ impl EnvRestore {
     fn capture() -> Self {
         Self {
             maw_from_rs: std::env::var_os("MAW_FROM_RS"),
+            home: std::env::var_os("HOME"),
+            maw_home: std::env::var_os("MAW_HOME"),
             maw_plugins_dir: std::env::var_os("MAW_PLUGINS_DIR"),
             maw_rs_hey_fallback: std::env::var_os("MAW_RS_HEY_FALLBACK"),
+            maw_rs_notify_fallback: std::env::var_os("MAW_RS_NOTIFY_FALLBACK"),
+            maw_rs_send_fallback: std::env::var_os("MAW_RS_SEND_FALLBACK"),
+            maw_rs_talkto_fallback: std::env::var_os("MAW_RS_TALKTO_FALLBACK"),
+            maw_rs_talkto_no_thread: std::env::var_os("MAW_RS_TALKTO_NO_THREAD"),
             path: std::env::var_os("PATH"),
         }
     }
@@ -31,8 +43,17 @@ impl EnvRestore {
 impl Drop for EnvRestore {
     fn drop(&mut self) {
         restore_env("MAW_FROM_RS", self.maw_from_rs.take());
+        restore_env("HOME", self.home.take());
+        restore_env("MAW_HOME", self.maw_home.take());
         restore_env("MAW_PLUGINS_DIR", self.maw_plugins_dir.take());
         restore_env("MAW_RS_HEY_FALLBACK", self.maw_rs_hey_fallback.take());
+        restore_env("MAW_RS_NOTIFY_FALLBACK", self.maw_rs_notify_fallback.take());
+        restore_env("MAW_RS_SEND_FALLBACK", self.maw_rs_send_fallback.take());
+        restore_env("MAW_RS_TALKTO_FALLBACK", self.maw_rs_talkto_fallback.take());
+        restore_env(
+            "MAW_RS_TALKTO_NO_THREAD",
+            self.maw_rs_talkto_no_thread.take(),
+        );
         restore_env("PATH", self.path.take());
     }
 }
@@ -174,27 +195,69 @@ fn unknown_command_is_native_error_and_never_invokes_path_maw() {
 }
 
 #[test]
-fn hey_can_still_fall_through_to_maw_when_safety_env_is_set() {
+fn env_fallback_hatches_are_ignored_and_never_invoke_path_maw() {
     let _guard = env_lock().lock().expect("env lock");
     let _restore = EnvRestore::capture();
-    let root = temp_dir("fallback");
+    let root = temp_dir("fallback-hatches-removed");
     let bin_dir = root.join("bin");
     let plugins_dir = root.join("plugins");
+    let home_dir = root.join("home");
+    let maw_home = root.join("maw-home");
     create_dir_all(&bin_dir).expect("bin dir");
     create_dir_all(&plugins_dir).expect("plugins dir");
+    create_dir_all(&home_dir).expect("home dir");
+    create_dir_all(&maw_home).expect("maw home dir");
     write_maw_shim(&bin_dir, 37);
+    write_tool_shim(&bin_dir, "bun", "#!/bin/sh\necho DELEGATED-BUN\nexit 37\n");
+    write_tool_shim(&bin_dir, "tmux", "#!/bin/sh\necho FAKE-TMUX >&2\nexit 1\n");
     std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("HOME", &home_dir);
+    std::env::set_var("MAW_HOME", &maw_home);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
     std::env::remove_var("MAW_FROM_RS");
     std::env::set_var("MAW_RS_HEY_FALLBACK", "1");
+    std::env::set_var("MAW_RS_SEND_FALLBACK", "1");
+    std::env::set_var("MAW_RS_NOTIFY_FALLBACK", "1");
+    std::env::set_var("MAW_RS_TALKTO_FALLBACK", "1");
+    std::env::set_var("MAW_RS_TALKTO_NO_THREAD", "1");
 
-    let output = run_cli(&args(&["hey", "local:nova:claude", "ping"]));
-
-    assert_eq!(output.code, 37, "{}", output.stderr);
-    assert!(output.stderr.is_empty(), "{}", output.stderr);
+    let mut proof = String::new();
+    for (command, argv) in [
+        ("hey", args(&["hey", "ghost", "ping"])),
+        ("send", args(&["send", "ghost", "ping"])),
+        ("notify", args(&["notify", "ghost", "ping"])),
+        ("talk-to", args(&["talk-to", "ghost", "ping"])),
+    ] {
+        let output = run_cli(&argv);
+        assert_ne!(output.code, 37, "{argv:?} delegated to fake maw/bun");
+        assert!(
+            output.stdout.is_empty(),
+            "{argv:?} stdout={}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("DELEGATED-MAW") && !output.stderr.contains("DELEGATED-MAW"),
+            "{argv:?} stdout={} stderr={}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !output.stdout.contains("DELEGATED-BUN") && !output.stderr.contains("DELEGATED-BUN"),
+            "{argv:?} stdout={} stderr={}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !output.stderr.contains("failed to run maw fallback"),
+            "{argv:?} stderr={}",
+            output.stderr
+        );
+        proof.push_str(command);
+        proof.push_str(" env fallback ignored: native/fail-closed\n");
+    }
     assert_eq!(
-        output.stdout,
-        "DELEGATED-MAW\nMAW_FROM_RS=1\nargs=hey local:nova:claude ping\n"
+        proof,
+        include_str!("fixtures/zero-bun/env-fallback-hatches-removed.stdout")
     );
 
     remove_dir_all(root).expect("cleanup");
@@ -382,26 +445,36 @@ async fn sync_async_handler_guard_refuses_to_block_inside_runtime() {
 }
 
 #[test]
-fn loop_guard_returns_unknown_command_instead_of_falling_through() {
+fn maw_from_rs_loop_guard_env_no_longer_reenables_hey_fallback() {
     let _guard = env_lock().lock().expect("env lock");
     let _restore = EnvRestore::capture();
-    let root = temp_dir("loop-guard");
+    let root = temp_dir("loop-guard-cutover");
     let bin_dir = root.join("bin");
     let plugins_dir = root.join("plugins");
+    let maw_home = root.join("maw-home");
     create_dir_all(&bin_dir).expect("bin dir");
     create_dir_all(&plugins_dir).expect("plugins dir");
+    create_dir_all(&maw_home).expect("maw home dir");
     write_maw_shim(&bin_dir, 37);
+    write_tool_shim(&bin_dir, "tmux", "#!/bin/sh\necho FAKE-TMUX >&2\nexit 1\n");
     std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_HOME", &maw_home);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
     std::env::set_var("MAW_FROM_RS", "1");
     std::env::set_var("MAW_RS_HEY_FALLBACK", "1");
 
-    let output = run_cli(&args(&["hey", "local:nova:claude", "ping"]));
+    let output = run_cli(&args(&["hey", "ghost", "ping"]));
 
-    assert_eq!(output.code, 2, "{}", output.stdout);
+    assert_ne!(output.code, 37, "delegated to fake maw");
     assert!(output.stdout.is_empty(), "{}", output.stdout);
     assert!(
-        output.stderr.contains("maw-rs: unknown command 'hey'"),
+        !output.stdout.contains("DELEGATED-MAW") && !output.stderr.contains("DELEGATED-MAW"),
+        "stdout={} stderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("failed to run maw fallback"),
         "{}",
         output.stderr
     );

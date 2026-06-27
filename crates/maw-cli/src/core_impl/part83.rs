@@ -10,11 +10,6 @@ fn run_notify_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput>
 }
 
 async fn notify_run_async_impl(raw_args: &[String]) -> CliOutput {
-    if std::env::var_os("MAW_RS_NOTIFY_FALLBACK").is_some() {
-        let mut fallback_argv = vec!["notify".to_owned()];
-        fallback_argv.extend(raw_args.iter().cloned());
-        return dispatch_bun_fallback(&fallback_argv, "notify");
-    }
     let args = match notify_parse_args(raw_args) {
         Ok(parsed) => parsed,
         Err(message) => return notify_usage_error(&message),
