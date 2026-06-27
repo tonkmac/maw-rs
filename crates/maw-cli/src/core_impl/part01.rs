@@ -432,6 +432,7 @@ fn dispatch_cli_plugin_or_unknown(argv: &[String], command: &str) -> CliOutput {
     dispatch_cli_plugin(argv).unwrap_or_else(|| unknown_command(command))
 }
 
+#[allow(dead_code)]
 fn dispatch_bun_fallback(argv: &[String], command: &str) -> CliOutput {
     if std::env::var_os("MAW_FROM_RS").is_some() {
         return unknown_command(command);
