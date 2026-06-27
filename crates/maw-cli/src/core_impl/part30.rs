@@ -1309,12 +1309,24 @@ fn resolve_request_cached_pubkey(
     let Some(from) = request_from_sign_sender(headers) else {
         return Ok(None);
     };
-    state
+    if let Some(entry) = state.peer_pubkeys.iter().find(|entry| entry.from == from) {
+        return Ok(Some(entry.pubkey.clone()));
+    }
+    let Some(node) = node_from_identity(&from) else {
+        return Err("refuse-missing-peer-key");
+    };
+    let mut node_matches = state
         .peer_pubkeys
         .iter()
-        .find(|entry| entry.from == from)
-        .map(|entry| Some(entry.pubkey.clone()))
-        .ok_or("refuse-missing-peer-key")
+        .filter(|entry| entry.node == node)
+        .filter(|entry| !entry.pubkey.trim().is_empty());
+    let Some(first) = node_matches.next() else {
+        return Err("refuse-missing-peer-key");
+    };
+    if node_matches.any(|entry| entry.pubkey != first.pubkey) {
+        return Err("refuse-ambiguous-peer-key");
+    }
+    Ok(Some(first.pubkey.clone()))
 }
 
 fn request_from_sign_sender(headers: &Headers) -> Option<String> {
