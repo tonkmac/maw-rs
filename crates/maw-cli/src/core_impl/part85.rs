@@ -26,11 +26,6 @@ fn run_talkto_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput>
 }
 
 async fn talkto_run_async_impl(raw_args: &[String]) -> CliOutput {
-    if std::env::var_os("MAW_RS_TALKTO_FALLBACK").is_some() {
-        let mut fallback_argv = vec!["talk-to".to_owned()];
-        fallback_argv.extend(raw_args.iter().cloned());
-        return dispatch_bun_fallback(&fallback_argv, "talk-to");
-    }
     let args = match talkto_parse_args(raw_args) {
         Ok(parsed) => parsed,
         Err(message) => return talkto_usage_error(&message),

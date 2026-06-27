@@ -35,13 +35,6 @@ fn run_wake_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> +
 }
 
 async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutput {
-    let fallback_env = format!("MAW_RS_{}_FALLBACK", command.to_ascii_uppercase());
-    if std::env::var_os(fallback_env).is_some() {
-        let mut fallback_argv = vec![command.to_owned()];
-        fallback_argv.extend(raw_args.iter().cloned());
-        return dispatch_bun_fallback(&fallback_argv, command);
-    }
-
     let send_args = match parse_send_args(command, raw_args) {
         Ok(parsed) => parsed,
         Err(message) => return send_usage_error(command, &message),
