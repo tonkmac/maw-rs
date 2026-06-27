@@ -456,11 +456,29 @@ async fn run_wake_async_impl(raw_args: &[String]) -> CliOutput {
             target,
             node: _,
         } => wake_peer_target(&peer_url, &target, &wake_args, &config).await,
-        RouteResult::Local { .. } | RouteResult::SelfNode { .. } | RouteResult::Error { .. } => {
-            let mut fallback_argv = vec!["wake".to_owned()];
-            fallback_argv.extend(raw_args.iter().cloned());
-            dispatch_bun_fallback(&fallback_argv, "wake")
+        RouteResult::Local { target } | RouteResult::SelfNode { target } => {
+            wake_fail_closed_local(&wake_args.target, &target)
         }
+        RouteResult::Error { detail, hint, .. } => wake_fail_closed_route_error(&detail, hint.as_deref()),
+    }
+}
+
+fn wake_fail_closed_local(query: &str, target: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "wake: native local wake is unavailable for '{query}' ({target}); refusing maw-js fallback\n"
+        ),
+    }
+}
+
+fn wake_fail_closed_route_error(detail: &str, hint: Option<&str>) -> CliOutput {
+    let suffix = hint.map_or_else(String::new, |hint| format!("; {hint}"));
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("wake: {detail}{suffix}; refusing maw-js fallback\n"),
     }
 }
 
