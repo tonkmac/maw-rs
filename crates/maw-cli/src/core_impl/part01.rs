@@ -432,30 +432,6 @@ fn dispatch_cli_plugin_or_unknown(argv: &[String], command: &str) -> CliOutput {
     dispatch_cli_plugin(argv).unwrap_or_else(|| unknown_command(command))
 }
 
-#[allow(dead_code)]
-fn dispatch_bun_fallback(argv: &[String], command: &str) -> CliOutput {
-    if std::env::var_os("MAW_FROM_RS").is_some() {
-        return unknown_command(command);
-    }
-
-    match std::process::Command::new("maw")
-        .args(argv)
-        .env("MAW_FROM_RS", "1")
-        .output()
-    {
-        Ok(out) => CliOutput {
-            code: out.status.code().unwrap_or(1),
-            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-        },
-        Err(error) => CliOutput {
-            code: 1,
-            stdout: String::new(),
-            stderr: format!("failed to run maw fallback: {error}\n"),
-        },
-    }
-}
-
 fn unknown_command(command: &str) -> CliOutput {
     CliOutput {
         code: 2,
