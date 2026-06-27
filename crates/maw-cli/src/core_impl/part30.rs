@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
+#[cfg(test)]
+use std::net::Ipv4Addr;
 
-const DEFAULT_SERVE_PORT: u16 = 31745;
-const DEFAULT_SERVE_BIND: &str = "127.0.0.1";
+const DEFAULT_SERVE_PORT: u16 = 3456;
+const DEFAULT_SERVE_BIND: &str = "0.0.0.0";
 #[cfg(test)]
 const NON_LOOPBACK_TEST_PEER: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 49_152);
@@ -51,14 +53,10 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         Ok(args) => args,
         Err(message) => return serve_usage_error(&message),
     };
-    if args.host != DEFAULT_SERVE_BIND {
-        return CliOutput {
-            code: 2,
-            stdout: String::new(),
-            stderr: "serve: native gateway binds 127.0.0.1 only; publish via nginx\n".to_owned(),
-        };
-    }
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
+    let addr = match resolve_serve_socket_addr(&args) {
+        Ok(addr) => addr,
+        Err(message) => return serve_usage_error(&message),
+    };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -174,13 +172,27 @@ fn serve_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{prefix}usage: maw-rs serve [--host 127.0.0.1] [--port <port>] [--cached-pubkey <key>] | maw-rs serve status|--status|stop\n"
+            "{prefix}usage: maw-rs serve [--host 0.0.0.0] [--port <port>] [--cached-pubkey <key>] | maw-rs serve status|--status|stop\n"
         ),
     }
 }
 
 fn default_bind_host() -> String {
     DEFAULT_SERVE_BIND.to_owned()
+}
+
+fn resolve_serve_socket_addr(args: &ServeArgs) -> Result<SocketAddr, String> {
+    if args.host.is_empty()
+        || args.host.starts_with('-')
+        || args.host.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("serve: --host must be an IP address".to_owned());
+    }
+    let host = args
+        .host
+        .parse::<IpAddr>()
+        .map_err(|_| "serve: --host must be an IP address".to_owned())?;
+    Ok(SocketAddr::new(host, args.port))
 }
 
 fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedState {
@@ -1341,11 +1353,54 @@ mod serve_tests {
     }
 
     #[test]
-    fn serve_default_bind_is_loopback_only() {
+    fn serve_default_bind_matches_maw_js_parity_and_ignores_maw_host() {
         let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = EnvVarRestore::capture("MAW_HOST");
-        std::env::set_var("MAW_HOST", "0.0.0.0");
-        assert_eq!(default_bind_host(), "127.0.0.1");
+        std::env::set_var("MAW_HOST", "127.0.0.1");
+        let args = parse_serve_args(&[]).expect("default serve args");
+        assert_eq!(args.host, "0.0.0.0");
+        assert_eq!(args.port, 3456);
+        assert_eq!(
+            resolve_serve_socket_addr(&args).expect("default bind"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3456)
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_host_port_override_resolves_and_binds_throwaway_loopback() {
+        let args = parse_serve_args(&[
+            "--host".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--port".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect("override serve args");
+        let addr = resolve_serve_socket_addr(&args).expect("override bind");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(addr.port(), 0);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("throwaway loopback bind");
+        assert_eq!(
+            listener.local_addr().expect("local addr").ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn serve_host_validation_rejects_injection_before_bind() {
+        for host in ["", "-0.0.0.0", "127.0.0.1\nx", "localhost"] {
+            let args = ServeArgs {
+                host: host.to_owned(),
+                port: 3456,
+                cached_pubkey: None,
+            };
+            assert_eq!(
+                resolve_serve_socket_addr(&args),
+                Err("serve: --host must be an IP address".to_owned()),
+                "host={host:?}"
+            );
+        }
     }
 
     #[tokio::test]
