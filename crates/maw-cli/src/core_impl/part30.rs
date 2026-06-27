@@ -79,6 +79,7 @@ struct ServeArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServePeerPubkey {
     from: String,
+    node: String,
     pubkey: String,
 }
 
@@ -1349,10 +1350,13 @@ fn collect_peer_pubkeys(value: &Value, key_hint: Option<&str>, entries: &mut Vec
         Value::Object(map) => {
             if let Some(pubkey) = object_pubkey(value) {
                 for from in object_from_identities(value, key_hint) {
-                    entries.push(ServePeerPubkey {
-                        from,
-                        pubkey: pubkey.clone(),
-                    });
+                    if let Some(node) = node_from_normalized_identity(&from) {
+                        entries.push(ServePeerPubkey {
+                            from,
+                            node,
+                            pubkey: pubkey.clone(),
+                        });
+                    }
                 }
             }
             for (key, child) in map {
@@ -1368,10 +1372,13 @@ fn collect_peer_pubkeys(value: &Value, key_hint: Option<&str>, entries: &mut Vec
             if let Some(from) = key_hint.and_then(normalize_from_identity) {
                 let pubkey = pubkey.trim();
                 if !pubkey.is_empty() {
-                    entries.push(ServePeerPubkey {
-                        from,
-                        pubkey: pubkey.to_owned(),
-                    });
+                    if let Some(node) = node_from_normalized_identity(&from) {
+                        entries.push(ServePeerPubkey {
+                            from,
+                            node,
+                            pubkey: pubkey.to_owned(),
+                        });
+                    }
                 }
             }
         }
@@ -1433,6 +1440,19 @@ fn normalize_from_identity(value: &str) -> Option<String> {
         return None;
     }
     Some(format!("{oracle}:{node}"))
+}
+
+fn node_from_normalized_identity(value: &str) -> Option<String> {
+    value
+        .split_once(':')
+        .map(|(_, node)| node)
+        .filter(|node| !node.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn node_from_identity(value: &str) -> Option<String> {
+    let normalized = normalize_from_identity(value)?;
+    node_from_normalized_identity(&normalized)
 }
 
 #[derive(Default, Deserialize)]
@@ -1760,6 +1780,13 @@ mod serve_tests {
         Arc::new(FakeServeDelivery::with_capture_agent())
     }
 
+    fn serve_test_peer_pubkey(from: &str, pubkey: &str) -> ServePeerPubkey {
+        ServePeerPubkey {
+            from: from.to_owned(),
+            node: node_from_identity(from).expect("peer identity node"),
+            pubkey: pubkey.to_owned(),
+        }
+    }
 
     fn serve_test_trust_store_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1865,13 +1892,10 @@ mod serve_tests {
 
     fn captured_send_key() -> ServePeerPubkey {
         let fixture = captured_send_fixture();
-        ServePeerPubkey {
-            from: fixture["headers"]["X-Maw-From"]
-                .as_str()
-                .expect("from")
-                .to_owned(),
-            pubkey: fixture["testPeerKey"].as_str().expect("peer key").to_owned(),
-        }
+        let from = fixture["headers"]["X-Maw-From"]
+            .as_str()
+            .expect("from");
+        serve_test_peer_pubkey(from, fixture["testPeerKey"].as_str().expect("peer key"))
     }
 
     fn captured_send_request() -> axum::http::Request<Body> {
@@ -1914,10 +1938,7 @@ mod serve_tests {
     async fn serve_o6_live_router_accepts_captured_maw_js_send_for_exact_from_key() {
         let app = serve_test_app_with_o6_keys(
             vec![
-                ServePeerPubkey {
-                    from: "other-oracle:other-node".to_owned(),
-                    pubkey: "wrong-first-peer-key".to_owned(),
-                },
+                serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key"),
                 captured_send_key(),
             ],
             1_782_553_858,
@@ -1938,10 +1959,7 @@ mod serve_tests {
     #[tokio::test]
     async fn serve_o6_live_router_rejects_captured_maw_js_send_when_exact_from_key_missing() {
         let app = serve_test_app_with_o6_keys(
-            vec![ServePeerPubkey {
-                from: "other-oracle:other-node".to_owned(),
-                pubkey: "wrong-first-peer-key".to_owned(),
-            }],
+            vec![serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key")],
             1_782_553_858,
             Some(NON_LOOPBACK_TEST_PEER),
         );
@@ -2008,10 +2026,7 @@ mod serve_tests {
     async fn serve_api_send_inbox_true_returns_501_without_tmux_send() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
-            vec![ServePeerPubkey {
-                from: FROM.to_owned(),
-                pubkey: KEY.to_owned(),
-            }],
+            vec![serve_test_peer_pubkey(FROM, KEY)],
             1_782_277_200,
             Some(NON_LOOPBACK_TEST_PEER),
             delivery.clone(),
@@ -2058,10 +2073,7 @@ mod serve_tests {
     async fn serve_api_send_auth_reject_is_logged_without_delivery() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
-            vec![ServePeerPubkey {
-                from: "other-oracle:other-node".to_owned(),
-                pubkey: "wrong-first-peer-key".to_owned(),
-            }],
+            vec![serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key")],
             1_782_553_858,
             Some(NON_LOOPBACK_TEST_PEER),
             delivery.clone(),
@@ -2091,10 +2103,7 @@ mod serve_tests {
     #[tokio::test]
     async fn serve_o6_from_aware_key_resolution_also_unblocks_api_feed() {
         let app = serve_test_app_with_o6_keys(
-            vec![ServePeerPubkey {
-                from: FROM.to_owned(),
-                pubkey: KEY.to_owned(),
-            }],
+            vec![serve_test_peer_pubkey(FROM, KEY)],
             1_782_277_200,
             Some(NON_LOOPBACK_TEST_PEER),
         );
