@@ -290,7 +290,7 @@ fn messages_usage152() -> String {
     "usage: maw-rs messages [serve [--detach] [--engine URL] [--port N] | status [--engine URL] | stop [--engine URL] | --limit N --from ID --to ID --direction outbound|inbound|forwarded --state queued|delivered|failed --q text --json]".to_owned()
 }
 
-fn serve_usage152() -> String { "usage: maw-rs serve [--host 127.0.0.1] [--port <port>] [--cached-pubkey <key>] | maw-rs serve status|--status|stop".to_owned() }
+fn serve_usage152() -> String { "usage: maw-rs serve [--host 0.0.0.0] [--port <port>] [--cached-pubkey <key>] | maw-rs serve status|--status|stop".to_owned() }
 
 fn messages_lifecycle_error152(code: i32, message: &str) -> CliOutput { CliOutput { code, stdout: String::new(), stderr: format!("{message}\n") } }
 
