@@ -1423,6 +1423,9 @@ fn object_from_identities(value: &Value, key_hint: Option<&str>) -> Vec<String> 
                 identities.push(from);
             }
         }
+        if let Some(from) = map.get("identity").and_then(identity_from_object) {
+            identities.push(from);
+        }
         if let (Some(oracle), Some(node)) = (
             map.get("oracle").and_then(Value::as_str),
             map.get("node").and_then(Value::as_str),
@@ -1435,6 +1438,13 @@ fn object_from_identities(value: &Value, key_hint: Option<&str>) -> Vec<String> 
     identities.sort();
     identities.dedup();
     identities
+}
+
+fn identity_from_object(value: &Value) -> Option<String> {
+    let map = value.as_object()?;
+    let oracle = map.get("oracle").and_then(Value::as_str)?.trim();
+    let node = map.get("node").and_then(Value::as_str)?.trim();
+    normalize_from_identity(&format!("{oracle}:{node}"))
 }
 
 fn normalize_from_identity(value: &str) -> Option<String> {
