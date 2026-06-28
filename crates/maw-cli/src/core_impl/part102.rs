@@ -110,8 +110,7 @@ fn plugin_create_rust(parsed: &PluginCreateArgs) -> Result<CliOutput, String> {
 fn plugin_create_rust_template_root() -> Result<std::path::PathBuf, String> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_millis());
     let root = std::env::temp_dir().join(format!(
         "maw-rs-plugin-create-rust-template-{}-{millis}",
         std::process::id()
@@ -575,7 +574,7 @@ fn plugin_error(code: i32, message: &str) -> CliOutput { CliOutput { code, stdou
 #[cfg(test)]
 mod plugin_native_tests {
     use super::{
-        plugin_build_or_dev_with_runner, plugin_cargo_build_args, plugin_run_command,
+        path_string, plugin_build_or_dev_with_runner, plugin_cargo_build_args, plugin_run_command,
         PluginBuildRunner, PluginCargoOutput, DISPATCH_102,
     };
     use std::path::{Path, PathBuf};
