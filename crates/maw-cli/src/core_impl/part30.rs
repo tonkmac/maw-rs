@@ -2035,6 +2035,59 @@ mod serve_tests {
     }
 
     #[tokio::test]
+    async fn serve_o6_node_fallback_accepts_collected_maw_js_nested_identity_shape() {
+        let node_key = "node-key-bigboy-vps-401";
+        let value = json!({
+            "version": 1,
+            "peers": {
+                "bigboy-vps": {
+                    "url": "http://100.64.0.1:3456",
+                    "node": "bigboy-vps",
+                    "addedAt": "2026-06-28T00:00:00.000Z",
+                    "lastSeen": "2026-06-28T00:01:00.000Z",
+                    "pubkeyFirstSeen": "2026-06-24T00:00:00.000Z",
+                    "pubkey": node_key,
+                    "identity": {"oracle": "mawjs", "node": "bigboy-vps"}
+                }
+            }
+        });
+        let mut entries = Vec::new();
+        collect_peer_pubkeys(&value, None, &mut entries);
+        assert!(entries.iter().any(|entry| entry.from == "mawjs:bigboy-vps"
+            && entry.node == "bigboy-vps"
+            && entry.pubkey == node_key));
+
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            entries,
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"hello nested identity"}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                node_key,
+                "alloy:bigboy-vps",
+                1_782_277_200,
+            ))
+            .await
+            .expect("nested identity fallback response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["state"], "delivered");
+        assert_eq!(payload["target"], "capture-agent:0");
+        let sends = delivery.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].0, "capture-agent:0");
+        assert_eq!(sends[0].1, "[alloy:bigboy-vps] hello nested identity");
+    }
+
+    #[tokio::test]
     async fn serve_o6_exact_mismatch_does_not_fallback_to_node_key() {
         let node_key = "node-key-bigboy-vps-399";
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
