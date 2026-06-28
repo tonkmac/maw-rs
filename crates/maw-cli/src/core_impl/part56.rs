@@ -552,28 +552,19 @@ fn forget_run_maw_done(cwd: &std::path::Path, args: &[&str]) -> Result<String, S
         }
         forget_validate_target_arg(arg, "maw done argument")?;
     }
-    let _guard = ForgetCwdGuard::set(cwd)?;
-    let argv = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    let output = run_cli(&argv);
-    if output.code == 0 { return Ok(output.stdout); }
-    let stderr = output.stderr.trim().to_owned();
-    let stdout = output.stdout.trim().to_owned();
-    if !stderr.is_empty() { Err(stderr) } else if !stdout.is_empty() { Err(stdout) } else { Err(format!("forget: maw exited {}", output.code)) }
-}
-
-struct ForgetCwdGuard { previous: std::path::PathBuf }
-
-impl ForgetCwdGuard {
-    fn set(cwd: &std::path::Path) -> Result<Self, String> {
-        let previous = std::env::current_dir().map_err(|error| format!("forget: current dir failed: {error}"))?;
-        std::env::set_current_dir(cwd).map_err(|error| format!("forget: failed to enter repo path: {error}"))?;
-        Ok(Self { previous })
+    let output = std::process::Command::new("maw")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .map_err(|error| format!("forget: failed to execute maw: {error}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
-}
-
-impl Drop for ForgetCwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.previous);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        Err(format!("forget: maw exited {}", output.status))
+    } else {
+        Err(stderr)
     }
 }
 
@@ -708,17 +699,6 @@ mod forget_tests {
         path
     }
 
-    fn forget_write_executable(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).expect("write executable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).expect("chmod");
-        }
-    }
-
     fn forget_fixture() -> (std::path::PathBuf, MawXdgEnv, std::path::PathBuf) {
         let root = forget_temp_root("fixture");
         let ghq = root.join("ghq");
@@ -787,36 +767,6 @@ mod forget_tests {
         assert!(json.contains("\"repoPath\""));
         assert!(json.contains("\"sessionName\""));
         assert!(json.contains("\"dryRun\""));
-    }
-
-    #[test]
-    fn forget_run_maw_done_uses_native_done_and_restores_cwd() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = forget_temp_root("native-done");
-        let bin = root.join("bin");
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&bin).expect("bin");
-        std::fs::create_dir_all(&repo).expect("repo");
-        forget_write_executable(&bin.join("maw"), "#!/bin/sh\nprintf 'DELEGATED-MAW %s\\n' \"$*\" >> \"$MAW_FORGET_MAW_LOG\"\nexit 37\n");
-        forget_write_executable(&bin.join("tmux"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MAW_FORGET_TMUX_LOG\"\ncase \"$1\" in\n  list-windows) printf '' ;;\n  *) exit 0 ;;\nesac\n");
-        let previous_path = std::env::var_os("PATH");
-        let previous_maw_log = std::env::var_os("MAW_FORGET_MAW_LOG");
-        let previous_tmux_log = std::env::var_os("MAW_FORGET_TMUX_LOG");
-        let previous_cwd = std::env::current_dir().expect("current dir");
-        std::env::set_var("PATH", &bin);
-        std::env::set_var("MAW_FORGET_MAW_LOG", root.join("maw.log"));
-        std::env::set_var("MAW_FORGET_TMUX_LOG", root.join("tmux.log"));
-
-        let output = forget_run_maw_done(&repo, &["done", "--all", "--force", "--clean-branch", "--oracle", "neo"]).expect("done");
-
-        assert!(output.contains("no tmux sessions to clean"), "{output}");
-        assert!(!root.join("maw.log").exists(), "must not delegate to PATH maw");
-        assert_eq!(std::env::current_dir().expect("current dir restored"), previous_cwd);
-        if let Some(value) = previous_path { std::env::set_var("PATH", value); } else { std::env::remove_var("PATH"); }
-        if let Some(value) = previous_maw_log { std::env::set_var("MAW_FORGET_MAW_LOG", value); } else { std::env::remove_var("MAW_FORGET_MAW_LOG"); }
-        if let Some(value) = previous_tmux_log { std::env::set_var("MAW_FORGET_TMUX_LOG", value); } else { std::env::remove_var("MAW_FORGET_TMUX_LOG"); }
-        let _ = std::env::set_current_dir(previous_cwd);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
