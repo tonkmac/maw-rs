@@ -3,7 +3,7 @@ const DISPATCH_136: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(config_run_command),
 }];
 
-const CONFIG_USAGE: &str = "usage: maw config <show|sources|explain <key>|set <key> <value>> [--json]";
+const CONFIG_USAGE: &str = "usage: maw config <show|set <key> <value>> [--json]";
 
 fn config_run_command(argv: &[String]) -> CliOutput {
     match config_dispatch(argv) {
@@ -105,6 +105,14 @@ mod config_tests {
     fn config_rejects_bad_node_and_port_before_write() {
         assert!(config_dispatch(&["set".to_owned(), "node".to_owned(), "--bad".to_owned()]).expect_err("bad node").contains("invalid node"));
         assert!(config_dispatch(&["set".to_owned(), "port".to_owned(), "0".to_owned()]).expect_err("bad port").contains("invalid port"));
+    }
+
+    #[test]
+    fn config_unknown_subcommand_reports_trimmed_native_usage() {
+        let output = super::config_run_command(&["sources".to_owned()]);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("usage: maw config <show|set <key> <value>> [--json]"));
+        assert!(!output.stderr.contains("sources|explain"));
     }
 
     #[test]
