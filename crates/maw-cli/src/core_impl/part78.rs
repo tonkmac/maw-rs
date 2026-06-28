@@ -978,8 +978,7 @@ mod kill_tests {
 
     impl KillEnvGuard {
         fn new(label: &str) -> Self {
-            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-            let lock = LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().expect("kill env lock");
+            let lock = env_test_lock().lock().expect("kill env lock");
             let keys = ["PEERS_FILE", "MAW_SENDER", "MAW_PEER_KEY", "HOME", "MAW_HOME", "MAW_STATE_DIR", "XDG_STATE_HOME"];
             let saved = keys.into_iter().map(|key| (key, std::env::var_os(key))).collect::<Vec<_>>();
             let dir = std::env::temp_dir().join(format!("maw-rs-kill-peer-{label}-{}", std::process::id()));
