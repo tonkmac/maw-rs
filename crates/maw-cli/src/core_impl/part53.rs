@@ -265,31 +265,18 @@ fn incubate_build_skill_command(options: &IncubateOptions) -> Result<String, Str
 
 fn incubate_run_bud(stem: &str, options: &IncubateOptions) -> Result<String, String> {
     let bud_args = incubate_bud_args(stem, options)?;
-    let _guard = IncubateEnvGuard::set("MAW_FROM_RS", "1");
-    let output = run_cli(&bud_args);
-    if output.code != 0 {
-        let stderr = output.stderr.trim().to_owned();
-        let stdout = output.stdout.trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw bud exited {}", output.code) };
+    let output = std::process::Command::new("maw")
+        .args(&bud_args)
+        .env("MAW_FROM_RS", "1")
+        .output()
+        .map_err(|error| format!("incubate: failed to run maw bud: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw bud exited {}", output.status) };
         return Err(format!("incubate: bud failed: {detail}"));
     }
-    Ok(output.stdout)
-}
-
-struct IncubateEnvGuard { key: &'static str, previous: Option<std::ffi::OsString> }
-
-impl IncubateEnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for IncubateEnvGuard {
-    fn drop(&mut self) {
-        if let Some(value) = self.previous.take() { std::env::set_var(self.key, value); } else { std::env::remove_var(self.key); }
-    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn incubate_bud_args(stem: &str, options: &IncubateOptions) -> Result<Vec<String>, String> {

@@ -33,8 +33,8 @@ fn write_fake_maw(bin_dir: &Path) {
     fs::write(
         &maw,
         r#"#!/bin/sh
-printf 'DELEGATED-MAW %s\n' "$*" >> "$MAW_INCUBATE_BUD_LOG"
-exit 37
+printf '%s\n' "$*" >> "$MAW_INCUBATE_BUD_LOG"
+printf 'budded %s\n' "$2"
 "#,
     )
     .expect("write fake maw");
@@ -98,7 +98,6 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
         .env("XDG_STATE_HOME", &xdg_state)
         .env("TMUX", root.join("tmux-socket"))
         .env("MAW_JS_REF_DIR", "/nonexistent")
-        .env("GHQ_ROOT", root.join("ghq/github.com"))
         .env("MAW_INCUBATE_BUD_LOG", root.join("bud.log"))
         .env("MAW_INCUBATE_TMUX_LOG", root.join("tmux.log"))
         .output()
@@ -121,20 +120,14 @@ fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("Oracle scaffold plan"), "{stdout}");
-    assert!(
-        stdout.contains("[dry-run] would create repo: Soul-Brews-Studio/foo-oracle"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("[dry-run] would send \u{1b}[33m/incubate org/foo --flash\u{1b}[0m to foo"),
-        "{stdout}"
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-incubate/dry-run.stdout")
     );
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
-    assert!(
-        !root.join("bud.log").exists(),
-        "must not delegate to PATH maw"
+    assert_eq!(
+        fs::read_to_string(root.join("bud.log")).expect("bud log"),
+        "bud foo --repo org/foo --dry-run\n"
     );
     assert!(
         !root.join("tmux.log").exists(),
@@ -154,32 +147,24 @@ fn native_incubate_dispatches_trigger_after_bud_and_guards_options() {
 
     assert_eq!(dispatcher_status("incubate"), DispatchKind::Native);
 
-    let output = run(
-        &root,
-        &["incubate", "org/widgets", "--contribute", "--dry-run"],
-    );
+    let output = run(&root, &["incubate", "org/widgets", "--contribute"]);
     assert!(
         output.status.success(),
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("Oracle scaffold plan"), "{stdout}");
-    assert!(
-        stdout.contains(
-            "[dry-run] would send \u{1b}[33m/incubate org/widgets --contribute\u{1b}[0m to widgets"
-        ),
-        "{stdout}"
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-incubate/send.stdout")
     );
-    assert!(
-        !root.join("bud.log").exists(),
-        "must not delegate to PATH maw"
+    assert_eq!(
+        fs::read_to_string(root.join("bud.log")).expect("bud log"),
+        "bud widgets --repo org/widgets\n"
     );
-    assert!(
-        !root.join("tmux.log").exists(),
-        "dry-run must not touch tmux"
-    );
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(tmux_log.contains("list-windows -a -F #{session_name}|||#{window_index}|||#{window_name}|||#{window_active}|||#{pane_current_path}"));
+    assert!(tmux_log.contains("send-keys -t widgets:0 -l /incubate org/widgets --contribute"));
 
     let bad = run(&root, &["incubate", "org/widgets", "--stem", "-bad"]);
     assert!(!bad.status.success());
