@@ -498,11 +498,13 @@ mod agents_tests {
 
     #[test]
     fn agents_node_json_is_metadata_only_and_ignores_missing_js_ref() {
-        let old = std::env::var_os("MAW_JS_REF_DIR");
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
         std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
         let mut runtime = agents_fake_runtime();
         let out = agents_run(&agents_args(&["--node=edge", "--json"]), &mut runtime).expect("json");
-        if let Some(value) = old { std::env::set_var("MAW_JS_REF_DIR", value); } else { std::env::remove_var("MAW_JS_REF_DIR"); }
         let value: serde_json::Value = serde_json::from_str(&out).expect("json parse");
         assert_eq!(value.as_array().expect("array").len(), 2);
         assert_eq!(value[0]["node"], "edge");

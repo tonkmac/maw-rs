@@ -448,11 +448,12 @@ mod tmux_kill_tests {
 
     #[test]
     fn tmux_kill_fake_maw_no_delegate_and_no_bun_runtime() {
+        let _guard = env_test_lock().lock().expect("env lock");
+        let _restore = EnvVarRestore::capture("MAW_JS_REF_DIR");
         std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
         let mut runner = fake_runner();
         let output = tmux_kill_run_with(&fake_args(&["scratch:1.2"]), &mut runner)
             .expect("kill pane by canonical target");
-        std::env::remove_var("MAW_JS_REF_DIR");
         assert!(output.contains("killed pane %42"));
         assert!(!runner.calls.iter().any(|call| call.subcommand == "bun"));
     }
