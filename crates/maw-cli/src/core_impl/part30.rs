@@ -969,6 +969,63 @@ fn receiver_inbox_ghq_root() -> std::path::PathBuf {
     )
 }
 
+fn receiver_inbox_target_cwd_parts(target: &str) -> Option<(&str, Option<&str>)> {
+    let clean = receiver_inbox_strip_pane_suffix(target.trim());
+    if clean.is_empty() {
+        return None;
+    }
+    let parts = clean.split(':').collect::<Vec<_>>();
+    let (session, window) = if parts.len() >= 3 {
+        (parts.get(1).copied().unwrap_or_default(), parts.get(2).copied())
+    } else {
+        (parts.first().copied().unwrap_or_default(), parts.get(1).copied())
+    };
+    let session = session.trim();
+    if session.is_empty() {
+        return None;
+    }
+    Some((session, window.map(str::trim).filter(|value| !value.is_empty())))
+}
+
+fn receiver_inbox_target_cwd_window<'a>(
+    fleet: &'a NativeFleetSession,
+    win_ref: Option<&str>,
+) -> Option<&'a NativeFleetWindow> {
+    let Some(win_ref) = win_ref else {
+        return fleet.windows.first();
+    };
+    if win_ref.bytes().all(|byte| byte.is_ascii_digit()) {
+        return win_ref
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| fleet.windows.get(index));
+    }
+    fleet.windows.iter().find(|window| window.name == win_ref)
+}
+
+fn receiver_inbox_resolve_target_cwd(target: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let Some((session, win_ref)) = receiver_inbox_target_cwd_parts(target) else {
+        return Ok(None);
+    };
+    let ghq_root = receiver_inbox_ghq_root();
+    let mut candidates = Vec::new();
+    for fleet in load_native_fleet().into_iter().filter(|fleet| fleet.name == session) {
+        let Some(window) = receiver_inbox_target_cwd_window(&fleet, win_ref) else {
+            continue;
+        };
+        let repo = window.repo.trim();
+        if repo.is_empty() {
+            continue;
+        }
+        candidates.push(ghq_root.join(repo));
+    }
+    let candidates = receiver_inbox_existing_candidates(candidates);
+    if candidates.len() > 1 {
+        return Err(format!("receiver repo ambiguous for {target}"));
+    }
+    Ok(candidates.into_iter().next())
+}
+
 fn receiver_inbox_lookup_key(value: &str) -> Option<String> {
     let value = receiver_inbox_strip_pane_suffix(value.trim()).trim();
     (!value.is_empty()).then(|| value.to_ascii_lowercase())
@@ -1076,6 +1133,13 @@ fn receiver_inbox_repo_candidates(
             candidates.push(receiver_inbox_strip_psi_suffix(&psi_path));
         }
     }
+    if let Some(target) = input.target {
+        match receiver_inbox_resolve_target_cwd(target) {
+            Ok(Some(path)) => candidates.push(path),
+            Ok(None) => {}
+            Err(reason) => return Err(reason),
+        }
+    }
     let manifest = locate_load_manifest();
     if let Some(entry) = manifest.iter().find(|entry| {
         receiver_inbox_normalize_oracle_name(Some(&entry.name)).as_deref() == Some(oracle)
@@ -1084,29 +1148,25 @@ fn receiver_inbox_repo_candidates(
     }) {
         receiver_inbox_push_manifest_entry_candidates(&mut candidates, entry);
     }
-    let phase_a = receiver_inbox_existing_candidates(candidates);
-    if !phase_a.is_empty() {
-        return Ok(phase_a);
-    }
 
     let target_keys = receiver_inbox_target_lookup_keys(input);
-    if target_keys.is_empty() {
-        return Ok(Vec::new());
+    if !target_keys.is_empty() {
+        let mut phase_b = Vec::new();
+        for entry in manifest
+            .iter()
+            .filter(|entry| receiver_inbox_manifest_entry_matches_target(entry, &target_keys))
+        {
+            let mut entry_candidates = Vec::new();
+            receiver_inbox_push_manifest_entry_candidates(&mut entry_candidates, entry);
+            phase_b.extend(receiver_inbox_existing_candidates(entry_candidates));
+        }
+        let phase_b = receiver_inbox_existing_candidates(phase_b);
+        if phase_b.len() > 1 {
+            return Err(format!("receiver repo ambiguous for {}", input.query));
+        }
+        candidates.extend(phase_b);
     }
-    let mut repos = Vec::new();
-    for entry in manifest
-        .iter()
-        .filter(|entry| receiver_inbox_manifest_entry_matches_target(entry, &target_keys))
-    {
-        let mut entry_candidates = Vec::new();
-        receiver_inbox_push_manifest_entry_candidates(&mut entry_candidates, entry);
-        repos.extend(receiver_inbox_existing_candidates(entry_candidates));
-    }
-    let repos = receiver_inbox_existing_candidates(repos);
-    if repos.len() > 1 {
-        return Err(format!("receiver repo ambiguous for {}", input.query));
-    }
-    Ok(repos)
+    Ok(receiver_inbox_existing_candidates(candidates))
 }
 
 fn persist_receiver_inbox(
@@ -2860,6 +2920,7 @@ mod serve_tests {
         _guard: std::sync::MutexGuard<'static, ()>,
         root: std::path::PathBuf,
         config: std::path::PathBuf,
+        cache: std::path::PathBuf,
         ghq: std::path::PathBuf,
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -2871,6 +2932,7 @@ mod serve_tests {
                 "HOME",
                 "MAW_HOME",
                 "MAW_CONFIG_DIR",
+                "MAW_CACHE_DIR",
                 "MAW_XDG",
                 "XDG_CONFIG_HOME",
                 "GHQ_ROOT",
@@ -2886,19 +2948,23 @@ mod serve_tests {
             ));
             let home = root.join("home");
             let config = root.join("config");
+            let cache = root.join("cache");
             let ghq = root.join("ghq");
             std::fs::create_dir_all(config.join("fleet")).expect("fleet dir");
-            std::fs::create_dir_all(&ghq).expect("ghq dir");
+            std::fs::create_dir_all(&cache).expect("cache dir");
+            std::fs::create_dir_all(ghq.join("github.com")).expect("ghq dir");
             std::env::set_var("HOME", &home);
             std::env::remove_var("MAW_HOME");
             std::env::remove_var("MAW_XDG");
             std::env::remove_var("XDG_CONFIG_HOME");
             std::env::set_var("MAW_CONFIG_DIR", &config);
-            std::env::set_var("GHQ_ROOT", &ghq);
+            std::env::set_var("MAW_CACHE_DIR", &cache);
+            std::env::set_var("GHQ_ROOT", ghq.join("github.com"));
             Self {
                 _guard: guard,
                 root,
                 config,
+                cache,
                 ghq,
                 saved,
             }
@@ -2923,6 +2989,26 @@ mod serve_tests {
             )
             .expect("write fleet");
             repo_path
+        }
+
+        fn write_local_scanned_oracles_json(&self, name: &str, repo: &str, local_path: &std::path::Path) {
+            let value = json!({
+                "schema": 1,
+                "oracles": [{
+                    "org": "tonkmac",
+                    "repo": repo,
+                    "name": name,
+                    "local_path": local_path.display().to_string(),
+                    "has_psi": true,
+                    "has_fleet_config": true,
+                    "federation_node": "bigboy-vps"
+                }]
+            });
+            std::fs::write(
+                self.cache.join("oracles.json"),
+                serde_json::to_string_pretty(&value).expect("oracles json"),
+            )
+            .expect("write oracles");
         }
     }
 
@@ -3001,9 +3087,9 @@ mod serve_tests {
         };
         let result = persist_receiver_inbox(
             ReceiverInboxInput {
-                query: "01-wish",
-                target: Some("01-wish:0"),
-                to: Some("01-wish"),
+                query: "wish",
+                target: Some("wish"),
+                to: Some("wish"),
                 from: "bigboy-vps:alloy",
                 message: "hello wish inbox",
                 config: &config,
@@ -3021,7 +3107,7 @@ mod serve_tests {
     }
 
     #[tokio::test]
-    async fn serve_api_send_inbox_true_resolves_manifest_session_owner_without_relabeling_oracle() {
+    async fn serve_api_send_inbox_true_resolves_fleet_target_cwd_without_relabeling_oracle() {
         let env = ServeInboxManifestEnv::new("bigboylocal");
         let repo = env.add_fleet_repo(
             "02-bigboy.json",
@@ -3029,6 +3115,7 @@ mod serve_tests {
             "bigboylocal-oracle",
             "tonkmac/bigboylocal-oracle",
         );
+        env.write_local_scanned_oracles_json("bigboylocal", "bigboylocal-oracle", &repo);
         let delivery = Arc::new(FakeServeDelivery::default());
         delivery.set_sessions(vec![vec![serve_test_session(
             "02-bigboy",
@@ -3082,8 +3169,40 @@ mod serve_tests {
         );
     }
 
+    #[test]
+    fn receiver_inbox_target_cwd_matches_maw_js_window_selection_rules() {
+        let env = ServeInboxManifestEnv::new("target-cwd");
+        let repo = env.add_fleet_repo(
+            "02-bigboy.json",
+            "02-bigboy",
+            "bigboylocal-oracle",
+            "tonkmac/bigboylocal-oracle",
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("02-bigboy").expect("session"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("02-bigboy:0").expect("index"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("02-bigboy:bigboylocal-oracle").expect("window"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("node:02-bigboy:bigboylocal-oracle")
+                .expect("node window"),
+            Some(repo)
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("bigboy").expect("wrong owner"),
+            None
+        );
+    }
+
     #[tokio::test]
-    async fn serve_api_send_inbox_true_refuses_ambiguous_manifest_session_owner() {
+    async fn serve_api_send_inbox_true_refuses_ambiguous_fleet_session_owner() {
         let env = ServeInboxManifestEnv::new("ambiguous");
         let repo_one = env.add_fleet_repo(
             "02-bigboy-a.json",
