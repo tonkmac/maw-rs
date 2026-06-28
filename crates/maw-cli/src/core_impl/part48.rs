@@ -1,4 +1,4 @@
-const DISPATCH_48: &[DispatcherEntry] = &[ DispatcherEntry { command: "assign", handler: Handler::Sync(run_assign_command) } ];
+const DISPATCH_48: &[DispatcherEntry] = &[ DispatcherEntry { command: "assign", handler: Handler::Async(run_assign_async) } ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AssignIssueRef {
@@ -21,14 +21,16 @@ struct AssignGithubLabel {
     name: String,
 }
 
-fn run_assign_command(argv: &[String]) -> CliOutput {
-    match assign_run(argv) {
-        Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
-        Err(message) => CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") },
-    }
+fn run_assign_async(argv: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move {
+        match assign_run_async(&argv).await {
+            Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
+            Err(message) => CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") },
+        }
+    })
 }
 
-fn assign_run(argv: &[String]) -> Result<String, String> {
+async fn assign_run_async(argv: &[String]) -> Result<String, String> {
     let (issue_url, explicit_oracle) = assign_parse_args(argv)?;
     let issue_ref = assign_parse_issue_url(&issue_url)?;
     let slug = assign_repo_slug(&issue_ref);
@@ -42,7 +44,7 @@ fn assign_run(argv: &[String]) -> Result<String, String> {
 
     let mut stdout = format!("\x1b[36m⚡\x1b[0m fetching issue #{} from {slug}...\n", issue_ref.issue_num);
     let prompt = assign_fetch_issue_prompt(&issue_ref, &slug)?;
-    let wake_output = assign_wake_oracle(&oracle, &slug, issue_ref.issue_num, &prompt)?;
+    let wake_output = assign_wake_oracle_async(&oracle, &slug, issue_ref.issue_num, &prompt).await?;
     stdout.push_str(&wake_output);
     Ok(stdout)
 }
@@ -200,21 +202,25 @@ fn assign_wrap_external_content(source: &str, content: &str) -> String {
     )
 }
 
-fn assign_wake_oracle(oracle: &str, slug: &str, issue_num: u64, prompt: &str) -> Result<String, String> {
+async fn assign_wake_oracle_async(oracle: &str, slug: &str, issue_num: u64, prompt: &str) -> Result<String, String> {
     assign_validate_target_arg(oracle, "oracle")?;
     assign_validate_repo_slug(slug)?;
     let task = format!("issue-{issue_num}");
     assign_validate_target_arg(&task, "task")?;
-    let output = std::process::Command::new("maw")
-        .args(["wake", oracle, "--incubate", slug, "--task", &task, "--prompt", prompt])
-        .output()
-        .map_err(|error| format!("assign: maw wake failed: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if output.status.success() {
-        return Ok(stdout);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let message = if stderr.is_empty() { format!("maw exited {}", output.status) } else { stderr };
+    let argv = assign_wake_argv(oracle, slug, task, prompt);
+    let output = run_cli_async(&argv).await;
+    assign_wake_output(output)
+}
+
+fn assign_wake_argv(oracle: &str, slug: &str, task: String, prompt: &str) -> Vec<String> {
+    vec!["wake".to_owned(), oracle.to_owned(), "--incubate".to_owned(), slug.to_owned(), "--task".to_owned(), task, "--prompt".to_owned(), prompt.to_owned()]
+}
+
+fn assign_wake_output(output: CliOutput) -> Result<String, String> {
+    if output.code == 0 { return Ok(output.stdout); }
+    let stderr = output.stderr.trim().to_owned();
+    let stdout = output.stdout.trim().to_owned();
+    let message = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw exited {}", output.code) };
     Err(format!("assign: maw wake failed: {message}"))
 }
 
