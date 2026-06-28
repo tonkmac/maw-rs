@@ -205,16 +205,12 @@ fn assign_wake_oracle(oracle: &str, slug: &str, issue_num: u64, prompt: &str) ->
     assign_validate_repo_slug(slug)?;
     let task = format!("issue-{issue_num}");
     assign_validate_target_arg(&task, "task")?;
-    let output = std::process::Command::new("maw")
-        .args(["wake", oracle, "--incubate", slug, "--task", &task, "--prompt", prompt])
-        .output()
-        .map_err(|error| format!("assign: maw wake failed: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if output.status.success() {
-        return Ok(stdout);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let message = if stderr.is_empty() { format!("maw exited {}", output.status) } else { stderr };
+    let argv = vec!["wake".to_owned(), oracle.to_owned(), "--incubate".to_owned(), slug.to_owned(), "--task".to_owned(), task, "--prompt".to_owned(), prompt.to_owned()];
+    let output = run_cli(&argv);
+    if output.code == 0 { return Ok(output.stdout); }
+    let stderr = output.stderr.trim().to_owned();
+    let stdout = output.stdout.trim().to_owned();
+    let message = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw exited {}", output.code) };
     Err(format!("assign: maw wake failed: {message}"))
 }
 
