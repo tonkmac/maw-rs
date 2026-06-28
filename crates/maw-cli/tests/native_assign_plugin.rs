@@ -147,7 +147,9 @@ fn native_assign_explicit_oracle_matches_committed_golden_and_is_hermetic() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.starts_with("\u{1b}[36m⚡\u{1b}[0m fetching issue #127 from tonkmac/maw-rs...\n"));
+    assert!(
+        stdout.starts_with("\u{1b}[36m⚡\u{1b}[0m fetching issue #127 from tonkmac/maw-rs...\n")
+    );
     assert!(stdout.contains("woke 'nova-issue-127'"), "{stdout}");
     assert!(stdout.contains("ghq/github.com/tonkmac/maw-rs"), "{stdout}");
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
@@ -155,7 +157,10 @@ fn native_assign_explicit_oracle_matches_committed_golden_and_is_hermetic() {
         fs::read_to_string(root.join("gh.log")).expect("gh log"),
         "issue view 127 --repo tonkmac/maw-rs --json title,body,labels\n"
     );
-    assert!(!root.join("wake.log").exists(), "must not delegate to PATH maw");
+    assert!(
+        !root.join("wake.log").exists(),
+        "must not delegate to PATH maw"
+    );
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(tmux_log.contains("has-session -t "));
     assert!(tmux_log.contains("new-window -t "));
@@ -187,10 +192,17 @@ fn native_assign_detects_oracle_from_isolated_tmux_and_rejects_injection() {
         String::from_utf8_lossy(&output.stderr)
     );
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
-    assert!(tmux_log.starts_with("list-sessions -F #{session_name}\ndisplay-message -p #{window_name}\n"), "{tmux_log}");
+    assert!(
+        tmux_log
+            .starts_with("list-sessions -F #{session_name}\ndisplay-message -p #{window_name}\n"),
+        "{tmux_log}"
+    );
     assert!(tmux_log.contains("has-session -t "));
     assert!(tmux_log.contains("new-window -t "));
-    assert!(!root.join("wake.log").exists(), "must not delegate to PATH maw");
+    assert!(
+        !root.join("wake.log").exists(),
+        "must not delegate to PATH maw"
+    );
 
     let bad = run(
         &root,

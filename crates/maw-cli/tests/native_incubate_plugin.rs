@@ -123,10 +123,19 @@ fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("Oracle scaffold plan"), "{stdout}");
-    assert!(stdout.contains("[dry-run] would create repo: Soul-Brews-Studio/foo-oracle"), "{stdout}");
-    assert!(stdout.contains("[dry-run] would send \u{1b}[33m/incubate org/foo --flash\u{1b}[0m to foo"), "{stdout}");
+    assert!(
+        stdout.contains("[dry-run] would create repo: Soul-Brews-Studio/foo-oracle"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[dry-run] would send \u{1b}[33m/incubate org/foo --flash\u{1b}[0m to foo"),
+        "{stdout}"
+    );
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
-    assert!(!root.join("bud.log").exists(), "must not delegate to PATH maw");
+    assert!(
+        !root.join("bud.log").exists(),
+        "must not delegate to PATH maw"
+    );
     assert!(
         !root.join("tmux.log").exists(),
         "dry-run must not touch tmux"
@@ -145,7 +154,10 @@ fn native_incubate_dispatches_trigger_after_bud_and_guards_options() {
 
     assert_eq!(dispatcher_status("incubate"), DispatchKind::Native);
 
-    let output = run(&root, &["incubate", "org/widgets", "--contribute", "--dry-run"]);
+    let output = run(
+        &root,
+        &["incubate", "org/widgets", "--contribute", "--dry-run"],
+    );
     assert!(
         output.status.success(),
         "stdout={}\nstderr={}",
@@ -154,9 +166,20 @@ fn native_incubate_dispatches_trigger_after_bud_and_guards_options() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("Oracle scaffold plan"), "{stdout}");
-    assert!(stdout.contains("[dry-run] would send \u{1b}[33m/incubate org/widgets --contribute\u{1b}[0m to widgets"), "{stdout}");
-    assert!(!root.join("bud.log").exists(), "must not delegate to PATH maw");
-    assert!(!root.join("tmux.log").exists(), "dry-run must not touch tmux");
+    assert!(
+        stdout.contains(
+            "[dry-run] would send \u{1b}[33m/incubate org/widgets --contribute\u{1b}[0m to widgets"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !root.join("bud.log").exists(),
+        "must not delegate to PATH maw"
+    );
+    assert!(
+        !root.join("tmux.log").exists(),
+        "dry-run must not touch tmux"
+    );
 
     let bad = run(&root, &["incubate", "org/widgets", "--stem", "-bad"]);
     assert!(!bad.status.success());
