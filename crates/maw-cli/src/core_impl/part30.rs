@@ -59,11 +59,11 @@ trait ServeReceiverInbox: Send + Sync {
 #[derive(Default)]
 struct ServeSystemReceiverInbox {
     #[cfg(test)]
-    enabled_override: Option<bool>,
+    enabled: Option<bool>,
     #[cfg(test)]
-    now_millis_override: Option<u128>,
+    fixed_now_millis: Option<u128>,
     #[cfg(test)]
-    psi_path_override: Option<std::path::PathBuf>,
+    psi_root: Option<std::path::PathBuf>,
 }
 
 impl ServeReceiverInbox for ServeSystemReceiverInbox {
@@ -71,7 +71,7 @@ impl ServeReceiverInbox for ServeSystemReceiverInbox {
         let enabled = {
             #[cfg(test)]
             {
-                self.enabled_override.unwrap_or_else(receiver_inbox_auto_write_enabled)
+                self.enabled.unwrap_or_else(receiver_inbox_auto_write_enabled)
             }
             #[cfg(not(test))]
             {
@@ -87,24 +87,24 @@ impl ServeReceiverInbox for ServeSystemReceiverInbox {
         let now_millis = {
             #[cfg(test)]
             {
-                self.now_millis_override.unwrap_or_else(receiver_inbox_now_millis)
+                self.fixed_now_millis.unwrap_or_else(receiver_inbox_now_millis)
             }
             #[cfg(not(test))]
             {
                 receiver_inbox_now_millis()
             }
         };
-        let psi_path_override = {
+        let psi_root = {
             #[cfg(test)]
             {
-                self.psi_path_override.as_deref()
+                self.psi_root.as_deref()
             }
             #[cfg(not(test))]
             {
                 None
             }
         };
-        persist_receiver_inbox(input, now_millis, psi_path_override)
+        persist_receiver_inbox(input, now_millis, psi_root)
     }
 }
 
@@ -426,7 +426,14 @@ fn serve_deliver_send(
     }
 
     if parsed.inbox.unwrap_or(false) {
-        return serve_deliver_inbox(state, headers, &parsed, &target, &message, &config, &log_from, &log_to);
+        let context = ServeInboxContext {
+            config: &config,
+            log_from: &log_from,
+            log_to: &log_to,
+            target: &target,
+            message: &message,
+        };
+        return serve_deliver_inbox(state, headers, &parsed, &context);
     }
 
     let sessions = match state.delivery.route_sessions() {
@@ -464,16 +471,25 @@ fn serve_deliver_send(
 }
 
 
+struct ServeInboxContext<'a> {
+    config: &'a HeyConfig,
+    log_from: &'a str,
+    log_to: &'a str,
+    target: &'a str,
+    message: &'a str,
+}
+
 fn serve_deliver_inbox(
     state: &ServeState,
     headers: &HeaderMap,
     parsed: &SendBody,
-    target: &str,
-    message: &str,
-    config: &HeyConfig,
-    log_from: &str,
-    log_to: &str,
+    context: &ServeInboxContext<'_>,
 ) -> axum::response::Response {
+    let target = context.target;
+    let message = context.message;
+    let config = context.config;
+    let log_from = context.log_from;
+    let log_to = context.log_to;
     let sessions = match state.delivery.route_sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -547,6 +563,7 @@ fn serve_deliver_inbox(
     }
 }
 
+#[derive(Clone, Copy)]
 struct ReceiverInboxInput<'a> {
     query: &'a str,
     target: Option<&'a str>,
@@ -955,10 +972,10 @@ fn receiver_inbox_ghq_root() -> std::path::PathBuf {
 fn receiver_inbox_repo_candidates(
     oracle: &str,
     input: &ReceiverInboxInput<'_>,
-    psi_path_override: Option<&std::path::Path>,
+    psi_root: Option<&std::path::Path>,
 ) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(psi_path) = psi_path_override {
+    if let Some(psi_path) = psi_root {
         candidates.push(receiver_inbox_strip_psi_suffix(psi_path));
     } else if let (Some(psi_path), Some(config_oracle)) = (receiver_inbox_config_psi_path(), input.config.oracle.as_deref()) {
         if receiver_inbox_normalize_oracle_name(Some(config_oracle)).as_deref() == Some(oracle) {
@@ -991,12 +1008,12 @@ fn receiver_inbox_repo_candidates(
 fn persist_receiver_inbox(
     input: ReceiverInboxInput<'_>,
     now_millis: u128,
-    psi_path_override: Option<&std::path::Path>,
+    psi_root: Option<&std::path::Path>,
 ) -> ReceiverInboxResult {
     let Some(oracle) = receiver_inbox_resolve_oracle(&input) else {
         return ReceiverInboxResult::Err { oracle: None, reason: "receiver oracle could not be inferred".to_owned() };
     };
-    let Some(repo_path) = receiver_inbox_repo_candidates(&oracle, &input, psi_path_override).into_iter().next() else {
+    let Some(repo_path) = receiver_inbox_repo_candidates(&oracle, &input, psi_root).into_iter().next() else {
         return ReceiverInboxResult::Err { oracle: Some(oracle.clone()), reason: format!("receiver repo not found for {oracle}") };
     };
     let timestamp = receiver_inbox_iso_from_millis(now_millis);
@@ -1022,7 +1039,7 @@ fn persist_receiver_inbox(
                 }
                 return ReceiverInboxResult::Ok(ReceiverInboxOk { oracle, inbox_dir, path, filename });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return ReceiverInboxResult::Err { oracle: Some(oracle), reason: error.to_string() },
         }
     }
@@ -2212,17 +2229,17 @@ mod serve_tests {
 
     fn serve_test_receiver_inbox() -> Arc<dyn ServeReceiverInbox> {
         Arc::new(ServeSystemReceiverInbox {
-            enabled_override: Some(false),
-            now_millis_override: Some(1_782_277_200_000),
-            psi_path_override: None,
+            enabled: Some(false),
+            fixed_now_millis: Some(1_782_277_200_000),
+            psi_root: None,
         })
     }
 
     fn serve_test_receiver_inbox_at(repo: &std::path::Path, now_millis: u128) -> Arc<dyn ServeReceiverInbox> {
         Arc::new(ServeSystemReceiverInbox {
-            enabled_override: Some(true),
-            now_millis_override: Some(now_millis),
-            psi_path_override: Some(repo.join("ψ")),
+            enabled: Some(true),
+            fixed_now_millis: Some(now_millis),
+            psi_root: Some(repo.join("ψ")),
         })
     }
 
