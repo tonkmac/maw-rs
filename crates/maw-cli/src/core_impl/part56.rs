@@ -111,10 +111,7 @@ impl ForgetDoneRunner for ForgetCommandDoneRunner {
     fn forget_done_all(&mut self, cwd: &std::path::Path, oracle: &str) -> Result<String, String> {
         forget_validate_existing_dir(cwd, "repo path")?;
         forget_validate_target_arg(oracle, "oracle")?;
-        forget_run_maw_done(
-            cwd,
-            &["done", "--all", "--force", "--clean-branch", "--oracle", oracle],
-        )
+        forget_run_native_done(cwd, &["--all", "--force", "--clean-branch", oracle])
         .map(|stdout| {
             let count = forget_processed_count(&stdout).unwrap_or(0);
             let mut detail = String::from("done --all processed ");
@@ -126,7 +123,7 @@ impl ForgetDoneRunner for ForgetCommandDoneRunner {
     fn forget_done_worktree(&mut self, cwd: &std::path::Path, worktree: &str) -> Result<(), String> {
         forget_validate_existing_dir(cwd, "repo path")?;
         forget_validate_target_arg(worktree, "worktree")?;
-        forget_run_maw_done(cwd, &["done", worktree, "--force", "--clean-branch"]).map(|_| ())
+        forget_run_native_done(cwd, &[worktree, "--force", "--clean-branch"]).map(|_| ())
     }
 }
 
@@ -545,27 +542,15 @@ fn forget_find_worktrees(parent_dir: &std::path::Path, repo_name: &str) -> Vec<F
     out
 }
 
-fn forget_run_maw_done(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+fn forget_run_native_done(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
     for arg in args {
-        if matches!(*arg, "done" | "--all" | "--force" | "--clean-branch" | "--oracle") {
+        if matches!(*arg, "--all" | "--force" | "--clean-branch") {
             continue;
         }
         forget_validate_target_arg(arg, "maw done argument")?;
     }
-    let output = std::process::Command::new("maw")
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .map_err(|error| format!("forget: failed to execute maw: {error}"))?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if stderr.is_empty() {
-        Err(format!("forget: maw exited {}", output.status))
-    } else {
-        Err(stderr)
-    }
+    let done_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    done_run_with_cwd(cwd, &done_args, &mut DoneLocal::default())
 }
 
 fn forget_processed_count(stdout: &str) -> Option<usize> {
@@ -699,6 +684,20 @@ mod forget_tests {
         path
     }
 
+    fn forget_write_script(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("script parent");
+        }
+        std::fs::write(path, body).expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(path).expect("script metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("script chmod");
+        }
+    }
+
     fn forget_fixture() -> (std::path::PathBuf, MawXdgEnv, std::path::PathBuf) {
         let root = forget_temp_root("fixture");
         let ghq = root.join("ghq");
@@ -783,5 +782,54 @@ mod forget_tests {
         assert_eq!(done.worktrees, vec!["143-forget".to_owned()]);
         assert!(result.actions.iter().any(|action| action.layer == "fleet" && action.status == "removed"));
         assert!(result.actions.iter().any(|action| action.layer == "snapshots" && action.status == "removed"));
+    }
+
+    #[test]
+    fn forget_native_done_runner_uses_explicit_cwd_without_path_maw_or_global_cwd_change() {
+        let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarRestore::capture("HOME");
+        let _maw_home = EnvVarRestore::capture("MAW_HOME");
+        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let _path = EnvVarRestore::capture("PATH");
+
+        let cwd_before = std::env::current_dir().expect("cwd before");
+        let root = forget_temp_root("native-done");
+        let bin = root.join("bin");
+        let home = root.join("home");
+        let ghq = root.join("ghq");
+        let repo = ghq.join("github.com/acme/neo-oracle");
+        let worktree = repo.join("agents/143-forget");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(worktree.join(".git"), "gitdir: linked\n").expect("worktree git");
+        std::fs::create_dir_all(root.join("config/fleet")).expect("fleet dir");
+
+        let delegated_maw = root.join("delegated-maw.log");
+        forget_write_script(
+            &bin.join("maw"),
+            &format!("#!/bin/sh\nprintf 'DELEGATED-MAW %s\\n' \"$*\" >> '{}'\nexit 77\n", delegated_maw.display()),
+        );
+        forget_write_script(
+            &bin.join("tmux"),
+            "#!/bin/sh\ncase \"$1\" in\n  list-windows) exit 0 ;;\n  display-message) exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+        );
+        forget_write_script(
+            &bin.join("git"),
+            "#!/bin/sh\ncase \"$*\" in\n  *'rev-parse --abbrev-ref HEAD'*) printf 'feature-forget\\n' ;;\nesac\nexit 0\n",
+        );
+
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("MAW_HOME");
+        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+        std::env::set_var("GHQ_ROOT", &ghq);
+        std::env::set_var("PATH", &bin);
+
+        let mut runner = ForgetCommandDoneRunner;
+        runner
+            .forget_done_worktree(&repo, "143-forget")
+            .expect("native done worktree");
+
+        assert!(!delegated_maw.exists(), "forget must not shell to PATH maw");
+        assert_eq!(std::env::current_dir().expect("cwd after"), cwd_before);
     }
 }

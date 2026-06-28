@@ -16,6 +16,29 @@ struct DoneWindow { session: String, index: i32, name: String }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoneWorktree { main_path: std::path::PathBuf, full_path: std::path::PathBuf, label: String }
 
+#[derive(Debug, Clone)]
+struct DoneContext {
+    repos_root: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
+}
+
+impl DoneContext {
+    fn from_env() -> Self {
+        Self {
+            repos_root: ghq_root().join("github.com"),
+            config_dir: active_config_dir(),
+        }
+    }
+
+    fn with_cwd(cwd: &std::path::Path) -> Self {
+        Self {
+            repos_root: done_repos_root_from_cwd(cwd)
+                .unwrap_or_else(|| ghq_root().join("github.com")),
+            config_dir: active_config_dir(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct DoneLocal { runner: maw_tmux::CommandTmuxRunner }
 
@@ -27,10 +50,20 @@ fn run_done_command(argv: &[String]) -> CliOutput {
 }
 
 fn done_run(argv: &[String], local: &mut DoneLocal) -> Result<String, String> {
+    let context = DoneContext::from_env();
+    done_run_with_context(argv, local, &context)
+}
+
+fn done_run_with_cwd(cwd: &std::path::Path, argv: &[String], local: &mut DoneLocal) -> Result<String, String> {
+    let context = DoneContext::with_cwd(cwd);
+    done_run_with_context(argv, local, &context)
+}
+
+fn done_run_with_context(argv: &[String], local: &mut DoneLocal, context: &DoneContext) -> Result<String, String> {
     let options = done_parse_args(argv)?;
-    if options.all { return Ok(done_run_all(&options, local)); }
+    if options.all { return Ok(done_run_all(&options, local, context)); }
     let target = options.target.clone().ok_or_else(|| DONE_USAGE.to_owned())?;
-    done_run_one(&target, &options, None, local)
+    done_run_one_with_context(&target, &options, None, local, context)
 }
 
 fn done_parse_args(argv: &[String]) -> Result<DoneOptions, String> {
@@ -60,6 +93,11 @@ fn done_parse_args(argv: &[String]) -> Result<DoneOptions, String> {
 }
 
 fn done_run_one(target: &str, options: &DoneOptions, session_filter: Option<&str>, local: &mut DoneLocal) -> Result<String, String> {
+    let context = DoneContext::from_env();
+    done_run_one_with_context(target, options, session_filter, local, &context)
+}
+
+fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter: Option<&str>, local: &mut DoneLocal, context: &DoneContext) -> Result<String, String> {
     let mut stdout = String::new();
     let sessions = local.done_list_windows();
     let target_lower = target.to_lowercase();
@@ -74,22 +112,21 @@ fn done_run_one(target: &str, options: &DoneOptions, session_filter: Option<&str
         let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] window '{target}' not running — nothing to auto-save");
     }
     if let Some(window) = &matched { done_kill_window(window, options, local, &mut stdout); } else { let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running"); }
-    let repos_root = ghq_root().join("github.com");
-    let removed_worktree = done_remove_worktree_via_config(&target_lower, &repos_root, options, &mut stdout)? || done_remove_worktree_by_scan(target, &repos_root, options, &mut stdout)?;
+    let removed_worktree = done_remove_worktree_via_config(&target_lower, context, options, &mut stdout)? || done_remove_worktree_by_scan(target, &context.repos_root, options, &mut stdout)?;
     if !removed_worktree { stdout.push_str("  \x1b[90m○\x1b[0m no worktree to remove (may be a main window)\n"); }
     if options.dry_run {
         if matched.is_none() && !removed_worktree { done_fail_missing_target(target)?; }
         let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would remove '{target_lower}' from fleet config if present\n");
         return Ok(stdout);
     }
-    let removed_config = done_remove_from_fleet_config(&target_lower, &mut stdout);
+    let removed_config = done_remove_from_fleet_config(&target_lower, context, &mut stdout);
     if !removed_config { stdout.push_str("  \x1b[90m○\x1b[0m not in any fleet config\n"); }
     if matched.is_none() && !removed_worktree && !removed_config { done_fail_missing_target(target)?; }
     stdout.push('\n');
     Ok(stdout)
 }
 
-fn done_run_all(options: &DoneOptions, local: &mut DoneLocal) -> String {
+fn done_run_all(options: &DoneOptions, local: &mut DoneLocal, context: &DoneContext) -> String {
     let mut stdout = String::new();
     let sessions = local.done_list_windows();
     let session_name = done_current_session_name(&sessions, options.target.as_deref(), local);
@@ -106,7 +143,7 @@ fn done_run_all(options: &DoneOptions, local: &mut DoneLocal) -> String {
     let mut skipped = 0_usize;
     for window in targets {
         let _ = writeln!(stdout, "\n\x1b[36m→\x1b[0m done {session_name}:{}", window.name);
-        match done_run_one(&window.name, options, Some(&session_name), local) { Ok(text) => { stdout.push_str(&text); processed += 1; }, Err(error) => { skipped += 1; let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m skipped {}: {error}", window.name); } }
+        match done_run_one_with_context(&window.name, options, Some(&session_name), local, context) { Ok(text) => { stdout.push_str(&text); processed += 1; }, Err(error) => { skipped += 1; let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m skipped {}: {error}", window.name); } }
     }
     let verb = if options.dry_run { "would process" } else { "processed" };
     let suffix = if skipped == 0 { String::new() } else { format!(", skipped {skipped}") };
@@ -199,6 +236,12 @@ fn done_session_stem(value: &str) -> String { value.trim().to_lowercase().trim_s
 
 fn done_compact_stem(value: &str) -> String { done_session_stem(value).chars().filter(char::is_ascii_alphanumeric).collect() }
 
+fn done_repos_root_from_cwd(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    cwd.ancestors()
+        .find(|path| path.file_name().and_then(std::ffi::OsStr::to_str) == Some("github.com"))
+        .map(std::path::Path::to_path_buf)
+}
+
 fn done_auto_save(window: &DoneWindow, options: &DoneOptions, local: &mut DoneLocal, stdout: &mut String) {
     let target = format!("{}:{}", window.session, window.name);
     let (command, cwd) = local.done_pane_info(&target).unwrap_or_default();
@@ -225,13 +268,13 @@ fn done_retrospective_command(command: &str) -> Option<&'static str> {
     if lower.contains("omx") || lower.contains("oh-my-codex") { Some("$rrr") } else if lower.is_empty() || lower.contains("codex") || lower.contains("aider") || lower.contains("opencode") { None } else { Some("/rrr") }
 }
 
-fn done_remove_worktree_via_config(window_lower: &str, repos_root: &std::path::Path, options: &DoneOptions, stdout: &mut String) -> Result<bool, String> {
-    for file in done_fleet_config_files() {
+fn done_remove_worktree_via_config(window_lower: &str, context: &DoneContext, options: &DoneOptions, stdout: &mut String) -> Result<bool, String> {
+    for file in done_fleet_config_files(context) {
         let Ok(raw) = std::fs::read_to_string(&file) else { continue; };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else { continue; };
         let Some(windows) = json.get("windows").and_then(serde_json::Value::as_array) else { continue; };
         let Some(repo) = windows.iter().find(|item| item.get("name").and_then(serde_json::Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case(window_lower))).and_then(|item| item.get("repo")).and_then(serde_json::Value::as_str) else { continue; };
-        let Some(worktree) = done_parse_worktree_path(&repos_root.join(repo), repos_root) else { break; };
+        let Some(worktree) = done_parse_worktree_path(&context.repos_root.join(repo), &context.repos_root) else { break; };
         if options.dry_run { let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would remove worktree {repo}"); return Ok(true); }
         done_remove_worktree(&worktree, options, stdout)?;
         return Ok(true);
@@ -302,9 +345,9 @@ fn done_parse_worktree_path(full_path: &std::path::Path, repos_root: &std::path:
     None
 }
 
-fn done_remove_from_fleet_config(window_lower: &str, stdout: &mut String) -> bool {
+fn done_remove_from_fleet_config(window_lower: &str, context: &DoneContext, stdout: &mut String) -> bool {
     let mut removed = false;
-    for file in done_fleet_config_files() {
+    for file in done_fleet_config_files(context) {
         let Ok(raw) = std::fs::read_to_string(&file) else { continue; };
         let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&raw) else { continue; };
         let before = json.get("windows").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
@@ -319,8 +362,8 @@ fn done_remove_from_fleet_config(window_lower: &str, stdout: &mut String) -> boo
     removed
 }
 
-fn done_fleet_config_files() -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(active_config_dir().join("fleet")) else { return Vec::new(); };
+fn done_fleet_config_files(context: &DoneContext) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(context.config_dir.join("fleet")) else { return Vec::new(); };
     let mut files = entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).collect::<Vec<_>>();
     files.sort();
     files
