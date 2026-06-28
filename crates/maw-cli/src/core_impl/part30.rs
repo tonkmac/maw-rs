@@ -969,17 +969,175 @@ fn receiver_inbox_ghq_root() -> std::path::PathBuf {
     )
 }
 
+fn receiver_inbox_target_cwd_parts(target: &str) -> Option<(&str, Option<&str>)> {
+    let clean = receiver_inbox_strip_pane_suffix(target.trim());
+    if clean.is_empty() {
+        return None;
+    }
+    let parts = clean.split(':').collect::<Vec<_>>();
+    let (session, window) = if parts.len() >= 3 {
+        (parts.get(1).copied().unwrap_or_default(), parts.get(2).copied())
+    } else {
+        (parts.first().copied().unwrap_or_default(), parts.get(1).copied())
+    };
+    let session = session.trim();
+    if session.is_empty() {
+        return None;
+    }
+    Some((session, window.map(str::trim).filter(|value| !value.is_empty())))
+}
+
+fn receiver_inbox_target_cwd_window<'a>(
+    fleet: &'a NativeFleetSession,
+    win_ref: Option<&str>,
+) -> Option<&'a NativeFleetWindow> {
+    let Some(win_ref) = win_ref else {
+        return fleet.windows.first();
+    };
+    if win_ref.bytes().all(|byte| byte.is_ascii_digit()) {
+        return win_ref
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| fleet.windows.get(index));
+    }
+    fleet.windows.iter().find(|window| window.name == win_ref)
+}
+
+fn receiver_inbox_resolve_target_cwd(target: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let Some((session, win_ref)) = receiver_inbox_target_cwd_parts(target) else {
+        return Ok(None);
+    };
+    let ghq_root = receiver_inbox_ghq_root();
+    let mut candidates = Vec::new();
+    for fleet in load_native_fleet().into_iter().filter(|fleet| fleet.name == session) {
+        let Some(window) = receiver_inbox_target_cwd_window(&fleet, win_ref) else {
+            continue;
+        };
+        let repo = window.repo.trim();
+        if repo.is_empty() {
+            continue;
+        }
+        candidates.push(ghq_root.join(repo));
+    }
+    let candidates = receiver_inbox_existing_candidates(candidates);
+    if candidates.len() > 1 {
+        return Err(format!("receiver repo ambiguous for {target}"));
+    }
+    Ok(candidates.into_iter().next())
+}
+
+fn receiver_inbox_lookup_key(value: &str) -> Option<String> {
+    let value = receiver_inbox_strip_pane_suffix(value.trim()).trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
+fn receiver_inbox_add_target_lookup_keys(keys: &mut BTreeSet<String>, raw: Option<&str>) {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let raw = receiver_inbox_strip_pane_suffix(raw);
+    if let Some(key) = receiver_inbox_lookup_key(raw) {
+        keys.insert(key);
+    }
+    let parts = raw
+        .split(':')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [session, window] => {
+            if let Some(key) = receiver_inbox_lookup_key(session) {
+                keys.insert(key);
+            }
+            if !window.bytes().all(|byte| byte.is_ascii_digit()) {
+                if let Some(key) = receiver_inbox_lookup_key(window) {
+                    keys.insert(key);
+                }
+            }
+        }
+        [_, session, window, ..] => {
+            if let Some(key) = receiver_inbox_lookup_key(session) {
+                keys.insert(key);
+            }
+            if !window.bytes().all(|byte| byte.is_ascii_digit()) {
+                if let Some(key) = receiver_inbox_lookup_key(window) {
+                    keys.insert(key);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn receiver_inbox_target_lookup_keys(input: &ReceiverInboxInput<'_>) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    receiver_inbox_add_target_lookup_keys(&mut keys, input.target);
+    receiver_inbox_add_target_lookup_keys(&mut keys, input.to);
+    receiver_inbox_add_target_lookup_keys(&mut keys, Some(input.query));
+    keys
+}
+
+fn receiver_inbox_manifest_entry_matches_target(
+    entry: &LocateManifestEntry,
+    target_keys: &BTreeSet<String>,
+) -> bool {
+    entry
+        .session
+        .as_deref()
+        .and_then(receiver_inbox_lookup_key)
+        .is_some_and(|key| target_keys.contains(&key))
+        || entry
+            .window
+            .as_deref()
+            .and_then(receiver_inbox_lookup_key)
+            .is_some_and(|key| target_keys.contains(&key))
+}
+
+fn receiver_inbox_push_manifest_entry_candidates(
+    candidates: &mut Vec<std::path::PathBuf>,
+    entry: &LocateManifestEntry,
+) {
+    if let Some(local_path) = entry.local_path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        candidates.push(std::path::PathBuf::from(local_path));
+    }
+    if let Some(repo) = entry.repo.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let ghq_root = receiver_inbox_ghq_root();
+        candidates.push(ghq_root.join("github.com").join(repo));
+        candidates.push(ghq_root.join(repo));
+    }
+}
+
+fn receiver_inbox_existing_candidates(
+    candidates: Vec<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.display().to_string()))
+        .filter(|candidate| candidate.exists())
+        .collect()
+}
+
 fn receiver_inbox_repo_candidates(
     oracle: &str,
     input: &ReceiverInboxInput<'_>,
     psi_root: Option<&std::path::Path>,
-) -> Vec<std::path::PathBuf> {
+) -> Result<Vec<std::path::PathBuf>, String> {
     let mut candidates = Vec::new();
     if let Some(psi_path) = psi_root {
         candidates.push(receiver_inbox_strip_psi_suffix(psi_path));
-    } else if let (Some(psi_path), Some(config_oracle)) = (receiver_inbox_config_psi_path(), input.config.oracle.as_deref()) {
+    } else if let (Some(psi_path), Some(config_oracle)) =
+        (receiver_inbox_config_psi_path(), input.config.oracle.as_deref())
+    {
         if receiver_inbox_normalize_oracle_name(Some(config_oracle)).as_deref() == Some(oracle) {
             candidates.push(receiver_inbox_strip_psi_suffix(&psi_path));
+        }
+    }
+    if let Some(target) = input.target {
+        match receiver_inbox_resolve_target_cwd(target) {
+            Ok(Some(path)) => candidates.push(path),
+            Ok(None) => {}
+            Err(reason) => return Err(reason),
         }
     }
     let manifest = locate_load_manifest();
@@ -988,21 +1146,27 @@ fn receiver_inbox_repo_candidates(
             || entry.window.as_deref().and_then(|window| receiver_inbox_normalize_oracle_name(Some(window))).as_deref()
                 == Some(oracle)
     }) {
-        if let Some(local_path) = entry.local_path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-            candidates.push(std::path::PathBuf::from(local_path));
-        }
-        if let Some(repo) = entry.repo.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-            let ghq_root = receiver_inbox_ghq_root();
-            candidates.push(ghq_root.join("github.com").join(repo));
-            candidates.push(ghq_root.join(repo));
-        }
+        receiver_inbox_push_manifest_entry_candidates(&mut candidates, entry);
     }
-    let mut seen = HashSet::new();
-    candidates
-        .into_iter()
-        .filter(|candidate| seen.insert(candidate.display().to_string()))
-        .filter(|candidate| candidate.exists())
-        .collect()
+
+    let target_keys = receiver_inbox_target_lookup_keys(input);
+    if !target_keys.is_empty() {
+        let mut phase_b = Vec::new();
+        for entry in manifest
+            .iter()
+            .filter(|entry| receiver_inbox_manifest_entry_matches_target(entry, &target_keys))
+        {
+            let mut entry_candidates = Vec::new();
+            receiver_inbox_push_manifest_entry_candidates(&mut entry_candidates, entry);
+            phase_b.extend(receiver_inbox_existing_candidates(entry_candidates));
+        }
+        let phase_b = receiver_inbox_existing_candidates(phase_b);
+        if phase_b.len() > 1 {
+            return Err(format!("receiver repo ambiguous for {}", input.query));
+        }
+        candidates.extend(phase_b);
+    }
+    Ok(receiver_inbox_existing_candidates(candidates))
 }
 
 fn persist_receiver_inbox(
@@ -1013,8 +1177,15 @@ fn persist_receiver_inbox(
     let Some(oracle) = receiver_inbox_resolve_oracle(&input) else {
         return ReceiverInboxResult::Err { oracle: None, reason: "receiver oracle could not be inferred".to_owned() };
     };
-    let Some(repo_path) = receiver_inbox_repo_candidates(&oracle, &input, psi_root).into_iter().next() else {
-        return ReceiverInboxResult::Err { oracle: Some(oracle.clone()), reason: format!("receiver repo not found for {oracle}") };
+    let repo_candidates = match receiver_inbox_repo_candidates(&oracle, &input, psi_root) {
+        Ok(candidates) => candidates,
+        Err(reason) => return ReceiverInboxResult::Err { oracle: Some(oracle), reason },
+    };
+    let Some(repo_path) = repo_candidates.into_iter().next() else {
+        return ReceiverInboxResult::Err {
+            oracle: Some(oracle.clone()),
+            reason: format!("receiver repo not found for {oracle}"),
+        };
     };
     let timestamp = receiver_inbox_iso_from_millis(now_millis);
     let date_part = &timestamp[..10];
@@ -2243,6 +2414,14 @@ mod serve_tests {
         })
     }
 
+    fn serve_test_receiver_inbox_from_manifest(now_millis: u128) -> Arc<dyn ServeReceiverInbox> {
+        Arc::new(ServeSystemReceiverInbox {
+            enabled: Some(true),
+            fixed_now_millis: Some(now_millis),
+            psi_root: None,
+        })
+    }
+
     fn serve_test_peer_pubkey(from: &str, pubkey: &str) -> ServePeerPubkey {
         ServePeerPubkey {
             from: from.to_owned(),
@@ -2332,7 +2511,13 @@ mod serve_tests {
         peer_addr_override: Option<SocketAddr>,
         delivery: Arc<dyn ServeDelivery>,
     ) -> Router {
-        serve_test_app_with_o6_keys_delivery_and_inbox(keys, now, peer_addr_override, delivery, serve_test_receiver_inbox())
+        serve_test_app_with_o6_keys_delivery_and_inbox(
+            keys,
+            now,
+            peer_addr_override,
+            delivery,
+            serve_test_receiver_inbox(),
+        )
     }
 
     fn serve_test_app_with_o6_keys_delivery_and_inbox(
@@ -2731,6 +2916,115 @@ mod serve_tests {
         repo
     }
 
+    struct ServeInboxManifestEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        root: std::path::PathBuf,
+        config: std::path::PathBuf,
+        cache: std::path::PathBuf,
+        ghq: std::path::PathBuf,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ServeInboxManifestEnv {
+        fn new(label: &str) -> Self {
+            let guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+            let keys = [
+                "HOME",
+                "MAW_HOME",
+                "MAW_CONFIG_DIR",
+                "MAW_CACHE_DIR",
+                "MAW_XDG",
+                "XDG_CONFIG_HOME",
+                "GHQ_ROOT",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            let root = std::env::temp_dir().join(format!(
+                "maw-rs-receiver-inbox-manifest-{label}-{}-{}",
+                std::process::id(),
+                random_hex(4)
+            ));
+            let home = root.join("home");
+            let config = root.join("config");
+            let cache = root.join("cache");
+            let ghq = root.join("ghq");
+            std::fs::create_dir_all(config.join("fleet")).expect("fleet dir");
+            std::fs::create_dir_all(&cache).expect("cache dir");
+            std::fs::create_dir_all(ghq.join("github.com")).expect("ghq dir");
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("MAW_HOME");
+            std::env::remove_var("MAW_XDG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("MAW_CONFIG_DIR", &config);
+            std::env::set_var("MAW_CACHE_DIR", &cache);
+            std::env::set_var("GHQ_ROOT", ghq.join("github.com"));
+            Self {
+                _guard: guard,
+                root,
+                config,
+                cache,
+                ghq,
+                saved,
+            }
+        }
+
+        fn add_fleet_repo(
+            &self,
+            file: &str,
+            session: &str,
+            window: &str,
+            repo: &str,
+        ) -> std::path::PathBuf {
+            let repo_path = self.ghq.join("github.com").join(repo);
+            std::fs::create_dir_all(repo_path.join("ψ")).expect("repo psi");
+            let fleet = json!({
+                "name": session,
+                "windows": [{"name": window, "repo": repo}],
+            });
+            std::fs::write(
+                self.config.join("fleet").join(file),
+                serde_json::to_string_pretty(&fleet).expect("fleet json"),
+            )
+            .expect("write fleet");
+            repo_path
+        }
+
+        fn write_local_scanned_oracles_json(&self, name: &str, repo: &str, local_path: &std::path::Path) {
+            let value = json!({
+                "schema": 1,
+                "oracles": [{
+                    "org": "tonkmac",
+                    "repo": repo,
+                    "name": name,
+                    "local_path": local_path.display().to_string(),
+                    "has_psi": true,
+                    "has_fleet_config": true,
+                    "federation_node": "bigboy-vps"
+                }]
+            });
+            std::fs::write(
+                self.cache.join("oracles.json"),
+                serde_json::to_string_pretty(&value).expect("oracles json"),
+            )
+            .expect("write oracles");
+        }
+    }
+
+    impl Drop for ServeInboxManifestEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[tokio::test]
     async fn serve_api_send_inbox_true_writes_receiver_inbox_without_tmux_send() {
         let repo = serve_test_inbox_repo("success");
@@ -2744,7 +3038,14 @@ mod serve_tests {
         );
         let body = r#"{"target":"capture-agent","text":"hello nested inbox","inbox":true}"#;
         let response = app
-            .oneshot(signed_json_request("POST", "/api/send", body, KEY, "alloy:bigboy-vps", 1_782_623_880))
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                KEY,
+                "alloy:bigboy-vps",
+                1_782_623_880,
+            ))
             .await
             .expect("inbox response");
         let status = response.status();
@@ -2768,6 +3069,224 @@ mod serve_tests {
             written,
             "---\nfrom: bigboy-vps:alloy\nto: capture-agent\ntimestamp: 2026-06-28T05:18:00.000Z\nread: false\n---\n\nhello nested inbox\n"
         );
+    }
+
+    #[test]
+    fn receiver_inbox_manifest_phase_a_keeps_numbered_oracle_name_match() {
+        let env = ServeInboxManifestEnv::new("phase-a");
+        let repo = env.add_fleet_repo(
+            "01-wish.json",
+            "01-wish",
+            "wish-oracle",
+            "tonkmac/wish-oracle",
+        );
+        let config = HeyConfig {
+            node: None,
+            oracle: None,
+            route: RouteConfig::default(),
+        };
+        let result = persist_receiver_inbox(
+            ReceiverInboxInput {
+                query: "wish",
+                target: Some("wish"),
+                to: Some("wish"),
+                from: "bigboy-vps:alloy",
+                message: "hello wish inbox",
+                config: &config,
+            },
+            1_782_623_880_000,
+            None,
+        );
+        let ReceiverInboxResult::Ok(ok) = result else {
+            panic!("phase-a inbox write failed: {result:?}");
+        };
+        assert_eq!(ok.oracle, "wish");
+        assert_eq!(ok.inbox_dir, repo.join("ψ").join("inbox"));
+        let written = std::fs::read_to_string(ok.path).expect("inbox body");
+        assert!(written.contains("to: wish\n"));
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_inbox_true_resolves_fleet_target_cwd_without_relabeling_oracle() {
+        let env = ServeInboxManifestEnv::new("bigboylocal");
+        let repo = env.add_fleet_repo(
+            "02-bigboy.json",
+            "02-bigboy",
+            "bigboylocal-oracle",
+            "tonkmac/bigboylocal-oracle",
+        );
+        env.write_local_scanned_oracles_json("bigboylocal", "bigboylocal-oracle", &repo);
+        let delivery = Arc::new(FakeServeDelivery::default());
+        delivery.set_sessions(vec![vec![serve_test_session(
+            "02-bigboy",
+            0,
+            "bigboylocal-oracle",
+        )]]);
+        let app = serve_test_app_with_o6_keys_delivery_and_inbox(
+            vec![serve_test_peer_pubkey("alloy:bigboy-vps", KEY)],
+            1_782_623_880,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            serve_test_receiver_inbox_from_manifest(1_782_623_880_000),
+        );
+        let body = r#"{"target":"02-bigboy","text":"hello bigboy inbox","inbox":true}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                KEY,
+                "alloy:bigboy-vps",
+                1_782_623_880,
+            ))
+            .await
+            .expect("inbox response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["target"], "02-bigboy:0");
+        assert_eq!(payload["source"], "inbox");
+        assert!(delivery.sends().is_empty(), "inbox-only must not inject tmux");
+
+        let expected = repo
+            .join("ψ")
+            .join("inbox")
+            .join("2026-06-28_05-18_bigboy-vps-alloy_hello-bigboy-inbox.md");
+        assert_eq!(payload["inbox"], expected.display().to_string());
+        let written = std::fs::read_to_string(&expected).expect("inbox body");
+        assert_eq!(
+            written,
+            concat!(
+                "---\n",
+                "from: bigboy-vps:alloy\n",
+                "to: bigboy\n",
+                "timestamp: 2026-06-28T05:18:00.000Z\n",
+                "read: false\n",
+                "---\n\n",
+                "hello bigboy inbox\n"
+            )
+        );
+    }
+
+    #[test]
+    fn receiver_inbox_target_cwd_matches_maw_js_window_selection_rules() {
+        let env = ServeInboxManifestEnv::new("target-cwd");
+        let repo = env.add_fleet_repo(
+            "02-bigboy.json",
+            "02-bigboy",
+            "bigboylocal-oracle",
+            "tonkmac/bigboylocal-oracle",
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("02-bigboy").expect("session"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("02-bigboy:0").expect("index"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("02-bigboy:bigboylocal-oracle").expect("window"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("node:02-bigboy:bigboylocal-oracle")
+                .expect("node window"),
+            Some(repo)
+        );
+        assert_eq!(
+            receiver_inbox_resolve_target_cwd("bigboy").expect("wrong owner"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_inbox_true_refuses_ambiguous_fleet_session_owner() {
+        let env = ServeInboxManifestEnv::new("ambiguous");
+        let repo_one = env.add_fleet_repo(
+            "02-bigboy-a.json",
+            "02-bigboy",
+            "bigboylocal-oracle",
+            "tonkmac/bigboylocal-oracle",
+        );
+        let repo_two = env.add_fleet_repo(
+            "02-bigboy-b.json",
+            "02-bigboy",
+            "bigboylocal-alt-oracle",
+            "tonkmac/bigboylocal-alt-oracle",
+        );
+        let delivery = Arc::new(FakeServeDelivery::default());
+        delivery.set_sessions(vec![vec![serve_test_session(
+            "02-bigboy",
+            0,
+            "bigboylocal-oracle",
+        )]]);
+        let app = serve_test_app_with_o6_keys_delivery_and_inbox(
+            vec![serve_test_peer_pubkey("alloy:bigboy-vps", KEY)],
+            1_782_623_880,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            serve_test_receiver_inbox_from_manifest(1_782_623_880_000),
+        );
+        let body = r#"{"target":"02-bigboy","text":"hello ambiguous inbox","inbox":true}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                KEY,
+                "alloy:bigboy-vps",
+                1_782_623_880,
+            ))
+            .await
+            .expect("inbox response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{payload}");
+        assert_eq!(payload["error"], "receiver-inbox-unavailable");
+        assert!(payload["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("receiver repo ambiguous"));
+        assert!(delivery.sends().is_empty());
+        assert!(!repo_one.join("ψ").join("inbox").exists());
+        assert!(!repo_two.join("ψ").join("inbox").exists());
+    }
+
+    #[test]
+    fn receiver_inbox_target_lookup_refuses_numeric_strip_wrong_owner() {
+        let env = ServeInboxManifestEnv::new("wrong-owner");
+        let _repo = env.add_fleet_repo(
+            "02-bigboy.json",
+            "02-bigboy",
+            "bigboylocal-oracle",
+            "tonkmac/bigboylocal-oracle",
+        );
+        let config = HeyConfig {
+            node: None,
+            oracle: None,
+            route: RouteConfig::default(),
+        };
+        let result = persist_receiver_inbox(
+            ReceiverInboxInput {
+                query: "bigboy",
+                target: Some("bigboy"),
+                to: Some("bigboy"),
+                from: "bigboy-vps:alloy",
+                message: "hello wrong owner",
+                config: &config,
+            },
+            1_782_623_880_000,
+            None,
+        );
+        match result {
+            ReceiverInboxResult::Err { oracle, reason } => {
+                assert_eq!(oracle.as_deref(), Some("bigboy"));
+                assert_eq!(reason, "receiver repo not found for bigboy");
+            }
+            ReceiverInboxResult::Ok(ok) => panic!("unexpected inbox write: {ok:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2834,7 +3353,14 @@ mod serve_tests {
         );
         let body = r#"{"target":"capture-agent","text":"hello nested inbox","inbox":true}"#;
         let response = app
-            .oneshot(signed_json_request("POST", "/api/send", body, KEY, "alloy:bigboy-vps", 1_782_623_880))
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                KEY,
+                "alloy:bigboy-vps",
+                1_782_623_880,
+            ))
             .await
             .expect("inbox response");
         let payload = response_json(response).await;
