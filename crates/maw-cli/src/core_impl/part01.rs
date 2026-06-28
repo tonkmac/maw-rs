@@ -50,7 +50,8 @@ use maw_plugin_manifest::{
     PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
-    build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
+    build_manifest_json, cmd_plugin_create, validate_plugin_name, PluginCreateRequest,
+    PluginLanguage as ScaffoldLanguage,
 };
 use maw_policy::{default_active_group, weight_to_tier, DEFAULT_TIER, KNOWN_TIERS};
 use maw_routing::{

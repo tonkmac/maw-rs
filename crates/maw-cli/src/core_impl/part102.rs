@@ -3,7 +3,7 @@ const DISPATCH_102: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(plugin_run_command),
 }];
 
-const PLUGIN_USAGE: &str = "usage: maw plugin <ls|info|install|remove|enable|disable|init|create|build|dev> [args]\n  ls/list                  list installed plugins\n  info <name>              show manifest and resolved paths\n  install <dir> --root R   install a built plugin directory\n  remove <name> --yes      archive installed plugin directory (Nothing Deleted)\n  enable <name...>         enable plugins in the local disabled registry\n  disable <name>           disable one plugin in the local disabled registry\n  init|create <name>       create file-only JS plugin scaffold\n  build [dir] [--watch]    build Rust WASM plugins with cargo; JS/TS refused unless prebuilt WASM\n  dev [dir]                bounded one-build dev alias for Rust WASM plugins";
+const PLUGIN_USAGE: &str = "usage: maw plugin <ls|info|install|remove|enable|disable|init|create|build|dev> [args]\n  ls/list                  list installed plugins\n  info <name>              show manifest and resolved paths\n  install <dir> --root R   install a built plugin directory\n  remove <name> --yes      archive installed plugin directory (Nothing Deleted)\n  enable <name...>         enable plugins in the local disabled registry\n  disable <name>           disable one plugin in the local disabled registry\n  init|create <name> [--rust] create file-only JS or Rust WASM plugin scaffold\n  build [dir] [--watch]    build Rust WASM plugins with cargo; JS/TS refused unless prebuilt WASM\n  dev [dir]                bounded one-build dev alias for Rust WASM plugins";
 const PLUGIN_TS_REFUSAL: &str = "plugin build/dev: JS/TS source plugins are not built by maw-rs because no Bun/JS compiler is vendored. Build this plugin to WASM first (Rust wasm32-unknown-unknown or a prebuilt WASM artifact) and set target=wasm with a relative wasm path in plugin.json. No Bun/JS subprocess fallback is available.";
 
 fn plugin_run_command(argv: &[String]) -> CliOutput {
@@ -44,6 +44,9 @@ fn plugin_with_subcommand(kind: &str, rest: &[String]) -> Vec<String> {
 
 fn plugin_create(argv: &[String]) -> Result<CliOutput, String> {
     let parsed = plugin_parse_create(argv)?;
+    if parsed.rust {
+        return plugin_create_rust(&parsed);
+    }
     match init_js_plugin_dir(&parsed.name, &parsed.dir) {
         Ok(summary) => Ok(CliOutput {
             code: 0,
@@ -54,16 +57,18 @@ fn plugin_create(argv: &[String]) -> Result<CliOutput, String> {
     }
 }
 
-struct PluginCreateArgs { name: String, dir: std::path::PathBuf, plan_json: bool }
+struct PluginCreateArgs { name: String, dir: std::path::PathBuf, plan_json: bool, rust: bool }
 
 fn plugin_parse_create(argv: &[String]) -> Result<PluginCreateArgs, String> {
     let mut name = None;
     let mut dir = None;
     let mut plan_json = false;
+    let mut rust = false;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
             "--plan-json" => plan_json = true,
+            "--rust" => rust = true,
             "--dir" => { dir = Some(plugin_take_path(argv, index, "--dir")?); index += 1; }
             other if !other.starts_with('-') && name.is_none() => name = Some(other.to_owned()),
             other => return Err(format!("plugin create: unknown argument {other}")),
@@ -72,7 +77,91 @@ fn plugin_parse_create(argv: &[String]) -> Result<PluginCreateArgs, String> {
     }
     let name = plugin_validate_name(&name.ok_or_else(|| "plugin create: name is required".to_owned())?)?;
     let dir = dir.unwrap_or_else(|| std::path::PathBuf::from(&name));
-    Ok(PluginCreateArgs { name, dir, plan_json })
+    Ok(PluginCreateArgs { name, dir, plan_json, rust })
+}
+
+fn plugin_create_rust(parsed: &PluginCreateArgs) -> Result<CliOutput, String> {
+    let template_root = plugin_create_rust_template_root()?;
+    let rust_template = template_root.join("rust");
+    let as_template = template_root.join("as");
+    plugin_write_builtin_rust_template(&rust_template)?;
+    std::fs::create_dir_all(&as_template)
+        .map_err(|error| format!("plugin create: as template create failed: {error}"))?;
+    let request = PluginCreateRequest {
+        name: Some(parsed.name.clone()),
+        rust: true,
+        assembly_script: false,
+        dest: parsed.dir.clone(),
+    };
+    let result = cmd_plugin_create(&request, &rust_template, &as_template, "extism-pdk");
+    let _ = std::fs::remove_dir_all(&template_root);
+    result.map_err(|error| error.to_string())?;
+    Ok(CliOutput {
+        code: 0,
+        stdout: if parsed.plan_json {
+            plugin_create_rust_summary_json(&parsed.name, &parsed.dir)
+        } else {
+            format!("created plugin {} {}\n", parsed.name.replace('_', "-"), path_string(&parsed.dir))
+        },
+        stderr: String::new(),
+    })
+}
+
+fn plugin_create_rust_template_root() -> Result<std::path::PathBuf, String> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let root = std::env::temp_dir().join(format!(
+        "maw-rs-plugin-create-rust-template-{}-{millis}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("plugin create: template root create failed: {error}"))?;
+    Ok(root)
+}
+
+fn plugin_write_builtin_rust_template(template: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(template.join("src"))
+        .map_err(|error| format!("plugin create: rust template create failed: {error}"))?;
+    std::fs::write(
+        template.join("Cargo.toml"),
+        r#"[package]
+name = "hello-rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "=1.4.1"
+
+[workspace]
+"#,
+    )
+    .map_err(|error| format!("plugin create: rust Cargo.toml template failed: {error}"))?;
+    std::fs::write(
+        template.join("src").join("lib.rs"),
+        r##"use extism_pdk::*;
+
+#[plugin_fn]
+pub fn handle(_input: String) -> FnResult<String> {
+    Ok(r#"{"ok":true}"#.to_owned())
+}
+"##,
+    )
+    .map_err(|error| format!("plugin create: rust lib.rs template failed: {error}"))?;
+    Ok(())
+}
+
+fn plugin_create_rust_summary_json(name: &str, dir: &std::path::Path) -> String {
+    format!(
+        "{{\"command\":\"plugin\",\"kind\":\"create\",\"language\":\"rust\",\"name\":{},\"dir\":{},\"manifestPath\":{},\"entryPath\":{}}}\n",
+        json_string(&name.replace('_', "-")),
+        json_string(&path_string(dir)),
+        json_string(&path_string(dir.join("plugin.json"))),
+        json_string(&path_string(dir.join("src").join("lib.rs")))
+    )
 }
 
 fn plugin_info(argv: &[String]) -> Result<CliOutput, String> {
@@ -485,7 +574,7 @@ fn plugin_error(code: i32, message: &str) -> CliOutput { CliOutput { code, stdou
 #[cfg(test)]
 mod plugin_native_tests {
     use super::{
-        plugin_build_or_dev_with_runner, plugin_cargo_build_args, plugin_run_command,
+        path_string, plugin_build_or_dev_with_runner, plugin_cargo_build_args, plugin_run_command,
         PluginBuildRunner, PluginCargoOutput, DISPATCH_102,
     };
     use std::path::{Path, PathBuf};
@@ -563,6 +652,41 @@ mod plugin_native_tests {
             assert!(out.stderr.contains("No Bun/JS subprocess fallback is available"));
             assert!(!out.stderr.contains("DELEGATED-MAW"));
         }
+    }
+
+    #[test]
+    fn plugin_create_rust_flag_scaffolds_rust_wasm_plugin_without_delegation() {
+        let root = plugin_temp_root("create-rust");
+        let dir = root.join("route-probe");
+        let out = plugin_run_command(&plugin_args(&[
+            "create",
+            "--rust",
+            "route-probe",
+            "--dir",
+            &dir.display().to_string(),
+        ]));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(
+            out.stdout,
+            include_str!("../../tests/fixtures/native-plugin-create/plugin-create-rust.stdout")
+                .replace("<DIR>", &path_string(&dir))
+        );
+        assert!(out.stderr.is_empty());
+        assert!(!out.stdout.contains("DELEGATED-MAW"));
+
+        let cargo = std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml");
+        assert!(cargo.contains(r#"name = "route-probe""#), "{cargo}");
+        assert!(cargo.contains(r#"extism-pdk = "=1.4.1""#), "{cargo}");
+        assert!(cargo.contains(r#"crate-type = ["cdylib"]"#), "{cargo}");
+        let lib = std::fs::read_to_string(dir.join("src").join("lib.rs")).expect("lib.rs");
+        assert!(lib.contains("#[plugin_fn]"), "{lib}");
+        let manifest = std::fs::read_to_string(dir.join("plugin.json")).expect("plugin.json");
+        assert!(manifest.contains(r#""name": "route-probe""#), "{manifest}");
+        assert!(
+            manifest.contains(r#""wasm": "./target/wasm32-unknown-unknown/release/route_probe.wasm""#),
+            "{manifest}"
+        );
+        assert!(!manifest.contains("DELEGATED-MAW"));
     }
 
     #[test]
