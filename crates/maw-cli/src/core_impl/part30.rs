@@ -10,7 +10,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
