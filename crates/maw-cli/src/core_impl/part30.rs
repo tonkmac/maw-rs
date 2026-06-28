@@ -1978,6 +1978,29 @@ mod serve_tests {
             && entry.pubkey == "node-key-c"));
     }
 
+    #[test]
+    fn serve_peer_pubkey_collection_reads_maw_js_nested_identity_shape() {
+        let value = json!({
+            "version": 1,
+            "peers": {
+                "bigboy-vps": {
+                    "url": "http://100.64.0.1:3456",
+                    "node": "bigboy-vps",
+                    "addedAt": "2026-06-28T00:00:00.000Z",
+                    "lastSeen": "2026-06-28T00:01:00.000Z",
+                    "pubkeyFirstSeen": "2026-06-24T00:00:00.000Z",
+                    "pubkey": "node-key-bigboy-vps-401",
+                    "identity": {"oracle": "mawjs", "node": "bigboy-vps"}
+                }
+            }
+        });
+        let mut entries = Vec::new();
+        collect_peer_pubkeys(&value, None, &mut entries);
+        assert!(entries.iter().any(|entry| entry.from == "mawjs:bigboy-vps"
+            && entry.node == "bigboy-vps"
+            && entry.pubkey == "node-key-bigboy-vps-401"));
+    }
+
     #[tokio::test]
     async fn serve_o6_node_fallback_accepts_unseeded_oracle_on_known_node() {
         let node_key = "node-key-bigboy-vps-399";
