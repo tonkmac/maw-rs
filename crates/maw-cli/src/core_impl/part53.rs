@@ -34,6 +34,42 @@ struct IncubateOptions {
     sync_peers: bool,
 }
 
+trait IncubateBudInvoker {
+    fn incubate_bud(&mut self, args: &[String]) -> CliOutput;
+}
+
+struct IncubateRealBudInvoker;
+
+impl IncubateBudInvoker for IncubateRealBudInvoker {
+    fn incubate_bud(&mut self, args: &[String]) -> CliOutput {
+        let _guard = IncubateEnvRestore::set("MAW_FROM_RS", "1");
+        run_cli(args)
+    }
+}
+
+struct IncubateEnvRestore {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl IncubateEnvRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+impl Drop for IncubateEnvRestore {
+    fn drop(&mut self) {
+        if let Some(old) = &self.old {
+            std::env::set_var(self.key, old);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 fn incubate_usage() -> &'static str {
     "usage: maw incubate <source-repo> [--stem <name>] [--from <oracle>] [--root] [--seed] [--org <org>] [--note <text>] [--nickname <pretty>] [--fast] [--split] [--dry-run] [--flash | --contribute] [--no-trigger] [--trigger <text>]"
 }
@@ -46,6 +82,10 @@ fn run_incubate_command(argv: &[String]) -> CliOutput {
 }
 
 fn incubate_run(argv: &[String]) -> Result<String, String> {
+    incubate_run_with(argv, &mut IncubateRealBudInvoker)
+}
+
+fn incubate_run_with(argv: &[String], bud: &mut impl IncubateBudInvoker) -> Result<String, String> {
     let options = incubate_parse_args(argv)?;
     incubate_resolve_mode(options.flash, options.contribute)?;
     let stem = options
@@ -55,7 +95,7 @@ fn incubate_run(argv: &[String]) -> Result<String, String> {
     incubate_validate_target_arg(&stem, "stem")?;
     let trigger = if options.no_trigger { None } else { Some(incubate_build_skill_command(&options)?) };
 
-    let mut stdout = incubate_run_bud(&stem, &options)?;
+    let mut stdout = incubate_run_bud(&stem, &options, bud)?;
 
     if options.dry_run {
         if let Some(trigger) = trigger {
@@ -263,20 +303,16 @@ fn incubate_build_skill_command(options: &IncubateOptions) -> Result<String, Str
     Ok(command)
 }
 
-fn incubate_run_bud(stem: &str, options: &IncubateOptions) -> Result<String, String> {
+fn incubate_run_bud(stem: &str, options: &IncubateOptions, bud: &mut impl IncubateBudInvoker) -> Result<String, String> {
     let bud_args = incubate_bud_args(stem, options)?;
-    let output = std::process::Command::new("maw")
-        .args(&bud_args)
-        .env("MAW_FROM_RS", "1")
-        .output()
-        .map_err(|error| format!("incubate: failed to run maw bud: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw bud exited {}", output.status) };
+    let output = bud.incubate_bud(&bud_args);
+    if output.code != 0 {
+        let stderr = output.stderr.trim().to_owned();
+        let stdout = output.stdout.trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw bud exited {}", output.code) };
         return Err(format!("incubate: bud failed: {detail}"));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(output.stdout)
 }
 
 fn incubate_bud_args(stem: &str, options: &IncubateOptions) -> Result<Vec<String>, String> {
@@ -361,13 +397,35 @@ fn incubate_validate_target_arg(value: &str, label: &str) -> Result<(), String> 
 
 #[cfg(test)]
 mod incubate_tests {
-    use super::{
-        incubate_bud_args, incubate_build_skill_command, incubate_derive_stem_from_source,
-        incubate_parse_args, incubate_resolve_mode, IncubateMode,
-    };
+    use super::*;
 
     fn incubate_strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    struct FakeBudInvoker {
+        calls: Vec<Vec<String>>,
+        output: CliOutput,
+    }
+
+    impl Default for FakeBudInvoker {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                output: CliOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            }
+        }
+    }
+
+    impl IncubateBudInvoker for FakeBudInvoker {
+        fn incubate_bud(&mut self, args: &[String]) -> CliOutput {
+            self.calls.push(args.to_vec());
+            self.output.clone()
+        }
     }
 
     #[test]
@@ -422,5 +480,59 @@ mod incubate_tests {
         assert!(incubate_parse_args(&incubate_strings(&["org/foo", "--from", "-bad"])).expect_err("from guard").contains("requires a value"));
         assert!(incubate_parse_args(&incubate_strings(&["org/foo", "--issue", "-1"])).expect_err("issue guard").contains("requires a value"));
         assert_eq!(incubate_resolve_mode(true, true), Err("--flash and --contribute are mutually exclusive".to_owned()));
+    }
+
+    #[test]
+    fn incubate_run_with_invokes_bud_in_process_shape_and_dry_run_trigger() {
+        let mut bud = FakeBudInvoker {
+            output: CliOutput {
+                code: 0,
+                stdout: "bud dry-run\n".to_owned(),
+                stderr: String::new(),
+            },
+            ..FakeBudInvoker::default()
+        };
+        let output = incubate_run_with(
+            &incubate_strings(&["org/source", "--stem", "sprout", "--from", "nova", "--split", "--dry-run"]),
+            &mut bud,
+        )
+        .expect("incubate");
+        assert_eq!(bud.calls.len(), 1);
+        assert_eq!(
+            bud.calls[0],
+            incubate_strings(&["bud", "sprout", "--repo", "org/source", "--from", "nova", "--split", "--dry-run"])
+        );
+        assert!(output.starts_with("bud dry-run\n"));
+        assert!(output.contains("[dry-run] would send"));
+        assert!(output.contains("/incubate org/source"));
+    }
+
+    #[test]
+    fn incubate_run_with_propagates_fake_bud_failure_without_shelling_out() {
+        let mut bud = FakeBudInvoker {
+            output: CliOutput {
+                code: 17,
+                stdout: "ignored stdout".to_owned(),
+                stderr: "fake bud failure".to_owned(),
+            },
+            ..FakeBudInvoker::default()
+        };
+        let error = incubate_run_with(&incubate_strings(&["org/source", "--dry-run"]), &mut bud)
+            .expect_err("bud failure");
+        assert_eq!(bud.calls.len(), 1);
+        assert!(error.contains("incubate: bud failed: fake bud failure"));
+    }
+
+    #[test]
+    fn real_bud_invoker_sets_and_restores_maw_from_rs_for_in_process_dispatch() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_FROM_RS");
+        std::env::set_var("MAW_FROM_RS", "original");
+        let mut invoker = IncubateRealBudInvoker;
+        let output = invoker.incubate_bud(&incubate_strings(&["bud", "--help"]));
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert_eq!(std::env::var("MAW_FROM_RS").as_deref(), Ok("original"));
     }
 }
