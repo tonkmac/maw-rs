@@ -156,7 +156,7 @@ async fn talkto_peer(
 ) -> CliOutput {
     if let Err(message) = talkto_validate_transport_target(target) { return talkto_saved_or_error(&message, thread); }
     let send_args = SendArgs { target: target.to_owned(), text: notification.to_owned(), inbox: None, from: None, approve: false, trust: false };
-    let mut output = match send_acl_gate_peer("talk-to", target, &send_args, config) {
+    let mut output = match send_acl_gate_peer("talk-to", target, &send_args, config, false) {
         SendAclGateResult::Proceed { stderr_prefix } => {
             if let Some(output) = talkto_fake_peer(peer_url, target, node, args, notification, thread) {
                 send_acl_apply_proceed_stderr(output, &stderr_prefix)

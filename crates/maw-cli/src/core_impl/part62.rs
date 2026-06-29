@@ -1,6 +1,6 @@
 const DISPATCH_62: &[DispatcherEntry] = &[DispatcherEntry {
     command: "inbox",
-    handler: Handler::Sync(run_inbox_command),
+    handler: Handler::Async(run_inbox_command),
 }];
 
 const INBOX_USAGE: &str = "maw inbox [--unread] [--from <peer>] [--last N] | status [oracle-name] [--json] [--all] | drain [oracle-name] --safe [--max N] [--older-than-hours H] [--json] [--dry-run] | read <id> | show [N] | write <msg> | pending | approve <id> | reject <id> | show-pending <id>";
@@ -93,56 +93,43 @@ struct InboxCursorEntry {
 type InboxCursorStore = BTreeMap<String, InboxCursorEntry>;
 
 trait InboxSender {
-    fn inbox_send(&mut self, query: &str, message: &str) -> Result<(), String>;
-    fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
-        self.inbox_send(query, message)
-    }
+    fn inbox_send<'a>(
+        &'a mut self,
+        query: &'a str,
+        message: &'a str,
+        acl_bypass: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 struct InboxSystemSender;
 
-fn inbox_self_bin() -> Result<std::path::PathBuf, String> {
-    std::env::var_os("MAW_RS_SELF_BIN")
-        .map(std::path::PathBuf::from)
-        .map_or_else(
-            || std::env::current_exe().map_err(|error| format!("inbox: current_exe failed: {error}")),
-            Ok,
-        )
-}
-
 impl InboxSender for InboxSystemSender {
-    fn inbox_send(&mut self, query: &str, message: &str) -> Result<(), String> {
-        inbox_validate_target_arg(query, "query")?;
-        let output = std::process::Command::new(inbox_self_bin()?)
-            .args(["hey", "--", query, message])
-            .output()
-            .map_err(|error| format!("inbox: failed to execute maw hey: {error}"))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("inbox: maw hey failed: {}", stderr.trim()))
-        }
-    }
-
-    fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
-        inbox_validate_target_arg(query, "query")?;
-        let output = std::process::Command::new(inbox_self_bin()?)
-            .args(["hey", "--", query, message])
-            .env("MAW_ACL_BYPASS", "1")
-            .output()
-            .map_err(|error| format!("inbox: failed to execute maw hey: {error}"))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("inbox: maw hey failed: {}", stderr.trim()))
-        }
+    fn inbox_send<'a>(
+        &'a mut self,
+        query: &'a str,
+        message: &'a str,
+        acl_bypass: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            inbox_validate_target_arg(query, "query")?;
+            let output = run_hey_in_process(query, message, acl_bypass).await;
+            if output.code == 0 {
+                Ok(())
+            } else {
+                let detail = if output.stderr.trim().is_empty() {
+                    output.stdout.trim().to_owned()
+                } else {
+                    output.stderr.trim().to_owned()
+                };
+                Err(format!("inbox: maw hey failed: {detail}"))
+            }
+        })
     }
 }
 
-fn run_inbox_command(argv: &[String]) -> CliOutput {
-    match inbox_run(argv, &inbox_real_env(), &mut InboxSystemSender) {
+fn run_inbox_command(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move {
+        match inbox_run(&args, &inbox_real_env(), &mut InboxSystemSender).await {
         Ok(stdout) => CliOutput {
             code: 0,
             stdout,
@@ -153,10 +140,11 @@ fn run_inbox_command(argv: &[String]) -> CliOutput {
             stdout: String::new(),
             stderr: format!("{message}\n"),
         },
-    }
+        }
+    })
 }
 
-fn inbox_run(
+async fn inbox_run(
     argv: &[String],
     env: &InboxEnv,
     sender: &mut impl InboxSender,
@@ -170,7 +158,7 @@ fn inbox_run(
     match argv.first().map(String::as_str) {
         Some("pending" | "queue") => inbox_run_pending(env, inbox_now_ms()),
         Some("show-pending" | "pending-show") => inbox_run_show_pending(&argv[1..], env, inbox_now_ms()),
-        Some("approve") => inbox_run_approve(&argv[1..], env, sender, inbox_now_ms()),
+        Some("approve") => inbox_run_approve(&argv[1..], env, sender, inbox_now_ms()).await,
         Some("reject") => inbox_run_reject(&argv[1..], env, inbox_now_ms()),
         Some("read") => inbox_run_mark_read(&argv[1..], env),
         Some("show") => inbox_run_show(&argv[1..], env),
@@ -667,7 +655,7 @@ fn inbox_run_show_pending(argv: &[String], env: &InboxEnv, now_ms: u64) -> Resul
     Ok(inbox_format_pending_detail(&message))
 }
 
-fn inbox_run_approve(
+async fn inbox_run_approve(
     argv: &[String],
     env: &InboxEnv,
     sender: &mut impl InboxSender,
@@ -688,7 +676,7 @@ fn inbox_run_approve(
     let state_pending_dir = inbox_state_pending_dir(env);
     inbox_write_pending(&state_pending_dir, &message)?;
     let query = message.query.as_deref().unwrap_or(&message.target);
-    if let Err(error) = sender.inbox_send_with_acl_bypass(query, &message.message) {
+    if let Err(error) = sender.inbox_send(query, &message.message, true).await {
         original_status.clone_into(&mut message.status);
         inbox_write_pending(&state_pending_dir, &message)?;
         return Err(error);
@@ -1648,30 +1636,42 @@ mod inbox_tests {
 
     #[derive(Default)]
     struct InboxFakeSender {
-        sent: Vec<(String, String)>,
+        sent: Vec<(String, String, bool)>,
         fail: bool,
-        bypass_seen: bool,
     }
 
     impl InboxSender for InboxFakeSender {
-        fn inbox_send(&mut self, query: &str, message: &str) -> Result<(), String> {
-            inbox_validate_target_arg(query, "query")?;
-            self.sent.push((query.to_owned(), message.to_owned()));
-            Ok(())
+        fn inbox_send<'a>(
+            &'a mut self,
+            query: &'a str,
+            message: &'a str,
+            acl_bypass: bool,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                inbox_validate_target_arg(query, "query")?;
+                if std::env::var("MAW_ACL_BYPASS").is_ok() {
+                    return Err("test leak: MAW_ACL_BYPASS should not be global".to_owned());
+                }
+                if self.fail {
+                    return Err("fake send failed".to_owned());
+                }
+                self.sent
+                    .push((query.to_owned(), message.to_owned(), acl_bypass));
+                Ok(())
+            })
         }
+    }
 
-        fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
-            inbox_validate_target_arg(query, "query")?;
-            self.bypass_seen = true;
-            if std::env::var("MAW_ACL_BYPASS").is_ok() {
-                return Err("test leak: MAW_ACL_BYPASS should not be global".to_owned());
-            }
-            if self.fail {
-                return Err("fake send failed".to_owned());
-            }
-            self.sent.push((query.to_owned(), message.to_owned()));
-            Ok(())
-        }
+    fn inbox_run_test(
+        argv: &[String],
+        env: &InboxEnv,
+        sender: &mut impl InboxSender,
+    ) -> Result<String, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(inbox_run(argv, env, sender))
     }
 
     fn inbox_temp_env(name: &str) -> InboxEnv {
@@ -1700,6 +1700,10 @@ mod inbox_tests {
     }
 
     fn inbox_pending_fixture(env: &InboxEnv, id: &str, status: &str) {
+        inbox_pending_fixture_with_message(env, id, status, "hello fleet");
+    }
+
+    fn inbox_pending_fixture_with_message(env: &InboxEnv, id: &str, status: &str, body: &str) {
         let message = InboxPendingMessage {
             id: id.to_owned(),
             sender: "alice".to_owned(),
@@ -1707,7 +1711,7 @@ mod inbox_tests {
             query: Some("bob".to_owned()),
             sent_at: "2026-06-25T00:00:00.000Z".to_owned(),
             status: status.to_owned(),
-            message: "hello fleet".to_owned(),
+            message: body.to_owned(),
         };
         inbox_write_pending(&inbox_state_pending_dir(env), &message).unwrap();
     }
@@ -1727,7 +1731,7 @@ mod inbox_tests {
             "[alice] ci green confirmed",
         );
         let mut sender = InboxFakeSender::default();
-        let list = inbox_run(
+        let list = inbox_run_test(
             &inbox_strings(&["--unread", "--from", "alice", "--last", "1"]),
             &env,
             &mut sender,
@@ -1735,12 +1739,12 @@ mod inbox_tests {
         .unwrap();
         assert!(list.contains("INBOX"));
         assert!(list.contains("alice"));
-        let show = inbox_run(&inbox_strings(&["show", "ci"]), &env, &mut sender).unwrap();
+        let show = inbox_run_test(&inbox_strings(&["show", "ci"]), &env, &mut sender).unwrap();
         assert!(show.contains("ci green confirmed"));
-        let read = inbox_run(&inbox_strings(&["read", "ci"]), &env, &mut sender).unwrap();
+        let read = inbox_run_test(&inbox_strings(&["read", "ci"]), &env, &mut sender).unwrap();
         assert!(read.contains("marked read"));
         let write =
-            inbox_run(&inbox_strings(&["write", "new", "note"]), &env, &mut sender).unwrap();
+            inbox_run_test(&inbox_strings(&["write", "new", "note"]), &env, &mut sender).unwrap();
         assert!(write.contains("wrote"));
     }
 
@@ -1755,7 +1759,7 @@ mod inbox_tests {
             "[alice] ci green confirmed",
         );
         let mut sender = InboxFakeSender::default();
-        let out = inbox_run(
+        let out = inbox_run_test(
             &inbox_strings(&["drain", "--safe", "--dry-run", "--older-than-hours", "0"]),
             &env,
             &mut sender,
@@ -1790,18 +1794,17 @@ mod inbox_tests {
         inbox_pending_fixture(&env, "def456", "pending");
         let mut sender = InboxFakeSender::default();
 
-        let pending = inbox_run(&inbox_strings(&["pending"]), &env, &mut sender).unwrap();
+        let pending = inbox_run_test(&inbox_strings(&["pending"]), &env, &mut sender).unwrap();
         assert_eq!(pending, include_str!("../../tests/fixtures/native-scope-acl/inbox-pending-list.stdout"));
 
-        let detail = inbox_run(&inbox_strings(&["show-pending", "abc"]), &env, &mut sender).unwrap();
+        let detail = inbox_run_test(&inbox_strings(&["show-pending", "abc"]), &env, &mut sender).unwrap();
         assert_eq!(detail, include_str!("../../tests/fixtures/native-scope-acl/inbox-show-pending.stdout"));
 
-        let approved = inbox_run(&inbox_strings(&["approve", "abc"]), &env, &mut sender).unwrap();
+        let approved = inbox_run_test(&inbox_strings(&["approve", "abc"]), &env, &mut sender).unwrap();
         assert_eq!(approved, include_str!("../../tests/fixtures/native-scope-acl/inbox-approve.stdout"));
-        assert!(sender.bypass_seen);
-        assert_eq!(sender.sent, vec![("bob".to_owned(), "hello fleet".to_owned())]);
+        assert_eq!(sender.sent, vec![("bob".to_owned(), "hello fleet".to_owned(), true)]);
 
-        let rejected = inbox_run(&inbox_strings(&["reject", "def"]), &env, &mut sender).unwrap();
+        let rejected = inbox_run_test(&inbox_strings(&["reject", "def"]), &env, &mut sender).unwrap();
         assert_eq!(rejected, include_str!("../../tests/fixtures/native-scope-acl/inbox-reject.stdout"));
     }
 
@@ -1811,23 +1814,45 @@ mod inbox_tests {
         inbox_pending_fixture(&env, "abc123", "pending");
         inbox_pending_fixture(&env, "def456", "pending");
         let mut sender = InboxFakeSender::default();
-        let pending = inbox_run(&inbox_strings(&["pending"]), &env, &mut sender).unwrap();
+        let pending = inbox_run_test(&inbox_strings(&["pending"]), &env, &mut sender).unwrap();
         assert!(pending.contains("abc123"));
         let detail =
-            inbox_run(&inbox_strings(&["show-pending", "abc"]), &env, &mut sender).unwrap();
+            inbox_run_test(&inbox_strings(&["show-pending", "abc"]), &env, &mut sender).unwrap();
         assert!(detail.contains("message:"));
-        let approved = inbox_run(&inbox_strings(&["approve", "abc"]), &env, &mut sender).unwrap();
+        let approved = inbox_run_test(&inbox_strings(&["approve", "abc"]), &env, &mut sender).unwrap();
         assert!(approved.contains("approved: abc123"));
         assert_eq!(
             sender.sent,
-            vec![("bob".to_owned(), "hello fleet".to_owned())]
+            vec![("bob".to_owned(), "hello fleet".to_owned(), true)]
         );
-        assert!(sender.bypass_seen);
         assert!(std::env::var("MAW_ACL_BYPASS").is_err());
         assert!(!inbox_state_pending_dir(&env).join("abc123.json").exists());
-        let rejected = inbox_run(&inbox_strings(&["reject", "def"]), &env, &mut sender).unwrap();
+        let rejected = inbox_run_test(&inbox_strings(&["reject", "def"]), &env, &mut sender).unwrap();
         assert!(rejected.contains("rejected: def456"));
         assert!(!inbox_state_pending_dir(&env).join("def456.json").exists());
+    }
+
+    #[test]
+    fn inbox_approve_sends_flag_like_messages_as_opaque_text() {
+        let cases = [
+            ("approve", "hello --approve"),
+            ("from", "hello --from=mallory:edge"),
+            ("trust", "hello --trust"),
+            ("leading", "-leading payload"),
+        ];
+
+        for (name, body) in cases {
+            let env = inbox_temp_env(name);
+            inbox_pending_fixture_with_message(&env, "abc123", "pending", body);
+            let mut sender = InboxFakeSender::default();
+
+            let approved =
+                inbox_run_test(&inbox_strings(&["approve", "abc"]), &env, &mut sender).unwrap();
+
+            assert!(approved.contains("approved: abc123"));
+            assert_eq!(sender.sent, vec![("bob".to_owned(), body.to_owned(), true)]);
+            assert!(std::env::var("MAW_ACL_BYPASS").is_err());
+        }
     }
 
     #[test]
@@ -1862,11 +1887,11 @@ mod inbox_tests {
         assert!(!inbox_state_pending_dir(&env).join("old999.json").exists());
 
         let mut sender = InboxFakeSender::default();
-        let list = inbox_run(&inbox_strings(&["queue"]), &env, &mut sender).unwrap();
+        let list = inbox_run_test(&inbox_strings(&["queue"]), &env, &mut sender).unwrap();
         assert!(list.contains("same123"));
         assert!(list.contains("state"));
         assert!(!list.contains("SECRET_BODY"));
-        let detail = inbox_run(&inbox_strings(&["show-pending", "same"]), &env, &mut sender).unwrap();
+        let detail = inbox_run_test(&inbox_strings(&["show-pending", "same"]), &env, &mut sender).unwrap();
         assert!(detail.contains("SECRET_BODY"));
     }
 
@@ -1878,9 +1903,8 @@ mod inbox_tests {
             fail: true,
             ..InboxFakeSender::default()
         };
-        let err = inbox_run(&inbox_strings(&["approve", "abc"]), &env, &mut sender).expect_err("send failure");
+        let err = inbox_run_test(&inbox_strings(&["approve", "abc"]), &env, &mut sender).expect_err("send failure");
         assert!(err.contains("fake send failed"));
-        assert!(sender.bypass_seen);
         let path = inbox_state_pending_dir(&env).join("abc123.json");
         assert!(path.exists());
         let pending = inbox_load_pending_for_env(&env, inbox_now_ms()).unwrap();
@@ -1917,15 +1941,36 @@ mod inbox_tests {
     fn inbox_guards_reject_leading_dash_and_paths() {
         let env = inbox_temp_env("guards");
         let mut sender = InboxFakeSender::default();
-        assert!(inbox_run(&inbox_strings(&["--from", "-bad"]), &env, &mut sender).is_err());
-        assert!(inbox_run(&inbox_strings(&["read", "../secret"]), &env, &mut sender).is_err());
-        assert!(inbox_run(&inbox_strings(&["write", "-bad"]), &env, &mut sender).is_err());
-        assert!(inbox_run(&inbox_strings(&["write", "--", "-ok"]), &env, &mut sender).is_ok());
+        assert!(inbox_run_test(&inbox_strings(&["--from", "-bad"]), &env, &mut sender).is_err());
+        assert!(inbox_run_test(&inbox_strings(&["read", "../secret"]), &env, &mut sender).is_err());
+        assert!(inbox_run_test(&inbox_strings(&["write", "-bad"]), &env, &mut sender).is_err());
+        assert!(inbox_run_test(&inbox_strings(&["write", "--", "-ok"]), &env, &mut sender).is_ok());
     }
 
     #[test]
     fn inbox_dispatch_is_native() {
         assert_eq!(DISPATCH_62.len(), 1);
         assert_eq!(DISPATCH_62[0].command, "inbox");
+    }
+
+    #[test]
+    fn inbox_path_has_no_self_spawn_or_acl_env_channel() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let part62 = std::fs::read_to_string(manifest_dir.join("src/core_impl/part62.rs"))
+            .expect("read part62");
+        let part62_prod = part62
+            .split_once("#[cfg(test)]")
+            .map_or(part62.as_str(), |(prod, _tests)| prod);
+        assert!(!part62_prod.contains("Command::new"));
+        assert!(!part62_prod.contains("current_exe"));
+        assert!(!part62_prod.contains("MAW_ACL_BYPASS"));
+
+        let part29 = std::fs::read_to_string(manifest_dir.join("src/core_impl/part29.rs"))
+            .expect("read part29");
+        let part29_prod = part29
+            .split_once("#[cfg(test)]")
+            .map_or(part29.as_str(), |(prod, _tests)| prod);
+        assert!(!part29_prod.contains("std::env::var(\"MAW_ACL_BYPASS\")"));
+        assert!(!part29_prod.contains("std::env::var_os(\"MAW_ACL_BYPASS\")"));
     }
 }
