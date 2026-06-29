@@ -39,6 +39,30 @@ async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutp
         Ok(parsed) => parsed,
         Err(message) => return send_usage_error(command, &message),
     };
+    run_send_like_async_with_args(command, send_args, false).await
+}
+
+async fn run_hey_in_process(query: &str, message: &str, acl_bypass: bool) -> CliOutput {
+    let send_args = send_args_for_inbox_hey(query, message);
+    run_send_like_async_with_args("hey", send_args, acl_bypass).await
+}
+
+fn send_args_for_inbox_hey(query: &str, message: &str) -> SendArgs {
+    SendArgs {
+        target: query.to_owned(),
+        text: message.to_owned(),
+        inbox: None,
+        from: None,
+        approve: false,
+        trust: false,
+    }
+}
+
+async fn run_send_like_async_with_args(
+    command: &str,
+    send_args: SendArgs,
+    acl_bypass: bool,
+) -> CliOutput {
     let config = load_hey_config();
     let mut tmux = TmuxClient::local();
     let sessions = route_sessions_from_tmux(&mut tmux);
@@ -55,7 +79,7 @@ async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutp
             peer_url,
             target,
             node: _,
-        } => gated_send_peer_message(command, &peer_url, &target, &send_args, &config).await,
+        } => gated_send_peer_message(command, &peer_url, &target, &send_args, &config, acl_bypass).await,
         RouteResult::Error { detail, hint, .. } => CliOutput {
             code: 2,
             stdout: String::new(),
@@ -81,8 +105,9 @@ async fn gated_send_peer_message(
     target: &str,
     args: &SendArgs,
     config: &HeyConfig,
+    acl_bypass: bool,
 ) -> CliOutput {
-    match send_acl_gate_peer(command, target, args, config) {
+    match send_acl_gate_peer(command, target, args, config, acl_bypass) {
         SendAclGateResult::Proceed { stderr_prefix } => send_acl_deliver_peer_message(command, peer_url, target, args, config, stderr_prefix).await,
         SendAclGateResult::Queued(output) | SendAclGateResult::Reject(output) => output,
     }
@@ -111,6 +136,7 @@ fn send_acl_gate_peer(
     target: &str,
     args: &SendArgs,
     config: &HeyConfig,
+    acl_bypass: bool,
 ) -> SendAclGateResult {
     if args.trust && !args.approve {
         return SendAclGateResult::Reject(CliOutput {
@@ -130,7 +156,7 @@ fn send_acl_gate_peer(
         }
     };
     let target = send_acl_actor_from_target(target);
-    if args.approve || std::env::var("MAW_ACL_BYPASS").ok().as_deref() == Some("1") {
+    if args.approve || acl_bypass {
         let mut stderr_prefix = String::new();
         if args.approve && args.trust {
             if let Err(error) = scope_trust_add_to_path(&scope_trust_path(), &sender, &target, &inbox_iso_label(inbox_now_ms())) {
@@ -1098,14 +1124,14 @@ mod send_acl_hotpath_tests {
         let _lock = env_test_lock().lock().unwrap();
         let _env = SendAclEnvGuard::new("allow");
         let config = send_acl_config("alice");
-        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config)), "");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config, false)), "");
 
         send_acl_write_scope("team", &["alice", "bob"]);
-        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config)), "");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config, false)), "");
 
         std::fs::remove_file(scope_native_path("team")).unwrap();
         scope_trust_add_to_path(&scope_trust_path(), "alice", "bob", "2026-06-26T00:00:00.000Z").unwrap();
-        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config)), "");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &config, false)), "");
     }
 
     #[test]
@@ -1114,7 +1140,7 @@ mod send_acl_hotpath_tests {
         let env = SendAclEnvGuard::new("queue");
         send_acl_write_scope("team", &["alice", "carol"]);
         let args = send_acl_args("remote-bob", "SECRET_BODY token=abc123");
-        let result = send_acl_gate_peer("hey", "bob", &args, &send_acl_config("alice"));
+        let result = send_acl_gate_peer("hey", "bob", &args, &send_acl_config("alice"), false);
         let output = match result { SendAclGateResult::Queued(output) => output, other => panic!("expected queue, got {other:?}") };
         assert_eq!(output.code, 0);
         assert!(output.stdout.contains("queued pending ACL approval"));
@@ -1138,11 +1164,11 @@ mod send_acl_hotpath_tests {
 
         let mut approve = send_acl_args("remote-bob", "hello");
         approve.approve = true;
-        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &approve, &config)), "");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &approve, &config, false)), "");
         assert!(!scope_trust_path().exists());
 
         approve.trust = true;
-        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &approve, &config)), "");
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &approve, &config, false)), "");
         let trusted = scope_trust_load_from_path(&scope_trust_path());
         assert_eq!(trusted.len(), 1);
         assert_eq!(trusted[0].sender, "alice");
@@ -1153,12 +1179,17 @@ mod send_acl_hotpath_tests {
     }
 
     #[test]
-    fn send_acl_env_bypass_is_read_only_and_writes_no_trust() {
+    fn send_acl_env_bypass_is_ignored_and_explicit_param_writes_no_trust() {
         let _lock = env_test_lock().lock().unwrap();
         let _env = SendAclEnvGuard::new("bypass");
         send_acl_write_scope("team", &["alice", "carol"]);
         std::env::set_var("MAW_ACL_BYPASS", "1");
-        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice"))), "");
+        let queued = send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice"), false);
+        assert!(
+            matches!(queued, SendAclGateResult::Queued(_)),
+            "env must not bypass ACL"
+        );
+        assert_eq!(send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice"), true)), "");
         assert!(!scope_trust_path().exists());
         assert_eq!(std::env::var("MAW_ACL_BYPASS").as_deref(), Ok("1"));
     }
@@ -1170,14 +1201,14 @@ mod send_acl_hotpath_tests {
         let dir = scope_native_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("broken.json"), "{not json").unwrap();
-        let stderr = send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice")));
+        let stderr = send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice"), false));
         assert!(stderr.contains("warn: ACL check failed, allowing send"));
         assert!(stderr.contains("broken.json"));
         assert!(stderr.contains("fix"));
 
         std::fs::remove_file(dir.join("broken.json")).unwrap();
         std::fs::write(scope_trust_path(), "{not json").unwrap();
-        let stderr = send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice")));
+        let stderr = send_acl_assert_proceed(send_acl_gate_peer("hey", "bob", &send_acl_args("remote-bob", "hello"), &send_acl_config("alice"), false));
         assert!(stderr.contains("warn: ACL check failed, allowing send"));
         assert!(stderr.contains("scope-trust.json"));
     }
@@ -1190,6 +1221,24 @@ mod send_acl_hotpath_tests {
         let output = send_usage_error("hey", "hey: --trust requires --approve");
         assert_eq!(output.code, 2);
         assert!(output.stderr.contains("[--approve] [--trust]"));
+    }
+
+    #[test]
+    fn inbox_hey_send_args_keep_message_flags_opaque() {
+        let args = send_args_for_inbox_hey(
+            "bob",
+            "hello --approve --from=mallory:edge --trust -leading",
+        );
+
+        assert_eq!(args.target, "bob");
+        assert_eq!(
+            args.text,
+            "hello --approve --from=mallory:edge --trust -leading"
+        );
+        assert_eq!(args.inbox, None);
+        assert_eq!(args.from, None);
+        assert!(!args.approve);
+        assert!(!args.trust);
     }
 
 
