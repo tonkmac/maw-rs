@@ -96,6 +96,47 @@ async fn reqwest_http_transport_posts_api_send_with_verifiable_v3_signature() {
 }
 
 #[tokio::test]
+async fn reqwest_http_transport_surfaces_api_send_auth_decision() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let _captured = read_one_http_request(&mut socket).await;
+        let body = r#"{"ok":false,"error":"unauthorized","decision":"refuse-missing-peer-key"}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let client = ReqwestHttpTransportIo::new(2_000).expect("client");
+    let error = client
+        .send_peer(&PeerSendRequest {
+            peer_url: format!("http://{addr}"),
+            target: "remote-oracle".to_owned(),
+            text: "hello".to_owned(),
+            inbox: None,
+            from: "sender-oracle:sender-node".to_owned(),
+            peer_key: "known-peer-key".to_owned(),
+            timestamp: 1_700_000_123_i64,
+        })
+        .await
+        .expect_err("401 must fail closed");
+
+    assert!(error.contains("HTTP 401"), "{error}");
+    assert!(
+        error.contains("decision=refuse-missing-peer-key"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn reqwest_http_transport_posts_api_wake_with_verifiable_v3_signature() {
     let peer_key = "known-peer-key";
     let timestamp = 1_700_000_456_i64;
