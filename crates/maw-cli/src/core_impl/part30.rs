@@ -337,6 +337,8 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/transport/status", get(api_transport_status))
         .route("/api/transport/send", post(api_transport_send))
         .route("/api/health", get(api_health))
+        .route("/info", get(api_peers_info))
+        .route("/api/peers/info", get(api_peers_info))
         .route("/api/message-ledger", get(api_message_ledger))
         .route("/api/requests", get(api_requests))
         .route("/api/trust", get(api_trust_list).post(api_trust_add))
@@ -1314,6 +1316,41 @@ async fn api_transport_send(
 
 async fn api_health() -> impl IntoResponse {
     Json(json!({"ok": true, "source": "maw-rs", "server": "local", "port": DEFAULT_SERVE_PORT}))
+}
+
+async fn api_peers_info() -> impl IntoResponse {
+    Json(serve_peers_info_payload()).into_response()
+}
+
+fn serve_peers_info_payload() -> Value {
+    let identity = crate::core_impl::serveidentity_http_payload_read_only();
+    let mut endpoints = identity
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    endpoints.extend([
+        Value::String("/info".to_owned()),
+        Value::String("/api/peers/info".to_owned()),
+    ]);
+
+    let mut payload = json!({
+        "node": identity.get("node").cloned().unwrap_or_else(|| Value::String("local".to_owned())),
+        "host": identity.get("host").cloned().unwrap_or_else(|| Value::String("local".to_owned())),
+        "version": identity.get("version").cloned().unwrap_or_else(|| Value::String(MAW_RS_BUILD_VERSION.to_owned())),
+        "ts": identity.get("clockUtc").cloned().unwrap_or(Value::Null),
+        "endpoints": endpoints,
+        "reachability": {"reachable": true, "status": "reachable"},
+        "maw": {
+            "schema": "1",
+            "plugins": {"manifestEndpoint": "/api/plugins"},
+            "capabilities": ["plugin.listManifest", "peer.handshake", "info", "peer.identity"],
+        },
+    });
+    if let Some(port) = identity.get("port") {
+        payload["port"] = port.clone();
+    }
+    payload
 }
 
 async fn api_message_ledger(
@@ -2495,6 +2532,80 @@ mod serve_tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn serve_peers_info_routes_return_public_metadata_for_peer_probe() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let _restore_home = EnvVarRestore::capture("HOME");
+        let _restore_maw_home = EnvVarRestore::capture("MAW_HOME");
+        let _restore_maw_state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _restore_maw_config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _restore_peer = EnvVarRestore::capture("MAW_PEER_KEY");
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-peers-info-{}-{}",
+            std::process::id(),
+            random_hex(4)
+        ));
+        let home = root.join("home");
+        let state = root.join("state");
+        let config = root.join("config");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&state).expect("state");
+        std::fs::create_dir_all(&config).expect("config");
+        std::fs::write(
+            config.join("maw.config.json"),
+            r#"{"node":"node-a","oracle":"oracle-a"}"#,
+        )
+        .expect("config");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("MAW_HOME");
+        std::env::set_var("MAW_STATE_DIR", &state);
+        std::env::set_var("MAW_CONFIG_DIR", &config);
+        std::env::set_var("MAW_PEER_KEY", "pub-peers-info-test");
+
+        assert!(!maw_auth::is_protected("/info", "GET"));
+        assert!(!maw_auth::is_protected("/api/peers/info", "GET"));
+
+        let app = serve_test_app_with_o6_keys(Vec::new(), 1_782_277_200, Some(NON_LOOPBACK_TEST_PEER));
+        for path in ["/info", "/api/peers/info"] {
+            let mut request = axum::http::Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .expect("request");
+            request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let payload = response_json(response).await;
+            assert_eq!(payload["node"], "node-a");
+            assert_eq!(payload["host"], "node-a");
+            assert!(payload.get("oracle").is_none(), "/info must stay maw-js-safe fields only: {payload}");
+            assert!(payload.get("identity").is_none(), "/info must not embed full identity payload: {payload}");
+            assert!(payload.get("pubkey").is_none(), "/info must not expose peer_key: {payload}");
+            assert!(!payload.to_string().contains("pub-peers-info-test"), "/info leaked peer_key: {payload}");
+            assert_eq!(payload["reachability"]["status"], "reachable");
+            assert_eq!(payload["maw"]["schema"], "1");
+            assert!(payload["endpoints"]
+                .as_array()
+                .expect("endpoints")
+                .iter()
+                .any(|value| value == "/api/peers/info"));
+        }
+
+        let mut protected = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/trust")
+            .body(Body::empty())
+            .expect("request");
+        protected
+            .extensions_mut()
+            .insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+        let response = app.oneshot(protected).await.expect("protected response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn serve_test_app_with_o6_keys(
