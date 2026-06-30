@@ -1,4 +1,7 @@
-const DISPATCH_51: &[DispatcherEntry] = &[ DispatcherEntry { command: "pulse", handler: Handler::Sync(run_pulse_command) } ];
+const DISPATCH_51: &[DispatcherEntry] = &[
+    DispatcherEntry { command: "pulse", handler: Handler::Sync(run_pulse_command) },
+    DispatcherEntry { command: "board", handler: Handler::Sync(run_board_command) },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PulseIssue {
@@ -61,7 +64,24 @@ enum PulseWorktreeStatus {
 }
 
 fn run_pulse_command(argv: &[String]) -> CliOutput {
-    match pulse_run(argv) {
+    pulse_output(pulse_run(argv))
+}
+
+fn run_board_command(argv: &[String]) -> CliOutput {
+    if argv.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) {
+        return CliOutput { code: 0, stdout: format!("{}\n", board_usage()), stderr: String::new() };
+    }
+    if let Some(arg) = argv.iter().find(|arg| arg.starts_with('-')) {
+        return CliOutput { code: 1, stdout: String::new(), stderr: format!("board: unknown argument {arg}\n") };
+    }
+    if !argv.is_empty() {
+        return CliOutput { code: 1, stdout: String::new(), stderr: format!("{}\n", board_usage()) };
+    }
+    pulse_output(pulse_list(false))
+}
+
+fn pulse_output(result: Result<String, String>) -> CliOutput {
+    match result {
         Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
         Err(message) => CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") },
     }
@@ -80,6 +100,8 @@ fn pulse_run(argv: &[String]) -> Result<String, String> {
 }
 
 fn pulse_usage() -> String { "usage: maw pulse <add|ls|cleanup> [opts]".to_owned() }
+
+fn board_usage() -> String { "usage: maw board".to_owned() }
 
 fn pulse_parse_add_args(argv: &[String]) -> Result<PulseAddOptions, String> {
     let mut oracle = None::<String>;
@@ -719,6 +741,24 @@ mod pulse_tests {
         assert_eq!(parsed.wt.as_deref(), Some("repo/task"));
         assert!(pulse_parse_add_args(&pulse_strings(&["ship", "--oracle", "-bad"])).is_err());
         assert!(pulse_parse_add_args(&pulse_strings(&["ship", "--wt", "../bad"])).is_err());
+    }
+
+    #[test]
+    fn board_dispatch_registers_top_level_alias() {
+        assert_eq!(dispatcher_status("board"), DispatchKind::Native);
+        assert_eq!(DISPATCH_51.len(), 2);
+        assert_eq!(DISPATCH_51[1].command, "board");
+    }
+
+    #[test]
+    fn board_rejects_args_without_calling_external_tools() {
+        let output = run_board_command(&pulse_strings(&["extra"]));
+        assert_eq!(output.code, 1);
+        assert_eq!(output.stderr, "usage: maw board\n");
+
+        let output = run_board_command(&pulse_strings(&["--sync"]));
+        assert_eq!(output.code, 1);
+        assert_eq!(output.stderr, "board: unknown argument --sync\n");
     }
 
     #[test]
