@@ -130,3 +130,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 1. Add a `maw-rs` CLI with `clap`.
 2. Port high-value fast-path commands first: `ls`, `hey`, `peek`, and target resolution helpers.
 3. Validate each command against maw-js fixtures or captured golden outputs before replacing any default `maw` entrypoint.
+
+### `maw peek` locality
+
+`maw peek` reads the local tmux server only. If a target resolves to a configured remote node, it reports `remote/unknown` and suggests `maw hey <agent> pong` instead of treating the remote tmux session as down. Full federation-aware remote peek is intentionally out of scope for the native local peek path.
