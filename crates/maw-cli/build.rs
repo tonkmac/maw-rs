@@ -3,7 +3,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 struct PartFile {
@@ -175,7 +180,7 @@ fn resolve_build_version() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| git_output(&["describe", "--tags", "--always", "--dirty"]))
-        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_owned()))
+        .unwrap_or_else(|| "unknown".to_owned())
         .trim()
         .to_owned();
     strip_leading_v(value)
@@ -190,12 +195,34 @@ fn strip_leading_v(value: String) -> String {
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
-    Command::new("git")
+    command_output_with_timeout("git", args, GIT_COMMAND_TIMEOUT)
+}
+
+fn command_output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(program)
         .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => {
+                return child
+                    .wait_with_output()
+                    .ok()
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty());
+            }
+            Some(_) => return None,
+            None if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => thread::sleep(GIT_COMMAND_POLL_INTERVAL),
+        }
+    }
 }
