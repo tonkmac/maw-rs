@@ -186,6 +186,33 @@ fn native_pulse_cleanup_dry_run_is_hermetic_and_matches_golden() {
 }
 
 #[test]
+fn native_board_command_matches_pulse_list_golden() {
+    let root = temp_dir("board");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_fake_gh(&bin_dir);
+
+    let output = run(&root, &["board"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        format!("{}\n", include_str!("fixtures/native-pulse/list.stdout"))
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+    assert_eq!(
+        fs::read_to_string(root.join("gh.log")).expect("gh log"),
+        "issue list --repo laris-co/pulse-oracle --state open --json number,title,labels --limit 50\n"
+    );
+}
+
+#[test]
 fn native_dispatcher_registers_pulse_plugin() {
     assert_eq!(dispatcher_status("pulse"), DispatchKind::Native);
+    assert_eq!(dispatcher_status("board"), DispatchKind::Native);
 }
