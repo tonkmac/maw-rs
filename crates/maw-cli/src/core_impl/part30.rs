@@ -1319,48 +1319,38 @@ async fn api_health() -> impl IntoResponse {
 }
 
 async fn api_peers_info() -> impl IntoResponse {
-    match serve_peers_info_payload() {
-        Ok(payload) => Json(payload).into_response(),
-        Err(message) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": message})),
-        )
-            .into_response(),
-    }
+    Json(serve_peers_info_payload()).into_response()
 }
 
-fn serve_peers_info_payload() -> Result<Value, String> {
-    let mut payload = crate::core_impl::serveidentity_http_payload_read_only()?;
-    let oracle = payload
-        .get("oracle")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_ORACLE)
-        .to_owned();
-    let node = payload
-        .get("node")
-        .and_then(Value::as_str)
-        .unwrap_or("local")
-        .to_owned();
-    let endpoints = payload
+fn serve_peers_info_payload() -> Value {
+    let identity = crate::core_impl::serveidentity_http_payload_read_only();
+    let mut endpoints = identity
         .get("endpoints")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .chain([
-            Value::String("/info".to_owned()),
-            Value::String("/api/peers/info".to_owned()),
-        ])
-        .collect::<Vec<_>>();
-    payload["endpoints"] = Value::Array(endpoints);
-    payload["identity"] = json!({"oracle": oracle, "node": node});
-    payload["reachability"] = json!({"reachable": true, "status": "reachable"});
-    payload["maw"] = json!({
-        "schema": "1",
-        "plugins": {"manifestEndpoint": "/api/plugins"},
-        "capabilities": ["plugin.listManifest", "peer.handshake", "info", "peer.identity"],
+        .unwrap_or_default();
+    endpoints.extend([
+        Value::String("/info".to_owned()),
+        Value::String("/api/peers/info".to_owned()),
+    ]);
+
+    let mut payload = json!({
+        "node": identity.get("node").cloned().unwrap_or_else(|| Value::String("local".to_owned())),
+        "host": identity.get("host").cloned().unwrap_or_else(|| Value::String("local".to_owned())),
+        "version": identity.get("version").cloned().unwrap_or_else(|| Value::String(MAW_RS_BUILD_VERSION.to_owned())),
+        "ts": identity.get("clockUtc").cloned().unwrap_or(Value::Null),
+        "endpoints": endpoints,
+        "reachability": {"reachable": true, "status": "reachable"},
+        "maw": {
+            "schema": "1",
+            "plugins": {"manifestEndpoint": "/api/plugins"},
+            "capabilities": ["plugin.listManifest", "peer.handshake", "info", "peer.identity"],
+        },
     });
-    Ok(payload)
+    if let Some(port) = identity.get("port") {
+        payload["port"] = port.clone();
+    }
+    payload
 }
 
 async fn api_message_ledger(
@@ -2590,9 +2580,11 @@ mod serve_tests {
             assert_eq!(response.status(), StatusCode::OK, "{path}");
             let payload = response_json(response).await;
             assert_eq!(payload["node"], "node-a");
-            assert_eq!(payload["oracle"], "oracle-a");
-            assert_eq!(payload["pubkey"], "pub-peers-info-test");
-            assert_eq!(payload["identity"], json!({"oracle": "oracle-a", "node": "node-a"}));
+            assert_eq!(payload["host"], "node-a");
+            assert!(payload.get("oracle").is_none(), "/info must stay maw-js-safe fields only: {payload}");
+            assert!(payload.get("identity").is_none(), "/info must not embed full identity payload: {payload}");
+            assert!(payload.get("pubkey").is_none(), "/info must not expose peer_key: {payload}");
+            assert!(!payload.to_string().contains("pub-peers-info-test"), "/info leaked peer_key: {payload}");
             assert_eq!(payload["reachability"]["status"], "reachable");
             assert_eq!(payload["maw"]["schema"], "1");
             assert!(payload["endpoints"]

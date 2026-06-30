@@ -48,7 +48,6 @@ struct ServeidentityDeps {
     version: String,
     uptime_seconds: u64,
     clock_utc: String,
-    peer_key: String,
     env_node_user: Option<String>,
     env_service_user: Option<String>,
     process_user: Option<String>,
@@ -81,39 +80,21 @@ fn serveidentity_usage_error(message: &str) -> CliOutput {
 }
 
 
-pub(crate) fn serveidentity_http_payload_read_only() -> Result<serde_json::Value, String> {
+pub(crate) fn serveidentity_http_payload_read_only() -> serde_json::Value {
     let config = serveidentity_load_config();
-    let deps = serveidentity_default_read_only_deps()?;
-    Ok(serveidentity_identity_payload(&config, &deps))
+    let deps = serveidentity_default_read_only_deps();
+    serveidentity_identity_payload(&config, &deps)
 }
 
-fn serveidentity_default_read_only_deps() -> Result<ServeidentityDeps, String> {
-    Ok(ServeidentityDeps {
+fn serveidentity_default_read_only_deps() -> ServeidentityDeps {
+    ServeidentityDeps {
         version: MAW_RS_BUILD_VERSION.to_owned(),
         uptime_seconds: current_epoch_seconds().saturating_sub(serveidentity_process_started_at()),
         clock_utc: serveidentity_now_utc(),
-        peer_key: serveidentity_read_peer_key()?,
         env_node_user: std::env::var("MAW_NODE_USER").ok(),
         env_service_user: std::env::var("MAW_SERVICE_USER").ok(),
         process_user: std::env::var("USER").ok().or_else(|| std::env::var("LOGNAME").ok()),
-    })
-}
-
-fn serveidentity_read_peer_key() -> Result<String, String> {
-    if let Ok(value) = std::env::var("MAW_PEER_KEY") {
-        if !value.is_empty() {
-            return Ok(value);
-        }
     }
-    let env = real_xdg_env();
-    let path = maw_state_path(&env, &["peer-key"]);
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read peer-key for identity: {error}"))?;
-    let key = raw.trim().to_owned();
-    if key.is_empty() {
-        return Err("failed to read peer-key for identity: empty peer-key".to_owned());
-    }
-    Ok(key)
 }
 
 #[allow(dead_code)]
@@ -129,7 +110,6 @@ fn serveidentity_identity_payload(config: &ServeidentityConfig, deps: &Serveiden
         "uptime": deps.uptime_seconds,
         "clockUtc": deps.clock_utc,
         "endpoints": SERVEIDENTITY_ENDPOINTS,
-        "pubkey": deps.peer_key,
     });
     serveidentity_insert_optional_fields(&mut payload, resolved.user.as_deref(), resolved.port);
     payload
@@ -279,7 +259,6 @@ mod serveidentity_tests {
             version: "1.2.3".to_owned(),
             uptime_seconds: 42,
             clock_utc: "2026-06-08T02:03:04.000Z".to_owned(),
-            peer_key: "pub".to_owned(),
             env_node_user: None,
             env_service_user: None,
             process_user: Some("agent".to_owned()),
@@ -331,7 +310,8 @@ mod serveidentity_tests {
         assert_eq!(payload["version"], "1.2.3");
         assert_eq!(payload["uptime"], 42);
         assert_eq!(payload["clockUtc"], "2026-06-08T02:03:04.000Z");
-        assert_eq!(payload["pubkey"], "pub");
+        assert!(payload.get("pubkey").is_none(), "identity payload must not expose peer_key: {payload}");
+        assert!(!payload.to_string().contains("pub"), "identity payload leaked peer_key: {payload}");
         assert_eq!(payload["endpoints"].as_array().expect("endpoints").len(), 8);
         assert_eq!(payload["agents"], serde_json::json!(["nova", "wish"]));
     }
@@ -358,7 +338,7 @@ mod serveidentity_tests {
     }
 
     #[test]
-    fn serveidentity_http_provider_reads_peer_key_without_creating_one() {
+    fn serveidentity_http_provider_does_not_read_or_publish_peer_key() {
         let _guard = env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -381,13 +361,14 @@ mod serveidentity_tests {
         std::env::remove_var("MAW_HOME");
         std::env::remove_var("MAW_PEER_KEY");
 
-        let missing = serveidentity_http_payload_read_only().expect_err("missing key");
-        assert!(missing.contains("failed to read peer-key"));
+        let payload = serveidentity_http_payload_read_only();
+        assert!(payload.get("pubkey").is_none(), "identity payload must not expose peer_key: {payload}");
         assert!(!state.join("peer-key").exists());
 
         std::fs::write(state.join("peer-key"), "pub-from-file\n").expect("peer-key");
-        let payload = serveidentity_http_payload_read_only().expect("payload");
-        assert_eq!(payload["pubkey"], "pub-from-file");
+        let payload = serveidentity_http_payload_read_only();
+        assert!(payload.get("pubkey").is_none(), "identity payload must not expose peer_key: {payload}");
+        assert!(!payload.to_string().contains("pub-from-file"), "identity payload leaked peer_key: {payload}");
     }
 
     #[test]

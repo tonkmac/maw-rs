@@ -20,7 +20,7 @@ serve-* are **NOT standalone CLI commands**. They are **serve-lifecycle plugins*
 | 86 | serve-agents | /api/agents,/api/agent | GET | one-shot | public | reads tmux+config |
 | 87 | serve-debug | /api/plugins,/plugins(html) ; /api/plugins/reload | GET ; POST | one-shot | GET public, POST reload **PROTECTED** | PluginSystem stats |
 | 88 | serve-federation | /api/federation/status, /api/peers/discoveries | GET | one-shot | public | transport router/discovery |
-| 89 | serve-identity | /api/identity | GET | one-shot | **PUBLIC by design** (pre-auth peer discovery) | exposes node pubkey/TOFU; **embeds own Elysia** |
+| 89 | serve-identity | /api/identity | GET | one-shot | **PUBLIC by design** (pre-auth peer discovery) | redacted public identity metadata (no peer_key/pubkey); **embeds own Elysia** |
 | 90 | serve-triggers | /api/triggers | GET | one-shot | public | trigger engine (read) |
 | 91 | serve-triggers-mutate | /api/triggers/fire | POST | one-shot but **blocks on actions** | **PROTECTED** | fires/mutates trigger bus (side-effects) |
 | 92 | serve-views | /topology,/,/* (fallback `*`) | GET | one-shot | public | **Hono+static** UI dist; only `http.fallback` user |

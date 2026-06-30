@@ -129,7 +129,7 @@ Protected paths: `/send`, `/pane-keys`, `/probe`, `/wake`, `/sleep`, `/talk`, `/
 
 ### Per-peer from-signing (v3)
 
-Key source: local peer key from state path `peer-key`, generated mode 0600 on first read or overridden by `MAW_PEER_KEY` (`src/lib/peer-key.ts:2-12`, `src/lib/peer-key.ts:24-80`). It is published as `pubkey` in identity/pair flows and pinned TOFU in peers store (`src/lib/peers/store.ts:59-86`).
+Key source: local peer key from state path `peer-key`, generated mode 0600 on first read or overridden by `MAW_PEER_KEY` (`src/lib/peer-key.ts:2-12`, `src/lib/peer-key.ts:24-80`). It is not published by maw-rs public `/api/identity` or `/info`; pair-specific flows may carry a `pubkey`, and peer stores pin TOFU values (`src/lib/peers/store.ts:59-86`).
 
 Headers:
 

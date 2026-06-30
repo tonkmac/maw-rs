@@ -1,11 +1,11 @@
 use super::ServecoreModuleRegistration;
 use crate::serve_core::ServecoreLifecycleModule;
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Extension, Json, Router};
-use serde_json::{json, Value};
+use axum::{response::IntoResponse, routing::get, Extension, Json, Router};
+use serde_json::Value;
 
 #[derive(Clone, Copy)]
 struct IdentityProvider {
-    payload: fn() -> Result<Value, String>,
+    payload: fn() -> Value,
 }
 
 #[must_use]
@@ -49,24 +49,22 @@ where
 }
 
 async fn identity_get(Extension(provider): Extension<IdentityProvider>) -> impl IntoResponse {
-    match (provider.payload)() {
-        Ok(payload) => Json(payload).into_response(),
-        Err(message) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": message})),
-        )
-            .into_response(),
+    let mut payload = (provider.payload)();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("pubkey");
     }
+    Json(payload).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serve_core::servecore_apply_pipeline;
+    use axum::http::StatusCode;
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::sync::oneshot;
 
-    fn identity_fake_payload() -> Result<Value, String> {
+    fn identity_fake_payload() -> Value {
         serde_json::from_str(
             r#"{
                 "node":"test@local",
@@ -80,7 +78,7 @@ mod tests {
                 "pubkey":"pub-test"
             }"#,
         )
-        .map_err(|error| error.to_string())
+        .expect("fake identity payload")
     }
 
     async fn identity_spawn() -> std::net::SocketAddr {
@@ -114,7 +112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_route_is_public_and_returns_pubkey_payload() {
+    async fn identity_route_is_public_and_returns_redacted_payload() {
         let addr = identity_spawn().await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -127,7 +125,14 @@ mod tests {
             .expect("identity");
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response.json::<Value>().await.expect("json");
-        assert_eq!(payload["pubkey"], "pub-test");
+        assert!(
+            payload.get("pubkey").is_none(),
+            "identity payload must not expose peer_key: {payload}"
+        );
+        assert!(
+            !payload.to_string().contains("pub-test"),
+            "identity payload leaked peer_key: {payload}"
+        );
         assert_eq!(payload["node"], "test@local");
     }
 }
