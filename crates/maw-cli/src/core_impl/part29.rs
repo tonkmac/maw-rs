@@ -462,9 +462,43 @@ async fn send_peer_message(
         Err(message) => CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("{command}: {message}\n"),
+            stderr: format!(
+                "{command}: {message}{}\n",
+                hey_pairing_diagnostic(command, peer_url, &request.from, &message)
+            ),
         },
     }
+}
+
+fn hey_pairing_diagnostic(command: &str, peer_url: &str, from: &str, error: &str) -> String {
+    if !error.contains("HTTP 401") {
+        return String::new();
+    }
+    if error.contains("refuse-missing-peer-key") || error.contains("pin-missing") {
+        let node = hey_node_from_wire_from(from).unwrap_or("-");
+        return format!(
+            "\n\n{command}: auth diagnostic: peer pairing is required and still fail-closed\n  missing from: {from}\n  missing node: {node}\n  peer key: not paired (redacted)\n  remote peer: {peer_url}\n  pair this lane:\n    1. On the remote peer, mint a one-time code:\n       maw pair generate --at {peer_url}\n    2. On this node, replace <PAIR-CODE> with that code:\n       maw pair {peer_url} <PAIR-CODE>\n  note: no secret key values are printed."
+        );
+    }
+    if error.contains("refuse-ambiguous-peer-key") {
+        let node = hey_node_from_wire_from(from).unwrap_or("-");
+        return format!(
+            "\n\n{command}: auth diagnostic: peer pairing failed closed because multiple cached peer keys match this node\n  from: {from}\n  node: {node}\n  peer key: ambiguous (redacted)\n  remote peer: {peer_url}\n  action: verify the peer identity, clear stale pins on the receiver, then re-run:\n       maw pair generate --at {peer_url}\n       maw pair {peer_url} <PAIR-CODE>\n  note: no secret key values are printed."
+        );
+    }
+    if error.contains("refuse-mismatch") {
+        let node = hey_node_from_wire_from(from).unwrap_or("-");
+        return format!(
+            "\n\n{command}: auth diagnostic: peer pairing failed closed because the cached peer key did not verify this signature\n  from: {from}\n  node: {node}\n  peer key: mismatch (redacted)\n  remote peer: {peer_url}\n  action: verify you are contacting the intended peer before forgetting/re-pairing.\n  note: no secret key values are printed."
+        );
+    }
+    String::new()
+}
+
+fn hey_node_from_wire_from(from: &str) -> Option<&str> {
+    let (_, node) = from.trim().split_once(':')?;
+    let node = node.trim();
+    (!node.is_empty()).then_some(node)
 }
 
 
@@ -1221,6 +1255,40 @@ mod send_acl_hotpath_tests {
         let output = send_usage_error("hey", "hey: --trust requires --approve");
         assert_eq!(output.code, 2);
         assert!(output.stderr.contains("[--approve] [--trust]"));
+    }
+
+    #[test]
+    fn hey_pairing_diagnostic_reports_missing_identity_and_copyable_pair_commands_without_secrets() {
+        let diagnostic = hey_pairing_diagnostic(
+            "hey",
+            "http://peer.example:31745",
+            "nova:bigboy-vps",
+            "remote /api/send returned HTTP 401: unauthorized (decision=refuse-missing-peer-key)",
+        );
+
+        assert!(diagnostic.contains("peer pairing is required and still fail-closed"));
+        assert!(diagnostic.contains("missing from: nova:bigboy-vps"));
+        assert!(diagnostic.contains("missing node: bigboy-vps"));
+        assert!(diagnostic.contains("peer key: not paired (redacted)"));
+        assert!(diagnostic.contains("maw pair generate --at http://peer.example:31745"));
+        assert!(diagnostic.contains("maw pair http://peer.example:31745 <PAIR-CODE>"));
+        assert!(!diagnostic.contains("feedface"));
+        assert!(!diagnostic.contains("SECRET"));
+        assert!(!diagnostic.contains("peer_key"));
+        assert!(!diagnostic.contains("pubkey"));
+    }
+
+    #[test]
+    fn hey_pairing_diagnostic_is_auth_decision_specific() {
+        assert_eq!(
+            hey_pairing_diagnostic(
+                "hey",
+                "http://peer.example:31745",
+                "nova:bigboy-vps",
+                "network error posting http://peer.example:31745/api/send",
+            ),
+            ""
+        );
     }
 
     #[test]

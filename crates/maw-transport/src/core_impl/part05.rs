@@ -39,6 +39,7 @@ pub struct PeerSendResponse {
     pub target: Option<String>,
     pub last_line: Option<String>,
     pub error: Option<String>,
+    pub decision: Option<String>,
 }
 
 /// Parsed `/api/wake` response outcome.
@@ -114,11 +115,17 @@ impl ReqwestHttpTransportIo {
             target: wire.target,
             last_line: wire.last_line,
             error: wire.error,
+            decision: wire.decision,
         };
         if status >= 400 {
+            let decision = parsed
+                .decision
+                .as_deref()
+                .map_or_else(String::new, |decision| format!(" (decision={decision})"));
             return Err(format!(
-                "remote /api/send returned HTTP {status}: {}",
-                parsed.error.as_deref().unwrap_or("request failed")
+                "remote /api/send returned HTTP {status}: {}{}",
+                parsed.error.as_deref().unwrap_or("request failed"),
+                decision
             ));
         }
         if !parsed.delivered_or_queued() {
@@ -263,6 +270,8 @@ struct PeerSendWireResponse {
     last_line: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    decision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
