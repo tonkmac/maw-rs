@@ -3,7 +3,7 @@ const DISPATCH_134: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(peek_run_command),
 }];
 
-const PEEK_USAGE: &str = "usage: maw peek <tmux-target> [--lines N] [--history]\n       maw peek [--lines N]\n";
+const PEEK_USAGE: &str = "usage: maw peek <tmux-target> [--lines N] [--history]\n       maw peek [--lines N]\n\nNote: peek is local-only; remote agents should be checked with `maw hey <agent> pong`.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeekOptions {
@@ -35,9 +35,24 @@ fn peek_with_runner<R: maw_tmux::TmuxRunner>(
     argv: &[String],
     runner: &mut R,
 ) -> Result<CliOutput, (i32, String)> {
+    peek_with_runner_and_config(argv, runner, &load_hey_config().route)
+}
+
+fn peek_with_runner_and_config<R: maw_tmux::TmuxRunner>(
+    argv: &[String],
+    runner: &mut R,
+    config: &RouteConfig,
+) -> Result<CliOutput, (i32, String)> {
     let options = peek_parse(argv)?;
     if let Some(target) = options.target.as_deref() {
         peek_validate_tmux_target(target).map_err(|message| (1, message))?;
+        if let Some(message) = peek_remote_unknown_message(target, config) {
+            return Ok(CliOutput {
+                code: 0,
+                stdout: message,
+                stderr: String::new(),
+            });
+        }
         let content = peek_capture(runner, target, options.lines, options.history)
             .map_err(|message| (1, message))?;
         return Ok(CliOutput {
@@ -53,6 +68,33 @@ fn peek_with_runner<R: maw_tmux::TmuxRunner>(
         stdout: peek_render_overview(runner, &windows)?,
         stderr: String::new(),
     })
+}
+
+fn peek_remote_unknown_message(query: &str, config: &RouteConfig) -> Option<String> {
+    let (node, target) = peek_remote_route(query, config)?;
+    Some(format!(
+        "\x1b[36m--- {query} ---\x1b[0m\nremote/unknown: target is on node '{node}', but `maw peek` is local-only and cannot inspect remote tmux.\nUse `maw hey {target} pong` to verify the remote agent is alive.\n"
+    ))
+}
+
+fn peek_remote_route(query: &str, config: &RouteConfig) -> Option<(String, String)> {
+    match resolve_route_target(query, config, &[]) {
+        RouteResult::Peer { node, target, .. } => Some((node, target)),
+        RouteResult::Error { .. } => peek_remote_route_from_agents_map(query, config),
+        RouteResult::Local { .. } | RouteResult::SelfNode { .. } => None,
+    }
+}
+
+fn peek_remote_route_from_agents_map(query: &str, config: &RouteConfig) -> Option<(String, String)> {
+    let self_node = config.node.as_deref().unwrap_or("local");
+    let node = config
+        .agents
+        .get(query)
+        .or_else(|| query.strip_suffix("-oracle").and_then(|name| config.agents.get(name)))?;
+    if node == self_node || node == "local" {
+        return None;
+    }
+    Some((node.clone(), query.to_owned()))
 }
 
 fn peek_parse(argv: &[String]) -> Result<PeekOptions, (i32, String)> {
@@ -252,6 +294,54 @@ mod peek_tests {
                 args(&["-p", "-t", "sess:1.0", "-S", "-12", "-J"]),
             )
         );
+    }
+
+    #[test]
+    fn peek_remote_node_target_reports_unknown_without_tmux_capture() {
+        let mut runner = PeekFakeRunner::default();
+        let config = RouteConfig {
+            node: Some("local-node".to_owned()),
+            named_peers: vec![RouteNamedPeer {
+                name: "remote-node".to_owned(),
+                url: "http://remote.invalid:31745".to_owned(),
+            }],
+            peers: Vec::new(),
+            agents: std::collections::HashMap::new(),
+        };
+
+        let output = peek_with_runner_and_config(
+            &args(&["remote-node:nova", "--lines", "12"]),
+            &mut runner,
+            &config,
+        )
+        .expect("remote unknown");
+
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains("remote/unknown"));
+        assert!(output.stdout.contains("maw peek` is local-only"));
+        assert!(output.stdout.contains("maw hey nova pong"));
+        assert!(runner.calls.is_empty(), "remote target must not call local tmux");
+    }
+
+    #[test]
+    fn peek_remote_agents_map_without_peer_url_reports_unknown_without_tmux_capture() {
+        let mut runner = PeekFakeRunner::default();
+        let mut agents = std::collections::HashMap::new();
+        agents.insert("nova".to_owned(), "remote-node".to_owned());
+        let config = RouteConfig {
+            node: Some("local-node".to_owned()),
+            named_peers: Vec::new(),
+            peers: Vec::new(),
+            agents,
+        };
+
+        let output = peek_with_runner_and_config(&args(&["nova"]), &mut runner, &config)
+            .expect("remote unknown");
+
+        assert!(output.stdout.contains("remote/unknown"));
+        assert!(output.stdout.contains("node 'remote-node'"));
+        assert!(output.stdout.contains("maw hey nova pong"));
+        assert!(runner.calls.is_empty(), "remote target must not call local tmux");
     }
 
     #[test]
