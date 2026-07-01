@@ -1,3 +1,3 @@
-include!("federation_auth/part01.rs");
-include!("federation_auth/part02.rs");
-include!("federation_auth/part03.rs");
+include!("federation_auth/federation_signing_tests.rs");
+include!("federation_auth/consent_state_machine_tests.rs");
+include!("federation_auth/expiry_validation_tests.rs");
