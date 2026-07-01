@@ -1,2 +1,2 @@
-include!("plugin_create/part01.rs");
-include!("plugin_create/part02.rs");
+include!("plugin_create/create_errors_tests.rs");
+include!("plugin_create/manifest_norm_tests.rs");
