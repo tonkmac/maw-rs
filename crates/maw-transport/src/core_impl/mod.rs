@@ -1,6 +1,6 @@
-include!("part01.rs");
-include!("part02.rs");
-include!("part03.rs");
-include!("part04.rs");
-include!("part05.rs");
-include!("part06.rs");
+include!("error_classify.rs");
+include!("http_federation.rs");
+include!("tmux_transport_tests.rs");
+include!("transport_coverage_tests.rs");
+include!("peer_signing.rs");
+include!("wasm_http_adapter.rs");
