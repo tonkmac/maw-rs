@@ -1,7 +1,7 @@
-include!("part01.rs");
-include!("part02_1.rs");
-include!("part02_2.rs");
-include!("part02_3.rs");
-include!("part03.rs");
-include!("part04.rs");
-include!("part05.rs");
+include!("tmux_types.rs");
+include!("client_sessions.rs");
+include!("client_panes.rs");
+include!("client_mode_env.rs");
+include!("tmux_parsers.rs");
+include!("tmux_targets.rs");
+include!("tmux_live_state.rs");
