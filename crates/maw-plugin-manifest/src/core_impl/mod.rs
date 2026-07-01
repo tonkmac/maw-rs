@@ -1,7 +1,7 @@
-include!("part01.rs");
-include!("part02.rs");
-include!("part03.rs");
-include!("part04.rs");
-include!("part05.rs");
-include!("part06.rs");
-include!("part07.rs");
+include!("manifest_types.rs");
+include!("manifest_parse_optional.rs");
+include!("manifest_load_invoke.rs");
+include!("wasm_mvp_parse.rs");
+include!("manifest_validate.rs");
+include!("wasm_host_extism.rs");
+include!("plugin_build.rs");
